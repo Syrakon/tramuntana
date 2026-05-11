@@ -236,8 +236,14 @@ impl Paint {
         let connection = rendering_context
             .connection()
             .expect("Failed to get connection");
+        // Tramuntana: prefer a hardware adapter so WebGL gets a real GPU
+        // context. `create_adapter` can return surfman's software adapter
+        // on some setups, which leaves WebGL unusable (three.js renderer
+        // creation fails). Fall back to `create_adapter` if no hardware
+        // adapter is available.
         let adapter = connection
-            .create_adapter()
+            .create_hardware_adapter()
+            .or_else(|_| connection.create_adapter())
             .expect("Failed to create adapter");
 
         let painter_surfman_details = PainterSurfmanDetails {
