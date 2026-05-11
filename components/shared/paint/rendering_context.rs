@@ -486,6 +486,39 @@ impl WindowRenderingContext {
         })
     }
 
+    /// Tramuntana-only: build a `WindowRenderingContext` that does **not** own the
+    /// window's drawable surface. The connection is opened from `display_handle`
+    /// (so we get a real GPU adapter — WebGL works), but the bound surface is a
+    /// `Generic` offscreen one. Use this when the host (e.g. GPUI) already owns
+    /// the visible surface and Servo's output will be consumed via
+    /// `offscreen_context()` + `read_to_image()`.
+    pub fn new_offscreen_only(
+        display_handle: DisplayHandle,
+        size: PhysicalSize<u32>,
+    ) -> Result<Self, Error> {
+        if size.width == 0 || size.height == 0 {
+            log::error!(
+                "Unable to create WindowRenderingContext with size under 1x1 ({size:?} provided)"
+            );
+            return Err(Error::Failed);
+        }
+
+        let connection = Connection::from_display_handle(display_handle)?;
+        let adapter = connection.create_hardware_adapter()?;
+        let surfman_context = SurfmanRenderingContext::new(&connection, &adapter, None)?;
+
+        let surfman_size = Size2D::new(size.width as i32, size.height as i32);
+        let surface =
+            surfman_context.create_surface(SurfaceType::Generic { size: surfman_size })?;
+        surfman_context.bind_surface(surface)?;
+        surfman_context.make_current()?;
+
+        Ok(Self {
+            size: Cell::new(size),
+            surfman_context,
+        })
+    }
+
     pub fn offscreen_context(
         self: &Rc<Self>,
         size: PhysicalSize<u32>,
