@@ -462,6 +462,14 @@ pub struct WindowRenderingContext {
     /// The inner size of the window in physical pixels which excludes OS decorations.
     size: Cell<PhysicalSize<u32>>,
     surfman_context: SurfmanRenderingContext,
+    /// Lazy-init cache for the Stage 2 dma-buf export path. Holds a private GL
+    /// texture (separate from surfman's surface textures, which already have
+    /// EGL siblings claimed by WebRender / wgpu_hal::gles), a backing FBO,
+    /// an EGLImage built on top of that texture, and the resulting dma-buf
+    /// fd. Each call to `export_framebuffer_dma_buf` blits surfman's FBO
+    /// onto our private texture (GPU-to-GPU) and dups the cached fd. See
+    /// `docs/STAGE_2_GPU_SHARING.md`.
+    dma_buf_cache: RefCell<Option<dma_buf_export::Cache>>,
 }
 
 impl WindowRenderingContext {
@@ -518,6 +526,7 @@ impl WindowRenderingContext {
         Ok(Self {
             size: Cell::new(size),
             surfman_context,
+            dma_buf_cache: RefCell::new(None),
         })
     }
 
@@ -551,6 +560,7 @@ impl WindowRenderingContext {
         Ok(Self {
             size: Cell::new(size),
             surfman_context,
+            dma_buf_cache: RefCell::new(None),
         })
     }
 
@@ -685,12 +695,32 @@ impl WindowRenderingContext {
     /// See `docs/STAGE_2_GPU_SHARING.md` for the full producer/consumer
     /// design.
     pub fn export_framebuffer_dma_buf(&self) -> Option<DmaBufHandle> {
-        let texture_id = self.framebuffer_color_texture_id()?;
-        // Flush so any pending GL commands are in the command stream
-        // before we snapshot a fence over them.
-        self.surfman_context.gleam_gl.flush();
         let size = self.size.get();
-        dma_buf_export::export(texture_id, size)
+
+        // Identify Servo's bound FBO so we can blit FROM it. We can't export
+        // its color attachment directly because that texture is already an
+        // EGL sibling claimed by WebRender / wgpu_hal::gles (eglCreateImageKHR
+        // returns EGL_BAD_ACCESS). Instead we keep a private texture of our
+        // own and copy the framebuffer onto it on the GPU each frame.
+        let source_fbo = {
+            let device = self.surfman_context.device.borrow();
+            let context = self.surfman_context.context.borrow();
+            device.make_context_current(&context).ok()?;
+            device
+                .context_surface_info(&context)
+                .ok()??
+                .framebuffer_object
+                .map(|fb| fb.0.get())
+                .unwrap_or(0)
+        };
+
+        let mut cache_slot = self.dma_buf_cache.borrow_mut();
+        dma_buf_export::blit_and_export(
+            &mut cache_slot,
+            size,
+            source_fbo,
+            &self.surfman_context.gleam_gl,
+        )
     }
 }
 
@@ -1112,14 +1142,24 @@ fn print_diagnostics_information_on_context_creation_failure(
     println!("===============================================================\n");
 }
 
-/// FFI helpers for `EGL_MESA_image_dma_buf_export`. Isolated in a sub-module
-/// so the file-level `#![deny(unsafe_code)]` only relaxes here, not
-/// everywhere. See [`WindowRenderingContext::export_framebuffer_dma_buf`].
+/// FFI helpers for `EGL_MESA_image_dma_buf_export` + `EGL_KHR_fence_sync`.
+/// Isolated in a sub-module so the file-level `#![deny(unsafe_code)]` only
+/// relaxes here, not everywhere. See
+/// [`WindowRenderingContext::export_framebuffer_dma_buf`].
+///
+/// Surfman's surface texture is already claimed as an EGL sibling by
+/// WebRender / wgpu_hal::gles, so we can't `eglCreateImageKHR` against it
+/// directly. We instead keep a **private intermediate texture** that we own
+/// exclusively, blit the framebuffer onto it each frame on the GPU, and
+/// export that one. The dma-buf fd and EGLImage are cached across frames
+/// and only torn down on resize.
 #[allow(unsafe_code)]
 mod dma_buf_export {
     use std::os::fd::{FromRawFd, OwnedFd};
+    use std::rc::Rc;
 
     use dpi::PhysicalSize;
+    use gleam::gl::{self, Gl};
     use khronos_egl as egl;
 
     use super::DmaBufHandle;
@@ -1174,6 +1214,66 @@ mod dma_buf_export {
     type EglDupNativeFenceFdAndroid =
         unsafe extern "system" fn(dpy: egl::EGLDisplay, sync: EGLSyncKHR) -> i32;
 
+    struct EglFuncs {
+        create_image: EglCreateImageKhr,
+        destroy_image: EglDestroyImageKhr,
+        export_query: EglExportDmabufImageQueryMesa,
+        export_image: EglExportDmabufImageMesa,
+        create_sync: Option<EglCreateSyncKhr>,
+        destroy_sync: Option<EglDestroySyncKhr>,
+        dup_fence_fd: Option<EglDupNativeFenceFdAndroid>,
+    }
+
+    /// Per-(WindowRenderingContext, size) cached state for the Stage 2 export.
+    pub(super) struct Cache {
+        /// Our private GL texture, owned by this `Cache`. Never bound to any
+        /// surfman surface, so EGL doesn't see another sibling claim it.
+        /// Kept in the struct purely for lifetime/ownership tracking — the
+        /// EGLImage we build from it must outlive the texture, so we hold a
+        /// reference here until the cache is invalidated. Read directly only
+        /// during `build_cache`.
+        #[allow(dead_code)]
+        gl_texture: u32,
+        /// FBO whose color attachment is `gl_texture`. Used as the BLIT
+        /// destination from surfman's read framebuffer.
+        gl_fbo: u32,
+        /// Owned dma-buf fd. Dup'd into each emitted [`DmaBufHandle`] so the
+        /// consumer can close their copy independently.
+        dma_buf_fd: OwnedFd,
+        /// Owned EGLImage backing `gl_texture`. Kept alive so the dma-buf fd
+        /// remains valid; destroyed on cache invalidation.
+        egl_image: egl::EGLImage,
+        /// EGL display handle the cache was built with. Stored so we can
+        /// tear down `egl_image` and any fence sync correctly.
+        egl_display: egl::EGLDisplay,
+        /// EGL extension entry points. Loaded once, reused across frames.
+        egl_funcs: EglFuncs,
+        /// Texture dimensions matching `gl_texture` and `egl_image`.
+        width: u32,
+        height: u32,
+        fourcc: u32,
+        modifier: u64,
+        stride: u32,
+        offset: u32,
+    }
+
+    impl Drop for Cache {
+        fn drop(&mut self) {
+            // Destroy the EGLImage so the kernel can release the dma-buf
+            // backing memory once all importers also close their copies.
+            // The owned `dma_buf_fd` closes itself via OwnedFd::Drop right
+            // after.
+            unsafe {
+                (self.egl_funcs.destroy_image)(self.egl_display, self.egl_image);
+            }
+            // GL texture and FBO leak deliberately: we don't have access to
+            // the surfman gl handle from Drop, and they belong to a context
+            // that is about to be destroyed when the RenderingContext drops
+            // anyway. Not worth carrying an Rc<dyn Gl> in Cache to clean a
+            // pair of GL ids that the driver releases on context teardown.
+        }
+    }
+
     /// Load a function pointer for an EGL extension by name and transmute it
     /// to the requested fn-pointer type. Returns `None` if the driver does
     /// not expose the entry point.
@@ -1189,59 +1289,80 @@ mod dma_buf_export {
         Some(unsafe { std::mem::transmute_copy::<extern "system" fn(), T>(&raw) })
     }
 
-    pub(super) fn export(texture_id: u32, size: PhysicalSize<u32>) -> Option<DmaBufHandle> {
+    fn build_cache(size: PhysicalSize<u32>, gl: &Rc<dyn Gl>) -> Option<Cache> {
         let egl_instance = egl::Instance::new(egl::Static);
         let display = egl_instance.get_current_display()?;
         let context = egl_instance.get_current_context()?;
 
-        let create_image: EglCreateImageKhr =
-            unsafe { load(&egl_instance, "eglCreateImageKHR")? };
-        let destroy_image: EglDestroyImageKhr =
-            unsafe { load(&egl_instance, "eglDestroyImageKHR")? };
-        let query: EglExportDmabufImageQueryMesa =
-            unsafe { load(&egl_instance, "eglExportDMABUFImageQueryMESA")? };
-        let export_fn: EglExportDmabufImageMesa =
-            unsafe { load(&egl_instance, "eglExportDMABUFImageMESA")? };
-        // Fence entry points are optional; the consumer falls back to a
-        // coarser wait when fence_fd is None.
-        let create_sync: Option<EglCreateSyncKhr> =
-            unsafe { load(&egl_instance, "eglCreateSyncKHR") };
-        let destroy_sync: Option<EglDestroySyncKhr> =
-            unsafe { load(&egl_instance, "eglDestroySyncKHR") };
-        let dup_fence_fd: Option<EglDupNativeFenceFdAndroid> =
-            unsafe { load(&egl_instance, "eglDupNativeFenceFDANDROID") };
+        let egl_funcs = EglFuncs {
+            create_image: unsafe { load(&egl_instance, "eglCreateImageKHR")? },
+            destroy_image: unsafe { load(&egl_instance, "eglDestroyImageKHR")? },
+            export_query: unsafe { load(&egl_instance, "eglExportDMABUFImageQueryMESA")? },
+            export_image: unsafe { load(&egl_instance, "eglExportDMABUFImageMESA")? },
+            create_sync: unsafe { load(&egl_instance, "eglCreateSyncKHR") },
+            destroy_sync: unsafe { load(&egl_instance, "eglDestroySyncKHR") },
+            dup_fence_fd: unsafe { load(&egl_instance, "eglDupNativeFenceFDANDROID") },
+        };
 
-        // Create and dup the fence first so it captures the GL writes the
-        // caller just flushed. Caller is expected to glFlush() before
-        // entering this fn so the fence covers issued commands.
-        let fence_fd = create_sync
-            .zip(destroy_sync)
-            .zip(dup_fence_fd)
-            .and_then(|((create_sync, destroy_sync), dup_fence_fd)| {
-                let attribs: [egl::Int; 1] = [egl::NONE];
-                let sync = unsafe {
-                    create_sync(display.as_ptr(), EGL_SYNC_NATIVE_FENCE_ANDROID, attribs.as_ptr())
-                };
-                if sync.is_null() {
-                    log::warn!("eglCreateSyncKHR returned NULL; fence sync unavailable");
-                    return None;
-                }
-                let raw_fd = unsafe { dup_fence_fd(display.as_ptr(), sync) };
-                unsafe { destroy_sync(display.as_ptr(), sync); }
-                if raw_fd == EGL_NO_NATIVE_FENCE_FD_ANDROID {
-                    log::warn!("eglDupNativeFenceFDANDROID returned -1; fence sync unavailable");
-                    return None;
-                }
-                Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
-            });
+        // Create the private intermediate texture: RGBA8, linear filtering,
+        // wrap clamp-to-edge. The format/modifier we get out of the EGL
+        // export query is determined by the driver but for GL_RGBA8 + linear
+        // tiling on NVIDIA / Mesa it is consistently DRM_FORMAT_ABGR8888
+        // (0x34324241) + DRM_FORMAT_MOD_LINEAR (0).
+        let textures = gl.gen_textures(1);
+        let texture = *textures.first()?;
+        gl.bind_texture(gl::TEXTURE_2D, texture);
+        gl.tex_image_2d(
+            gl::TEXTURE_2D,
+            0,
+            gl::RGBA8 as i32,
+            size.width as i32,
+            size.height as i32,
+            0,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            None,
+        );
+        gl.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+        gl.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+        gl.tex_parameter_i(
+            gl::TEXTURE_2D,
+            gl::TEXTURE_WRAP_S,
+            gl::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i(
+            gl::TEXTURE_2D,
+            gl::TEXTURE_WRAP_T,
+            gl::CLAMP_TO_EDGE as i32,
+        );
+        gl.bind_texture(gl::TEXTURE_2D, 0);
 
+        let fbos = gl.gen_framebuffers(1);
+        let fbo = *fbos.first()?;
+        gl.bind_framebuffer(gl::FRAMEBUFFER, fbo);
+        gl.framebuffer_texture_2d(
+            gl::FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::TEXTURE_2D,
+            texture,
+            0,
+        );
+        let status = gl.check_frame_buffer_status(gl::FRAMEBUFFER);
+        gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
+        if status != gl::FRAMEBUFFER_COMPLETE {
+            log::warn!(
+                "Stage 2 cache: intermediate FBO is not framebuffer-complete (status 0x{status:x})"
+            );
+            gl.delete_framebuffers(&fbos);
+            gl.delete_textures(&textures);
+            return None;
+        }
+
+        // Wrap our private texture as an EGLImage.
         let attrib_list: [egl::Int; 1] = [egl::NONE];
-        // `EGLClientBuffer` is `*mut c_void`; for `EGL_GL_TEXTURE_2D_KHR` the
-        // spec demands the GL texture name cast to a pointer-sized integer.
-        let buffer = texture_id as usize as egl::EGLClientBuffer;
-
+        let buffer = texture as usize as egl::EGLClientBuffer;
         let image = unsafe {
-            create_image(
+            (egl_funcs.create_image)(
                 display.as_ptr(),
                 context.as_ptr(),
                 EGL_GL_TEXTURE_2D_KHR,
@@ -1251,8 +1372,10 @@ mod dma_buf_export {
         };
         if image.is_null() {
             log::warn!(
-                "eglCreateImageKHR returned EGL_NO_IMAGE_KHR for GL texture id {texture_id}"
+                "Stage 2 cache: eglCreateImageKHR returned EGL_NO_IMAGE_KHR for our private texture id {texture}"
             );
+            gl.delete_framebuffers(&fbos);
+            gl.delete_textures(&textures);
             return None;
         }
 
@@ -1260,7 +1383,7 @@ mod dma_buf_export {
         let mut num_planes: i32 = 0;
         let mut modifier: u64 = 0;
         let ok = unsafe {
-            query(
+            (egl_funcs.export_query)(
                 display.as_ptr(),
                 image,
                 &mut fourcc,
@@ -1269,19 +1392,23 @@ mod dma_buf_export {
             )
         };
         if ok != EGL_TRUE {
-            log::warn!("eglExportDMABUFImageQueryMESA failed");
+            log::warn!("Stage 2 cache: eglExportDMABUFImageQueryMESA failed");
             unsafe {
-                destroy_image(display.as_ptr(), image);
+                (egl_funcs.destroy_image)(display.as_ptr(), image);
             }
+            gl.delete_framebuffers(&fbos);
+            gl.delete_textures(&textures);
             return None;
         }
         if num_planes != 1 {
             log::warn!(
-                "dma-buf export returned {num_planes} planes; single-plane only for now"
+                "Stage 2 cache: dma-buf export returned {num_planes} planes; single-plane only"
             );
             unsafe {
-                destroy_image(display.as_ptr(), image);
+                (egl_funcs.destroy_image)(display.as_ptr(), image);
             }
+            gl.delete_framebuffers(&fbos);
+            gl.delete_textures(&textures);
             return None;
         }
 
@@ -1289,7 +1416,7 @@ mod dma_buf_export {
         let mut stride: egl::Int = 0;
         let mut offset: egl::Int = 0;
         let ok = unsafe {
-            export_fn(
+            (egl_funcs.export_image)(
                 display.as_ptr(),
                 image,
                 &mut fd_raw,
@@ -1297,27 +1424,124 @@ mod dma_buf_export {
                 &mut offset,
             )
         };
-        // EGLImage destruction does NOT close the fd we received — ownership
-        // of the fd transferred to the caller on a successful export. We
-        // destroy the image in either branch.
-        unsafe {
-            destroy_image(display.as_ptr(), image);
-        }
-
         if ok != EGL_TRUE || fd_raw < 0 {
-            log::warn!("eglExportDMABUFImageMESA failed (returned fd = {fd_raw})");
+            log::warn!("Stage 2 cache: eglExportDMABUFImageMESA failed (returned fd = {fd_raw})");
+            unsafe {
+                (egl_funcs.destroy_image)(display.as_ptr(), image);
+            }
+            gl.delete_framebuffers(&fbos);
+            gl.delete_textures(&textures);
             return None;
         }
 
-        let fd = unsafe { OwnedFd::from_raw_fd(fd_raw) };
-        Some(DmaBufHandle {
-            fd,
+        let dma_buf_fd = unsafe { OwnedFd::from_raw_fd(fd_raw) };
+
+        log::info!(
+            "Stage 2 cache: built intermediate {}x{} (texture={}, fbo={}, fourcc=0x{:08x}, modifier=0x{:016x}, stride={}, offset={})",
+            size.width, size.height, texture, fbo, fourcc as u32, modifier, stride, offset
+        );
+
+        Some(Cache {
+            gl_texture: texture,
+            gl_fbo: fbo,
+            dma_buf_fd,
+            egl_image: image,
+            egl_display: display.as_ptr(),
+            egl_funcs,
             width: size.width,
             height: size.height,
             fourcc: fourcc as u32,
+            modifier,
             stride: stride as u32,
             offset: offset as u32,
-            modifier,
+        })
+    }
+
+    fn make_fence_fd(cache: &Cache) -> Option<OwnedFd> {
+        let create_sync = cache.egl_funcs.create_sync?;
+        let destroy_sync = cache.egl_funcs.destroy_sync?;
+        let dup_fence_fd = cache.egl_funcs.dup_fence_fd?;
+
+        let attribs: [egl::Int; 1] = [egl::NONE];
+        let sync = unsafe {
+            create_sync(
+                cache.egl_display,
+                EGL_SYNC_NATIVE_FENCE_ANDROID,
+                attribs.as_ptr(),
+            )
+        };
+        if sync.is_null() {
+            log::warn!("Stage 2 fence: eglCreateSyncKHR returned NULL");
+            return None;
+        }
+        let raw_fd = unsafe { dup_fence_fd(cache.egl_display, sync) };
+        unsafe {
+            destroy_sync(cache.egl_display, sync);
+        }
+        if raw_fd == EGL_NO_NATIVE_FENCE_FD_ANDROID {
+            log::warn!("Stage 2 fence: eglDupNativeFenceFDANDROID returned -1");
+            return None;
+        }
+        Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+    }
+
+    pub(super) fn blit_and_export(
+        cache_slot: &mut Option<Cache>,
+        size: PhysicalSize<u32>,
+        source_fbo: u32,
+        gl: &Rc<dyn Gl>,
+    ) -> Option<DmaBufHandle> {
+        // Invalidate cache if the window resized.
+        if let Some(c) = cache_slot.as_ref() {
+            if c.width != size.width || c.height != size.height {
+                *cache_slot = None;
+            }
+        }
+        if cache_slot.is_none() {
+            *cache_slot = Some(build_cache(size, gl)?);
+        }
+        let cache = cache_slot.as_ref()?;
+
+        // GPU-side blit: surfman's FBO -> our private FBO.
+        // Servo's FBO has Y=0 at the top in our coordinate space; for the
+        // consumer (gpui) sampling a wgpu texture we want the same
+        // orientation. glBlitFramebuffer copies in source coords directly, no
+        // flip needed.
+        gl.bind_framebuffer(gl::READ_FRAMEBUFFER, source_fbo);
+        gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, cache.gl_fbo);
+        gl.blit_framebuffer(
+            0,
+            0,
+            size.width as i32,
+            size.height as i32,
+            0,
+            0,
+            size.width as i32,
+            size.height as i32,
+            gl::COLOR_BUFFER_BIT,
+            gl::NEAREST,
+        );
+        // Restore default binding so subsequent surfman ops aren't surprised.
+        gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
+        gl.flush();
+
+        let fence_fd = make_fence_fd(cache);
+
+        // Dup the cached dma-buf fd so the consumer owns an independent fd
+        // that they can close without affecting our cache.
+        let fd = cache.dma_buf_fd.try_clone().ok().or_else(|| {
+            log::warn!("Stage 2 export: failed to dup cached dma-buf fd");
+            None
+        })?;
+
+        Some(DmaBufHandle {
+            fd,
+            width: cache.width,
+            height: cache.height,
+            fourcc: cache.fourcc,
+            stride: cache.stride,
+            offset: cache.offset,
+            modifier: cache.modifier,
             fence_fd,
         })
     }

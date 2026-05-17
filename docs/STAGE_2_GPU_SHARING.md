@@ -32,20 +32,47 @@ Servo renders into an offscreen FBO (the `new_offscreen_only`
 `WindowRenderingContext` from commit `0871238`). The FBO is backed by
 a GL texture that lives in the surfman-managed GL context.
 
-After each `webview.paint()`:
+**Why direct export of Servo's FBO does not work** (validated at
+runtime 2026-05-17): WebRender / `wgpu_hal::gles::egl` internally call
+`eglCreateImageKHR` against surfman's surface textures to do their
+own work. EGL only allows one EGLImage sibling per source object, so
+our `eglCreateImageKHR` returns `EGL_BAD_ACCESS` ("Source is already
+an EGL sibling"). The texture is busy as far as EGL is concerned.
 
-1. Bind the offscreen FBO's color attachment texture.
-2. `eglCreateImageKHR(EGL_GL_TEXTURE_2D, gl_texture_id)` → `EGLImageKHR`.
-3. `eglExportDMABUFImageQueryMESA()` → query (fourcc, num_planes, modifier).
-4. `eglExportDMABUFImageMESA()` → `(fd, stride, offset)` per plane.
-5. `glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE)` →
-   `eglDupNativeFenceFDANDROID` (via `EGL_ANDROID_native_fence_sync`,
-   exposed by NVIDIA as `EGL_NV_nvrm_fence_sync` — verify name on this
-   driver) → sync fd.
-6. Return a `DmaBufHandle { fd, fence_fd, fourcc, width, height, stride,
-   offset, modifier, num_planes }` to the embedder. Ownership of both
-   fds transfers to the caller; producer drops the `EGLImageKHR` after
-   export.
+**Workaround that does work**: keep a **private intermediate texture**
+that we own exclusively (never bound to surfman, never seen by
+WebRender), and blit the framebuffer onto it on the GPU each frame.
+Cost: one `glBlitFramebuffer` per export, which is microseconds at
+1280×800 on a modern GPU — still many orders of magnitude cheaper
+than the CPU readback path it replaces.
+
+Lifecycle, after each `webview.paint()`:
+
+1. Build cache (once, lazily on first call, or on resize):
+   - `glGenTextures` / `glTexImage2D` for an `RGBA8` private texture.
+   - `glGenFramebuffers` / `glFramebufferTexture2D` for a private FBO
+     with that texture as `COLOR_ATTACHMENT0`.
+   - `eglCreateImageKHR(EGL_GL_TEXTURE_2D, our_texture_id)` →
+     `EGLImageKHR` (no sibling collision now — the texture is
+     exclusively ours).
+   - `eglExportDMABUFImageQueryMESA` (fourcc, num_planes, modifier).
+   - `eglExportDMABUFImageMESA` (dma-buf fd, stride, offset).
+   - Cache everything. `EGLImage` and `fd` are owned by the cache
+     for as long as the size doesn't change.
+2. Per-frame export:
+   - Bind Servo's FBO as `READ_FRAMEBUFFER`.
+   - Bind our cached FBO as `DRAW_FRAMEBUFFER`.
+   - `glBlitFramebuffer` (color buffer, `NEAREST`).
+   - `glFlush` to push the blit into the command stream.
+   - `eglCreateSyncKHR(EGL_SYNC_NATIVE_FENCE_ANDROID)` then
+     `eglDupNativeFenceFDANDROID` → fence sync fd snapshotting the
+     blit.
+   - `OwnedFd::try_clone` of the cached dma-buf fd so the consumer
+     gets its own fd.
+3. Return `DmaBufHandle { fd (dup), fence_fd, fourcc, width, height,
+   stride, offset, modifier }` to the embedder. The cache continues
+   to own the EGLImage and the original dma-buf fd; the next call
+   reuses both.
 
 New public API on `WindowRenderingContext`:
 
