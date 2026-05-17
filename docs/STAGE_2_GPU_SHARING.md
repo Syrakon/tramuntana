@@ -80,32 +80,45 @@ next to `read_to_image` in
 Two changes needed in gpui (vendored at
 `tramuntana/third_party/gpui/`):
 
-**1. New ImageSource variant — outside the atlas.**
+**1. New `ExternalGpuTexture` trait + dedicated element — outside the atlas.**
 
 The atlas is CPU-side by design (`PlatformAtlas::get_or_insert_with`
 takes `Cow<[u8]>`). Routing external textures through it requires
-rewriting the trait. Instead, add a parallel path:
+rewriting the trait. Initially I considered adding a variant to
+`ImageSource`, but the path from `Img::paint` → `source.use_data()` →
+`Arc<RenderImage>` → `window.paint_image()` is fundamentally
+CPU-side: every step assumes a `RenderImage`. Threading an `External`
+variant through it would require five separate forks of `Option<…>`
+plumbing.
+
+Cleaner: a parallel element type. `ImageSource` stays untouched and
+keeps serving CPU-backed images; `ExternalImage` (new) takes an
+`Arc<dyn ExternalGpuTexture>` and emits its own scene primitive.
 
 ```rust
-// crates/gpui/src/elements/img.rs
-pub enum ImageSource {
-    Resource(...),
-    Image(...),
-    Render(Arc<RenderImage>),
-    Custom(...),
-    External(Arc<dyn ExternalTextureProvider>),   // NEW
+// crates/gpui/src/external_texture.rs
+pub trait ExternalGpuTexture: Send + Sync {
+    fn descriptor(&self) -> Option<ExternalTextureDescriptor>;
+    fn fence(&self) -> Option<ExternalFence>;
+    fn size(&self) -> Size<DevicePixels>;
 }
 
-pub trait ExternalTextureProvider: Send + Sync {
-    fn texture(&self) -> wgpu::Texture;
-    fn fence_fd(&self) -> Option<OwnedFd>;
-    fn size(&self) -> Size<DevicePixels>;
+pub enum ExternalTextureDescriptor {
+    DmaBuf { fd, fourcc, modifier, stride, offset, width, height },
+    // future: IOSurface { ... }, Win32Handle { ... }
+}
+
+pub enum ExternalFence {
+    SyncFd(OwnedFd),
+    // future: MachPort, Win32Event
 }
 ```
 
-`window.paint_image()` branches on the variant — for `External`, emit
-a new scene primitive (`ExternalSprite { texture, bounds, ... }`)
-instead of `PolychromeSprite { tile, ... }`.
+`Window::paint_external_image()` (new method, sibling of
+`paint_image`) emits a new scene primitive
+(`ExternalSprite { handle, bounds, ... }`) routed through a new
+`ExternalSpritePipeline` in `gpui_wgpu`. The existing
+`PolychromeSpritePipeline` stays unchanged.
 
 **2. New scene primitive renderer in `gpui_wgpu`.**
 

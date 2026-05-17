@@ -38,6 +38,10 @@ pub mod profiler;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 #[expect(missing_docs)]
 pub mod queue;
+/// Stage 2 zero-copy cross-API texture handoff (Linux dma-buf today,
+/// IOSurface/Win32 stubs reserved). Embedders implement
+/// [`external_texture::ExternalGpuTexture`].
+pub mod external_texture;
 mod scene;
 mod shared_uri;
 mod style;
