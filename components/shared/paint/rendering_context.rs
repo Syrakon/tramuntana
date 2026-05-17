@@ -6,6 +6,7 @@
 
 use std::cell::{Cell, RefCell, RefMut};
 use std::num::NonZeroU32;
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -415,6 +416,40 @@ impl RenderingContext for SoftwareRenderingContext {
     }
 }
 
+/// Tramuntana-only: opaque handle to a dma-buf exported from the current
+/// framebuffer's color attachment. Used by the Stage 2 zero-copy bridge
+/// between Servo's GL output and gpui's Vulkan compositor (see
+/// `docs/STAGE_2_GPU_SHARING.md`).
+///
+/// The caller owns `fd` and is responsible for closing it (handled
+/// automatically by `OwnedFd`'s Drop impl). The `width`/`height`/`fourcc`/
+/// `modifier` fields are needed by the importer to construct a matching
+/// `wgpu::Texture` via `VK_EXT_external_memory_dma_buf` +
+/// `VK_EXT_image_drm_format_modifier`.
+#[derive(Debug)]
+pub struct DmaBufHandle {
+    /// Owned dma-buf file descriptor (O_CLOEXEC). Single-plane only.
+    pub fd: OwnedFd,
+    pub width: u32,
+    pub height: u32,
+    /// DRM fourcc, e.g. `DRM_FORMAT_ABGR8888` (0x34324241) or
+    /// `DRM_FORMAT_ARGB8888` (0x34325241). Consumer must match this.
+    pub fourcc: u32,
+    pub stride: u32,
+    pub offset: u32,
+    /// DRM format modifier. `DRM_FORMAT_MOD_LINEAR` (0) for linear,
+    /// vendor-specific tilings otherwise. Consumer must pass this to
+    /// Vulkan via `VK_EXT_image_drm_format_modifier`.
+    pub modifier: u64,
+    /// Optional sync fd from `EGL_ANDROID_native_fence_sync`. When present,
+    /// the consumer must wait on it before sampling the texture (e.g. via
+    /// `VK_KHR_external_semaphore_fd` with `SYNC_FD` handle type) to avoid
+    /// reading partial GL writes. `None` means the driver did not expose
+    /// the fence-sync extensions; the consumer should fall back to a
+    /// coarser barrier such as `vkQueueWaitIdle` or accept tearing.
+    pub fence_fd: Option<OwnedFd>,
+}
+
 /// A [`RenderingContext`] that uses the `surfman` library to render to a
 /// `raw-window-handle` identified window. `surfman` will attempt to create an
 /// OpenGL context and surface for this window. This is a simple implementation
@@ -622,6 +657,40 @@ impl WindowRenderingContext {
             gleam::gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
         );
         u32::try_from(texture_id).ok()
+    }
+
+    /// Tramuntana-only: export the current framebuffer's color attachment as
+    /// a dma-buf file descriptor for zero-copy cross-API sharing. Uses
+    /// `EGL_MESA_image_dma_buf_export` (the standard MESA extension; on NVIDIA
+    /// it is exposed by the proprietary driver alongside `EGL_NV_*` siblings).
+    ///
+    /// Returns `None` if:
+    /// - The current FBO has no GL texture color attachment
+    ///   (see [`framebuffer_color_texture_id`])
+    /// - No EGL display/context is current (e.g. running under GLX)
+    /// - The driver does not expose the required extension entry points
+    /// - The exported image has more than one plane (we only handle
+    ///   single-plane RGBA today)
+    /// - Any EGL call fails
+    ///
+    /// On success, the returned [`DmaBufHandle`] owns the dma-buf fd. The
+    /// caller must close it (handled by `OwnedFd`'s Drop). The EGLImage
+    /// created internally is destroyed before returning; fd ownership has
+    /// transferred to the caller by then.
+    ///
+    /// **Not** safe to assume the returned dma-buf survives subsequent
+    /// paints — surfman may rotate the underlying surface. Treat each
+    /// successful export as a single-frame snapshot.
+    ///
+    /// See `docs/STAGE_2_GPU_SHARING.md` for the full producer/consumer
+    /// design.
+    pub fn export_framebuffer_dma_buf(&self) -> Option<DmaBufHandle> {
+        let texture_id = self.framebuffer_color_texture_id()?;
+        // Flush so any pending GL commands are in the command stream
+        // before we snapshot a fence over them.
+        self.surfman_context.gleam_gl.flush();
+        let size = self.size.get();
+        dma_buf_export::export(texture_id, size)
     }
 }
 
@@ -1041,6 +1110,217 @@ fn print_diagnostics_information_on_context_creation_failure(
         },
     }
     println!("===============================================================\n");
+}
+
+/// FFI helpers for `EGL_MESA_image_dma_buf_export`. Isolated in a sub-module
+/// so the file-level `#![deny(unsafe_code)]` only relaxes here, not
+/// everywhere. See [`WindowRenderingContext::export_framebuffer_dma_buf`].
+#[allow(unsafe_code)]
+mod dma_buf_export {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    use dpi::PhysicalSize;
+    use khronos_egl as egl;
+
+    use super::DmaBufHandle;
+
+    /// `EGL_GL_TEXTURE_2D_KHR` from `EGL_KHR_gl_texture_2D_image`.
+    const EGL_GL_TEXTURE_2D_KHR: egl::Enum = 0x30B1;
+    /// `EGL_SYNC_NATIVE_FENCE_ANDROID` from `EGL_ANDROID_native_fence_sync`.
+    const EGL_SYNC_NATIVE_FENCE_ANDROID: egl::Enum = 0x3144;
+    /// `EGL_NO_NATIVE_FENCE_FD_ANDROID` (returned on dup failure).
+    const EGL_NO_NATIVE_FENCE_FD_ANDROID: i32 = -1;
+    const EGL_TRUE: egl::Boolean = 1;
+
+    /// Opaque EGLSyncKHR pointer.
+    type EGLSyncKHR = *mut std::ffi::c_void;
+
+    type EglCreateImageKhr = unsafe extern "system" fn(
+        dpy: egl::EGLDisplay,
+        ctx: egl::EGLContext,
+        target: egl::Enum,
+        buffer: egl::EGLClientBuffer,
+        attrib_list: *const egl::Int,
+    ) -> egl::EGLImage;
+
+    type EglDestroyImageKhr =
+        unsafe extern "system" fn(dpy: egl::EGLDisplay, image: egl::EGLImage) -> egl::Boolean;
+
+    type EglExportDmabufImageQueryMesa = unsafe extern "system" fn(
+        dpy: egl::EGLDisplay,
+        image: egl::EGLImage,
+        fourcc: *mut i32,
+        num_planes: *mut i32,
+        modifiers: *mut u64,
+    ) -> egl::Boolean;
+
+    type EglExportDmabufImageMesa = unsafe extern "system" fn(
+        dpy: egl::EGLDisplay,
+        image: egl::EGLImage,
+        fds: *mut i32,
+        strides: *mut egl::Int,
+        offsets: *mut egl::Int,
+    ) -> egl::Boolean;
+
+    type EglCreateSyncKhr = unsafe extern "system" fn(
+        dpy: egl::EGLDisplay,
+        type_: egl::Enum,
+        attrib_list: *const egl::Int,
+    ) -> EGLSyncKHR;
+
+    type EglDestroySyncKhr =
+        unsafe extern "system" fn(dpy: egl::EGLDisplay, sync: EGLSyncKHR) -> egl::Boolean;
+
+    type EglDupNativeFenceFdAndroid =
+        unsafe extern "system" fn(dpy: egl::EGLDisplay, sync: EGLSyncKHR) -> i32;
+
+    /// Load a function pointer for an EGL extension by name and transmute it
+    /// to the requested fn-pointer type. Returns `None` if the driver does
+    /// not expose the entry point.
+    unsafe fn load<T: Copy>(
+        egl_instance: &egl::Instance<egl::Static>,
+        name: &str,
+    ) -> Option<T> {
+        let raw = egl_instance.get_proc_address(name)?;
+        debug_assert_eq!(
+            std::mem::size_of::<T>(),
+            std::mem::size_of::<extern "system" fn()>()
+        );
+        Some(unsafe { std::mem::transmute_copy::<extern "system" fn(), T>(&raw) })
+    }
+
+    pub(super) fn export(texture_id: u32, size: PhysicalSize<u32>) -> Option<DmaBufHandle> {
+        let egl_instance = egl::Instance::new(egl::Static);
+        let display = egl_instance.get_current_display()?;
+        let context = egl_instance.get_current_context()?;
+
+        let create_image: EglCreateImageKhr =
+            unsafe { load(&egl_instance, "eglCreateImageKHR")? };
+        let destroy_image: EglDestroyImageKhr =
+            unsafe { load(&egl_instance, "eglDestroyImageKHR")? };
+        let query: EglExportDmabufImageQueryMesa =
+            unsafe { load(&egl_instance, "eglExportDMABUFImageQueryMESA")? };
+        let export_fn: EglExportDmabufImageMesa =
+            unsafe { load(&egl_instance, "eglExportDMABUFImageMESA")? };
+        // Fence entry points are optional; the consumer falls back to a
+        // coarser wait when fence_fd is None.
+        let create_sync: Option<EglCreateSyncKhr> =
+            unsafe { load(&egl_instance, "eglCreateSyncKHR") };
+        let destroy_sync: Option<EglDestroySyncKhr> =
+            unsafe { load(&egl_instance, "eglDestroySyncKHR") };
+        let dup_fence_fd: Option<EglDupNativeFenceFdAndroid> =
+            unsafe { load(&egl_instance, "eglDupNativeFenceFDANDROID") };
+
+        // Create and dup the fence first so it captures the GL writes the
+        // caller just flushed. Caller is expected to glFlush() before
+        // entering this fn so the fence covers issued commands.
+        let fence_fd = create_sync
+            .zip(destroy_sync)
+            .zip(dup_fence_fd)
+            .and_then(|((create_sync, destroy_sync), dup_fence_fd)| {
+                let attribs: [egl::Int; 1] = [egl::NONE];
+                let sync = unsafe {
+                    create_sync(display.as_ptr(), EGL_SYNC_NATIVE_FENCE_ANDROID, attribs.as_ptr())
+                };
+                if sync.is_null() {
+                    log::warn!("eglCreateSyncKHR returned NULL; fence sync unavailable");
+                    return None;
+                }
+                let raw_fd = unsafe { dup_fence_fd(display.as_ptr(), sync) };
+                unsafe { destroy_sync(display.as_ptr(), sync); }
+                if raw_fd == EGL_NO_NATIVE_FENCE_FD_ANDROID {
+                    log::warn!("eglDupNativeFenceFDANDROID returned -1; fence sync unavailable");
+                    return None;
+                }
+                Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+            });
+
+        let attrib_list: [egl::Int; 1] = [egl::NONE];
+        // `EGLClientBuffer` is `*mut c_void`; for `EGL_GL_TEXTURE_2D_KHR` the
+        // spec demands the GL texture name cast to a pointer-sized integer.
+        let buffer = texture_id as usize as egl::EGLClientBuffer;
+
+        let image = unsafe {
+            create_image(
+                display.as_ptr(),
+                context.as_ptr(),
+                EGL_GL_TEXTURE_2D_KHR,
+                buffer,
+                attrib_list.as_ptr(),
+            )
+        };
+        if image.is_null() {
+            log::warn!(
+                "eglCreateImageKHR returned EGL_NO_IMAGE_KHR for GL texture id {texture_id}"
+            );
+            return None;
+        }
+
+        let mut fourcc: i32 = 0;
+        let mut num_planes: i32 = 0;
+        let mut modifier: u64 = 0;
+        let ok = unsafe {
+            query(
+                display.as_ptr(),
+                image,
+                &mut fourcc,
+                &mut num_planes,
+                &mut modifier,
+            )
+        };
+        if ok != EGL_TRUE {
+            log::warn!("eglExportDMABUFImageQueryMESA failed");
+            unsafe {
+                destroy_image(display.as_ptr(), image);
+            }
+            return None;
+        }
+        if num_planes != 1 {
+            log::warn!(
+                "dma-buf export returned {num_planes} planes; single-plane only for now"
+            );
+            unsafe {
+                destroy_image(display.as_ptr(), image);
+            }
+            return None;
+        }
+
+        let mut fd_raw: i32 = -1;
+        let mut stride: egl::Int = 0;
+        let mut offset: egl::Int = 0;
+        let ok = unsafe {
+            export_fn(
+                display.as_ptr(),
+                image,
+                &mut fd_raw,
+                &mut stride,
+                &mut offset,
+            )
+        };
+        // EGLImage destruction does NOT close the fd we received — ownership
+        // of the fd transferred to the caller on a successful export. We
+        // destroy the image in either branch.
+        unsafe {
+            destroy_image(display.as_ptr(), image);
+        }
+
+        if ok != EGL_TRUE || fd_raw < 0 {
+            log::warn!("eglExportDMABUFImageMESA failed (returned fd = {fd_raw})");
+            return None;
+        }
+
+        let fd = unsafe { OwnedFd::from_raw_fd(fd_raw) };
+        Some(DmaBufHandle {
+            fd,
+            width: size.width,
+            height: size.height,
+            fourcc: fourcc as u32,
+            stride: stride as u32,
+            offset: offset as u32,
+            modifier,
+            fence_fd,
+        })
+    }
 }
 
 #[cfg(test)]

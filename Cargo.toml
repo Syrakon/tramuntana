@@ -112,6 +112,7 @@ ipc-channel = "0.22"
 itertools = "0.14"
 js = { package = "mozjs", version = "=0.15.14", default-features = false, features = ["libz-sys", "intl"] }
 keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
+khronos-egl = { version = "6", features = ["static"] }
 kurbo = { version = "0.13", features = ["euclid"] }
 libc = "0.2"
 lru = "0.18"

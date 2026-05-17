@@ -8587,6 +8587,7 @@ dependencies = [
  "glow 0.17.0",
  "image",
  "ipc-channel",
+ "khronos-egl",
  "log",
  "malloc_size_of_derive",
  "parking_lot",
