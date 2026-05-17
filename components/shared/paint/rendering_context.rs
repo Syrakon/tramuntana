@@ -578,6 +578,51 @@ impl WindowRenderingContext {
             self.surfman_context.context.borrow_mut(),
         )
     }
+
+    /// Tramuntana-only: return the OpenGL texture name backing the color
+    /// attachment of the currently bound offscreen framebuffer. This is the
+    /// texture Servo paints into; it is the entry point for cross-API GPU
+    /// sharing (Stage 2 of the rumb bridge — see
+    /// `docs/STAGE_2_GPU_SHARING.md`).
+    ///
+    /// Returns `None` if no surface is bound, if the color attachment is a
+    /// renderbuffer (not a texture), or if making the context current fails.
+    ///
+    /// The returned ID is **not** guaranteed to be stable across frames:
+    /// surfman's `present_bound_surface` rotates the underlying surface,
+    /// which may change the texture identity. Callers that re-use GPU
+    /// resources keyed on this ID must re-validate it after every paint.
+    pub fn framebuffer_color_texture_id(&self) -> Option<u32> {
+        let device = self.surfman_context.device.borrow();
+        let context = self.surfman_context.context.borrow();
+        device.make_context_current(&context).ok()?;
+
+        let fb_id = device
+            .context_surface_info(&context)
+            .ok()??
+            .framebuffer_object
+            .map(|fb| fb.0.get())
+            .unwrap_or(0);
+
+        let gl = &self.surfman_context.gleam_gl;
+        gl.bind_framebuffer(gleam::gl::FRAMEBUFFER, fb_id);
+
+        let attachment_type = gl.get_framebuffer_attachment_parameter_iv(
+            gleam::gl::FRAMEBUFFER,
+            gleam::gl::COLOR_ATTACHMENT0,
+            gleam::gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+        );
+        if attachment_type != gleam::gl::TEXTURE as i32 {
+            return None;
+        }
+
+        let texture_id = gl.get_framebuffer_attachment_parameter_iv(
+            gleam::gl::FRAMEBUFFER,
+            gleam::gl::COLOR_ATTACHMENT0,
+            gleam::gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+        );
+        u32::try_from(texture_id).ok()
+    }
 }
 
 impl RenderingContext for WindowRenderingContext {
