@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, Corners, DevicePixels, ExternalSprite, GpuSpecs,
+    MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+    Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -92,6 +92,12 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    /// Stage 2 cross-API texture handoff pipeline. Samples a wgpu::Texture
+    /// imported via `external_texture_import::import_external_texture` and
+    /// draws it as a textured quad with corner radii / opacity / clip.
+    /// Reuses the `instances_with_texture` bind group layout: storage
+    /// buffer of `ExternalSpriteInstance` + texture view + sampler.
+    external_sprites: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -872,6 +878,18 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.surfaces,
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let external_sprites = create_pipeline(
+            "external_sprites",
+            "vs_external_sprite",
+            "fs_external_sprite",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
             &shader_module,
@@ -887,6 +905,7 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            external_sprites,
         }
     }
 
@@ -1305,16 +1324,12 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
-                        PrimitiveBatch::ExternalSprites(_range) => {
-                            // Stage 2 GPU sharing — external dma-buf/IOSurface/
-                            // NT-handle textures. The render pipeline that
-                            // imports them via wgpu_hal::vulkan and draws a
-                            // textured quad isn't wired up yet (2b.4 of the
-                            // Stage 2 plan). Silently drop for now so element
-                            // trees that already emit `paint_external_image`
-                            // calls don't panic at runtime.
-                            true
-                        }
+                        PrimitiveBatch::ExternalSprites(range) => self
+                            .draw_external_sprites(
+                                &scene.external_sprites[range],
+                                &mut instance_offset,
+                                &mut pass,
+                            ),
                     };
                     if !ok {
                         overflow = true;
@@ -1435,6 +1450,110 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    /// GPU-side instance layout for `ExternalSprite`. Matches the
+    /// `struct ExternalSprite` in `shaders.wgsl` byte-for-byte (64 bytes).
+    /// We use flat `[f32; 4]` arrays for bounds / corner_radii rather than
+    /// `Bounds<ScaledPixels>` / `Corners<ScaledPixels>` because those carry
+    /// generics constraints that block `Pod` / `Zeroable` derives.
+    fn draw_external_sprites(
+        &self,
+        sprites: &[ExternalSprite],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            #[repr(C)]
+            #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+            struct ExternalSpriteInstance {
+                order: u32,
+                _pad0: u32,
+                opacity: f32,
+                _pad1: u32,
+                // origin.x, origin.y, size.width, size.height
+                bounds: [f32; 4],
+                content_mask: [f32; 4],
+                // top_left, top_right, bottom_right, bottom_left
+                corner_radii: [f32; 4],
+            }
+
+            fn flatten_bounds(b: &Bounds<ScaledPixels>) -> [f32; 4] {
+                [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0]
+            }
+            fn flatten_corners(c: &Corners<ScaledPixels>) -> [f32; 4] {
+                [c.top_left.0, c.top_right.0, c.bottom_right.0, c.bottom_left.0]
+            }
+
+            let resources = self.resources();
+
+            // Each ExternalSprite carries its own externally-owned texture
+            // (no atlas), so we issue one draw call per sprite. rumb's
+            // current use case is a single browser surface; if we ever
+            // batch multiple WebViews per frame, this loop scales linearly
+            // — a few extra draw calls is negligible vs the CPU readback
+            // path we are replacing.
+            for sprite in sprites {
+                let descriptor = match sprite.handle.descriptor() {
+                    Some(d) => d,
+                    None => {
+                        log::warn!(
+                            "draw_external_sprites: handle.descriptor() returned None; skipping"
+                        );
+                        continue;
+                    }
+                };
+
+                let texture = match crate::external_texture_import::import_external_texture(
+                    &resources.device,
+                    descriptor,
+                ) {
+                    Some(t) => t,
+                    None => {
+                        // import_external_texture logs the cause on its own.
+                        continue;
+                    }
+                };
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let instance = ExternalSpriteInstance {
+                    order: sprite.order,
+                    _pad0: 0,
+                    opacity: sprite.opacity,
+                    _pad1: 0,
+                    bounds: flatten_bounds(&sprite.bounds),
+                    content_mask: flatten_bounds(&sprite.content_mask.bounds),
+                    corner_radii: flatten_corners(&sprite.corner_radii),
+                };
+                let data = bytemuck::bytes_of(&instance);
+
+                let ok = self.draw_instances_with_texture(
+                    data,
+                    1,
+                    &view,
+                    &resources.pipelines.external_sprites,
+                    instance_offset,
+                    pass,
+                );
+                if !ok {
+                    return false;
+                }
+                // `texture` and `view` drop here at end of scope; wgpu-hal's
+                // `TextureMemory::Dedicated` arm runs `vkFreeMemory` on
+                // teardown so the imported memory is released.
+            }
+            true
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        {
+            let _ = (sprites, instance_offset, pass);
+            // ExternalSprite paint is dma-buf-only today. Other platforms
+            // need their own importer (IOSurface, NT handle); until then,
+            // silently drop so element trees that emit external_image on
+            // multi-target builds don't break.
+            true
+        }
     }
 
     fn draw_polychrome_sprites(

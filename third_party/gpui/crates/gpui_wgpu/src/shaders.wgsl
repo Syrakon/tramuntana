@@ -1284,6 +1284,53 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     return blend_color(color, sprite.opacity * saturate(0.5 - distance));
 }
 
+// --- external sprites (Stage 2 cross-API texture handoff) --- //
+
+struct ExternalSprite {
+    order: u32,
+    _pad0: u32,
+    opacity: f32,
+    _pad1: u32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+}
+@group(1) @binding(0) var<storage, read> b_external_sprites: array<ExternalSprite>;
+@group(1) @binding(1) var t_external: texture_2d<f32>;
+@group(1) @binding(2) var s_external: sampler;
+
+struct ExternalSpriteVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texture_position: vec2<f32>,
+    @location(1) @interpolate(flat) sprite_id: u32,
+    @location(3) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_external_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ExternalSpriteVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let sprite = b_external_sprites[instance_id];
+
+    var out = ExternalSpriteVarying();
+    out.position = to_device_position(unit_vertex, sprite.bounds);
+    // No atlas — sample full 0..1 of the externally-imported texture.
+    out.texture_position = unit_vertex;
+    out.sprite_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_external_sprite(input: ExternalSpriteVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_external, s_external, input.texture_position);
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let sprite = b_external_sprites[input.sprite_id];
+    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    return blend_color(sample, sprite.opacity * saturate(0.5 - distance));
+}
+
 // --- surfaces --- //
 
 struct SurfaceParams {
