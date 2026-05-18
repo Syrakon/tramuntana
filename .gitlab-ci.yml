@@ -1,0 +1,93 @@
+# tramuntana CI
+#
+# Two pipelines for now:
+#
+# 1. `merge-request` / `push` builds — run on every change to verify the
+#    fork compiles. Servo's own CI is enormous (multi-platform, WPT, etc);
+#    we only check what our patches touch so the loop stays fast.
+#
+# 2. `upstream-sync` — weekly cron that fetches `upstream/main` from
+#    servo/servo and merges into our `main`. Clean merges push directly;
+#    conflicting merges open a merge request tagged `needs-manual-merge`
+#    for the maintainer to resolve. See SYNCING.md for the manual flow.
+
+stages:
+  - check
+  - upstream-sync
+
+# ---- Per-push: minimal compile gate. ------------------------------------
+check-paint-api:
+  stage: check
+  image: rust:1.94-slim
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - rustup default 1.94.0
+    - RUST_MIN_STACK=33554432 cargo check -p servo-paint-api --lib
+  cache:
+    key: cargo-paint-api
+    paths:
+      - target/
+      - .cargo/registry/
+
+# ---- Weekly: pull from Servo upstream. ----------------------------------
+upstream-sync:
+  stage: upstream-sync
+  image: rust:1.94-slim
+  rules:
+    # Trigger only on the weekly schedule or when manually run with the
+    # RUN_UPSTREAM_SYNC variable set.
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$RUN_UPSTREAM_SYNC == "1"'
+      when: manual
+  variables:
+    # Use the master torii from gitorii's releases. Pinned so a torii
+    # regression doesn't break our scheduled syncs silently. Bump
+    # deliberately.
+    TORII_VERSION: "0.7.6"
+    UPSTREAM_REMOTE: "upstream"
+    UPSTREAM_URL: "https://github.com/servo/servo.git"
+    SYNC_BRANCH: "main"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends ca-certificates git curl
+    # Install torii from crates.io at the pinned version.
+    - cargo install gitorii --version $TORII_VERSION --locked
+    # CI's clone of $CI_PROJECT_DIR only has origin. Add upstream.
+    - torii remote link --name $UPSTREAM_REMOTE --https github servo/servo || true
+    # CI identity — committer for the merge commit. Real authorship of
+    # each merged commit is preserved from upstream; this is just for the
+    # merge commit itself.
+    - torii config set user.name "tramuntana-bot"
+    - torii config set user.email "ci@syrakon.com"
+  script:
+    - set -euo pipefail
+    - torii sync --fetch $UPSTREAM_REMOTE
+    # Stash any leftover CI state.
+    - torii branch $SYNC_BRANCH
+    # Try to merge. Captured separately so we can branch on the outcome.
+    - |
+      if torii sync $UPSTREAM_REMOTE/$SYNC_BRANCH --merge; then
+        echo "Merge clean. Pushing to origin/$SYNC_BRANCH."
+        torii sync --push
+      else
+        echo "Merge has conflicts. Opening MR for manual resolution."
+        # Save the conflicted state on a branch and push so gitlab sees it.
+        torii branch upstream-sync-$(date +%Y%m%d) -c
+        torii save -am "wip: upstream sync needs manual merge ($(date -I))"
+        torii sync --push
+        # Best-effort MR creation; manual if gh/glab API is unavailable.
+        torii pr create \
+          --title "upstream-sync: needs manual merge ($(date -I))" \
+          --body "Automatic weekly sync hit a conflict. See SYNCING.md." \
+          --label needs-manual-merge || true
+        exit 1
+      fi
+  cache:
+    key: cargo-upstream-sync
+    paths:
+      - .cargo/registry/
+
+# Schedule note: configure a weekly pipeline schedule in the GitLab UI
+# (Settings → CI/CD → Schedules), with the cron `0 5 * * 1` (Mondays at
+# 05:00 UTC) and variable `CI_PIPELINE_SOURCE=schedule`. The job above
+# will pick it up via the `rules` matcher.
