@@ -8,8 +8,8 @@
 use std::panic;
 
 use crate::{
-    Bounds, Corners, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, Pixels, Style, Window,
+    Bounds, Corners, DefiniteLength, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, Length, Pixels, Style, Window,
     external_texture::ExternalGpuTextureHandle,
 };
 use gpui_util::ResultExt;
@@ -61,15 +61,13 @@ impl Element for ExternalImage {
         cx: &mut crate::App,
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
-        // Use the texture's native size as the default layout. A wrapping
-        // container with explicit width/height (or flex) can override.
-        let size = self.handle.size();
-        style.size.width = crate::Length::Definite(crate::DefiniteLength::Absolute(
-            crate::AbsoluteLength::Pixels(Pixels(size.width.0 as f32)),
-        ));
-        style.size.height = crate::Length::Definite(crate::DefiniteLength::Absolute(
-            crate::AbsoluteLength::Pixels(Pixels(size.height.0 as f32)),
-        ));
+        // Fill the parent container. The element does not impose its own
+        // pixel size from the texture — letting the wrapping `div().flex_1()`
+        // (or whatever the embedder uses) control bounds. If a caller
+        // wants the native texture size instead, they wrap the element in
+        // a fixed-size container.
+        style.size.width = Length::Definite(DefiniteLength::Fraction(1.0));
+        style.size.height = Length::Definite(DefiniteLength::Fraction(1.0));
         let layout_id = window.request_layout(style, [], cx);
         (layout_id, ())
     }

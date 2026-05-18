@@ -1314,7 +1314,10 @@ fn vs_external_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_i
     var out = ExternalSpriteVarying();
     out.position = to_device_position(unit_vertex, sprite.bounds);
     // No atlas — sample full 0..1 of the externally-imported texture.
-    out.texture_position = unit_vertex;
+    // Flip Y: the producer is OpenGL (origin bottom-left); the consumer is
+    // Vulkan/wgpu (origin top-left). Without this the page renders upside-
+    // down. Verified empirically on NVIDIA + EGL dma-buf.
+    out.texture_position = vec2<f32>(unit_vertex.x, 1.0 - unit_vertex.y);
     out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
     return out;
