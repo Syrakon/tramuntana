@@ -1,50 +1,47 @@
 # tramuntana CI
 #
-# Two pipelines for now:
+# Two pipelines:
 #
-# 1. `merge-request` / `push` builds — run on every change to verify the
-#    fork compiles. Servo's own CI is enormous (multi-platform, WPT, etc);
-#    we only check what our patches touch so the loop stays fast.
+# 1. `check-paint-api` — per-push compile gate on a self-hosted runner
+#    (the maintainer's workstation, registered with tag `self-hosted`).
+#    Servo's transitive deps don't fit in GitLab SaaS free runners, but
+#    on the self-hosted box the `target/` cache persists between jobs
+#    so incremental rebuilds are ~30s. Cold first run is slow.
 #
-# 2. `upstream-sync` — weekly cron that fetches `upstream/main` from
-#    servo/servo and merges into our `main`. Clean merges push directly;
-#    conflicting merges open a merge request tagged `needs-manual-merge`
-#    for the maintainer to resolve. See SYNCING.md for the manual flow.
+# 2. `upstream-sync` — weekly cron, runs on GitLab SaaS small runners.
+#    Doesn't compile Servo; only fetches and merges. Lives on SaaS so
+#    it fires every Monday even if the workstation is off.
 
 stages:
   - check
   - upstream-sync
 
-# ---- Per-push: minimal compile gate. ------------------------------------
+# ---- Per-push: compile gate on self-hosted runner. ----------------------
 #
 # tramuntana's Cargo.toml uses `path = "../stylo/..."` for the stylo
-# family of crates (introduced when we vendored gpui — easier to iterate
-# on stylo locally than pinning a git rev). The GitLab runner only
-# clones the project being built, so we need to clone the syrakon/stylo
-# fork next to tramuntana before cargo can resolve those paths.
+# family of crates. The runner clones tramuntana into its workdir, so we
+# need to keep a clone of syrakon/stylo as a sibling. On the self-hosted
+# runner that sibling already exists across runs after the first clone;
+# we `git fetch` to keep it current rather than re-cloning every job.
 check-paint-api:
   stage: check
-  image: rust:1.94-slim
+  tags:
+    - self-hosted
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "merge_request_event"'
   before_script:
-    - apt-get update && apt-get install -y --no-install-recommends ca-certificates git
-    # `../stylo` relative to the project checkout (CI clones tramuntana into
-    # `/builds/<group>/tramuntana/`, so the sibling is `/builds/<group>/stylo/`).
-    # syrakon/stylo is a public fork (MPL-2.0, mirroring servo/stylo) — clone
-    # anonymously, no auth dance. If we ever need to bump to a non-main branch
-    # of stylo, add `--branch <name>` here.
-    - git clone --depth 1 https://gitlab.com/syrakon/stylo.git ../stylo
+    # Keep ../stylo up to date (clone first time, fetch+reset every run).
+    - |
+      if [ -d ../stylo/.git ]; then
+        (cd ../stylo && git fetch --depth 1 origin main && git reset --hard origin/main)
+      else
+        git clone --depth 1 https://gitlab.com/syrakon/stylo.git ../stylo
+      fi
     - rustup default 1.94.0
   script:
     - RUST_MIN_STACK=33554432 cargo check -p servo-paint-api --lib
-  cache:
-    key: cargo-paint-api
-    paths:
-      - target/
-      - .cargo/registry/
 
-# ---- Weekly: pull from Servo upstream. ----------------------------------
+# ---- Weekly: pull from Servo upstream (GitLab SaaS). --------------------
 upstream-sync:
   stage: upstream-sync
   image: rust:1.94-slim
