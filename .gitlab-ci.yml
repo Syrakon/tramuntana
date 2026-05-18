@@ -31,7 +31,10 @@ check-paint-api:
     - apt-get update && apt-get install -y --no-install-recommends ca-certificates git
     # `../stylo` relative to the project checkout (CI clones tramuntana into
     # `/builds/<group>/tramuntana/`, so the sibling is `/builds/<group>/stylo/`).
-    - git clone --depth 1 https://gitlab.com/syrakon/stylo.git ../stylo
+    # syrakon/stylo is a private project; CI_JOB_TOKEN authenticates as
+    # the runner. Requires syrakon/stylo → Settings → CI/CD → Job token
+    # permissions to allow tramuntana in the inbound allowlist.
+    - git clone --depth 1 "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/syrakon/stylo.git" ../stylo
     - rustup default 1.94.0
   script:
     - RUST_MIN_STACK=33554432 cargo check -p servo-paint-api --lib
