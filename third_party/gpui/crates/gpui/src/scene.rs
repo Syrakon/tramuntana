@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree,
+    external_texture::ExternalGpuTextureHandle, point,
 };
 use std::{
     fmt::Debug,
@@ -36,6 +37,10 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Stage 2 cross-API GPU textures (e.g. dma-buf imported from Servo).
+    /// Composited by `gpui_wgpu`'s `ExternalSpritePipeline` without going
+    /// through the sprite atlas. See [`crate::external_texture`].
+    pub external_sprites: Vec<ExternalSprite>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +57,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.external_sprites.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -119,6 +125,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::ExternalSprite(sprite) => {
+                sprite.order = order;
+                self.external_sprites.push(sprite.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -146,6 +156,8 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.external_sprites
+            .sort_by_key(|sprite| sprite.order);
     }
 
     #[cfg_attr(
@@ -173,6 +185,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            external_sprites_start: 0,
+            external_sprites_iter: self.external_sprites.iter().peekable(),
         }
     }
 }
@@ -195,6 +209,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    ExternalSprite,
 }
 
 pub(crate) enum PaintOperation {
@@ -214,6 +229,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    ExternalSprite(ExternalSprite),
 }
 
 #[expect(missing_docs)]
@@ -228,6 +244,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::ExternalSprite(sprite) => &sprite.bounds,
         }
     }
 
@@ -241,6 +258,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::ExternalSprite(sprite) => &sprite.content_mask,
         }
     }
 }
@@ -269,6 +287,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    external_sprites_start: usize,
+    external_sprites_iter: Peekable<slice::Iter<'a, ExternalSprite>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -301,6 +321,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.external_sprites_iter.peek().map(|s| s.order),
+                PrimitiveKind::ExternalSprite,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -447,6 +471,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::ExternalSprite => {
+                let externals_start = self.external_sprites_start;
+                let mut externals_end = externals_start + 1;
+                self.external_sprites_iter.next();
+                while self
+                    .external_sprites_iter
+                    .next_if(|sprite| (sprite.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    externals_end += 1;
+                }
+                self.external_sprites_start = externals_end;
+                Some(PrimitiveBatch::ExternalSprites(
+                    externals_start..externals_end,
+                ))
+            }
         }
     }
 }
@@ -479,6 +519,11 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    /// Stage 2 cross-API GPU textures, indices into [`Scene::external_sprites`].
+    /// Unlike the atlas-based sprite variants, these don't share a texture
+    /// id — each entry references its own external `wgpu::Texture` imported
+    /// from a platform handle.
+    ExternalSprites(Range<usize>),
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -723,6 +768,41 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+/// A primitive that samples an externally-owned GPU texture (e.g. a
+/// dma-buf exported from Servo's offscreen framebuffer) and composites it
+/// at `bounds`. The texture and optional fence are obtained from the
+/// embedder via [`crate::external_texture::ExternalGpuTexture`]; gpui
+/// imports them lazily in the wgpu backend on each draw.
+#[derive(Clone)]
+#[allow(missing_docs)]
+pub struct ExternalSprite {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub opacity: f32,
+    pub handle: ExternalGpuTextureHandle,
+}
+
+impl Debug for ExternalSprite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalSprite")
+            .field("order", &self.order)
+            .field("bounds", &self.bounds)
+            .field("content_mask", &self.content_mask)
+            .field("corner_radii", &self.corner_radii)
+            .field("opacity", &self.opacity)
+            .field("handle", &"<ExternalGpuTexture>")
+            .finish()
+    }
+}
+
+impl From<ExternalSprite> for Primitive {
+    fn from(sprite: ExternalSprite) -> Self {
+        Primitive::ExternalSprite(sprite)
     }
 }
 

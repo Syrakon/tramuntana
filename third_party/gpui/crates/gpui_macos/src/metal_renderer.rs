@@ -843,6 +843,11 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                PrimitiveBatch::ExternalSprites(_) => {
+                    // Stage 2 cross-API texture handoff. macOS port would use
+                    // IOSurface; not wired in the Metal renderer yet.
+                    true
+                }
             };
             if !ok {
                 command_encoder.end_encoding();

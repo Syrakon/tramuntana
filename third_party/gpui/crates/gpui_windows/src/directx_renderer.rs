@@ -338,6 +338,12 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::ExternalSprites(_) => {
+                    // Stage 2 cross-API texture handoff. Windows port would
+                    // use NT handles / D3D11/D3D12 shared resources; not
+                    // wired in the DirectX renderer yet.
+                    Ok(())
+                }
             }
             .context(format!(
                 "scene too large:\

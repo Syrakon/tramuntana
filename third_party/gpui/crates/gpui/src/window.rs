@@ -3844,6 +3844,45 @@ impl Window {
         Ok(())
     }
 
+    /// Paint an externally-managed GPU texture into the scene at the current
+    /// z-index. The texture (and optional GPU completion fence) come from
+    /// the embedder via an [`ExternalGpuTexture`] implementation; gpui_wgpu
+    /// imports them on each draw using `wgpu_hal` and composites directly,
+    /// without going through the sprite atlas or any CPU staging.
+    ///
+    /// This is the consumer side of the Stage 2 cross-API GPU sharing
+    /// bridge (Servo's framebuffer → dma-buf → wgpu) — see
+    /// [`crate::external_texture`] for the trait definition and
+    /// `tramuntana/docs/STAGE_2_GPU_SHARING.md` for the end-to-end design.
+    ///
+    /// This method should only be called as part of the paint phase of
+    /// element drawing.
+    pub fn paint_external_image(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        handle: crate::external_texture::ExternalGpuTextureHandle,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        let corner_radii = corner_radii.scale(self.scale_factor());
+        let opacity = self.element_opacity();
+
+        self.next_frame
+            .scene
+            .insert_primitive(crate::scene::ExternalSprite {
+                order: 0,
+                bounds,
+                content_mask,
+                corner_radii,
+                opacity,
+                handle,
+            });
+        Ok(())
+    }
+
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.

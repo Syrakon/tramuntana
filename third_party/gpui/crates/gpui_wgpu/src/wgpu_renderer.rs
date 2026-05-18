@@ -1305,6 +1305,16 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        PrimitiveBatch::ExternalSprites(_range) => {
+                            // Stage 2 GPU sharing — external dma-buf/IOSurface/
+                            // NT-handle textures. The render pipeline that
+                            // imports them via wgpu_hal::vulkan and draws a
+                            // textured quad isn't wired up yet (2b.4 of the
+                            // Stage 2 plan). Silently drop for now so element
+                            // trees that already emit `paint_external_image`
+                            // calls don't panic at runtime.
+                            true
+                        }
                     };
                     if !ok {
                         overflow = true;
