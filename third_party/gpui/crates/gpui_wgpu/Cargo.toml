@@ -39,6 +39,19 @@ font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f281
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 pollster.workspace = true
 
+# Stage 2 dma-buf import (Linux/FreeBSD): we need to reach into wgpu's
+# Vulkan backend via wgpu-hal and call ash directly to wire
+# VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier into
+# a wgpu::Texture. See `src/external_texture_import.rs`.
+# wgpu-hal is reached via `wgpu::hal` (it's `pub extern crate wgpu_hal as hal`
+# in wgpu/lib.rs), so we don't declare a direct dep — that would create two
+# different versions in the crate graph and `wgpu::hal::api::Vulkan` would
+# not match the type wgpu uses internally. Same for ash: accessed via
+# `wgpu::hal::vulkan` re-exports.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+ash = "0.38"
+libc.workspace = true
+
 [target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen.workspace = true
 wasm-bindgen-futures = "0.4"
