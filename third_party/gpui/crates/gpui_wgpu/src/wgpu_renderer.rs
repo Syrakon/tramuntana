@@ -118,6 +118,12 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
+    /// NEAREST-filtered sampler for external textures (Stage 2 dma-buf
+    /// handoff). Avoids the sub-pixel blur that LINEAR introduces when the
+    /// imported texture is mapped ~1:1 onto the screen. Atlas-based sprites
+    /// keep using the LINEAR `atlas_sampler` because subpixel font
+    /// anti-aliasing depends on it.
+    external_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
@@ -373,6 +379,19 @@ impl WgpuRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // NEAREST would be pixel-perfect *if* gpui's rasterisation area
+        // matched the texture size exactly. In practice tiling WMs and
+        // Wayland fractional scaling routinely give us a different
+        // physical area, and until Servo can be safely resized at runtime
+        // (see BACKLOG.md "Window resize"), the texture is going to be
+        // upscaled or downscaled. LINEAR softens that into blur rather
+        // than the much more visible NEAREST aliasing.
+        let external_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("external_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
@@ -459,6 +478,7 @@ impl WgpuRenderer {
             pipelines,
             bind_group_layouts,
             atlas_sampler,
+            external_sampler,
             globals_buffer,
             globals_bind_group,
             path_globals_bind_group,
@@ -1528,17 +1548,64 @@ impl WgpuRenderer {
                 };
                 let data = bytemuck::bytes_of(&instance);
 
-                let ok = self.draw_instances_with_texture(
-                    data,
-                    1,
-                    &view,
-                    &resources.pipelines.external_sprites,
-                    instance_offset,
-                    pass,
-                );
-                if !ok {
-                    return false;
+                // One-shot scaling diagnostic (per-process). Compares the
+                // quad bounds (in device pixels) the rasteriser will paint
+                // against the imported texture's extent. If they differ,
+                // the visible blur / pixelation is upscale/downscale and
+                // we know to renegotiate Servo's render size.
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    let tex_size = texture.size();
+                    eprintln!(
+                        "external_sprite scale check: quad bounds=({:.0},{:.0} @ {:.0}x{:.0}), texture extent={}x{}",
+                        sprite.bounds.origin.x.0,
+                        sprite.bounds.origin.y.0,
+                        sprite.bounds.size.width.0,
+                        sprite.bounds.size.height.0,
+                        tex_size.width,
+                        tex_size.height,
+                    );
                 }
+
+                // Inline draw, NOT via `draw_instances_with_texture`, so
+                // the bind group binds `external_sampler` (NEAREST)
+                // instead of the atlas's LINEAR sampler. Atlas filtering
+                // is right for fonts/icons; for the Servo framebuffer
+                // mapped ~1:1 onto the viewport, LINEAR introduces visible
+                // blur because UV coords land on fractional pixel
+                // boundaries.
+                let Some((buf_offset, buf_size)) =
+                    self.write_to_instance_buffer(instance_offset, data)
+                else {
+                    return false;
+                };
+                let bind_group = resources.device.create_bind_group(
+                    &wgpu::BindGroupDescriptor {
+                        label: Some("external_sprite_bind_group"),
+                        layout: &resources.bind_group_layouts.instances_with_texture,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.instance_binding(buf_offset, buf_size),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(
+                                    &resources.external_sampler,
+                                ),
+                            },
+                        ],
+                    },
+                );
+                pass.set_pipeline(&resources.pipelines.external_sprites);
+                pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+                pass.set_bind_group(1, &bind_group, &[]);
+                pass.draw(0..4, 0..1);
                 // `texture` and `view` drop here at end of scope; wgpu-hal's
                 // `TextureMemory::Dedicated` arm runs `vkFreeMemory` on
                 // teardown so the imported memory is released.
