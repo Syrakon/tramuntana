@@ -16,13 +16,24 @@ stages:
   - upstream-sync
 
 # ---- Per-push: minimal compile gate. ------------------------------------
+#
+# tramuntana's Cargo.toml uses `path = "../stylo/..."` for the stylo
+# family of crates (introduced when we vendored gpui — easier to iterate
+# on stylo locally than pinning a git rev). The GitLab runner only
+# clones the project being built, so we need to clone the syrakon/stylo
+# fork next to tramuntana before cargo can resolve those paths.
 check-paint-api:
   stage: check
   image: rust:1.94-slim
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "merge_request_event"'
-  script:
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends ca-certificates git
+    # `../stylo` relative to the project checkout (CI clones tramuntana into
+    # `/builds/<group>/tramuntana/`, so the sibling is `/builds/<group>/stylo/`).
+    - git clone --depth 1 https://gitlab.com/syrakon/stylo.git ../stylo
     - rustup default 1.94.0
+  script:
     - RUST_MIN_STACK=33554432 cargo check -p servo-paint-api --lib
   cache:
     key: cargo-paint-api
