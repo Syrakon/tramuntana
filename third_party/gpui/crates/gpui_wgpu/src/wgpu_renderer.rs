@@ -1548,26 +1548,6 @@ impl WgpuRenderer {
                 };
                 let data = bytemuck::bytes_of(&instance);
 
-                // One-shot scaling diagnostic (per-process). Compares the
-                // quad bounds (in device pixels) the rasteriser will paint
-                // against the imported texture's extent. If they differ,
-                // the visible blur / pixelation is upscale/downscale and
-                // we know to renegotiate Servo's render size.
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    let tex_size = texture.size();
-                    eprintln!(
-                        "external_sprite scale check: quad bounds=({:.0},{:.0} @ {:.0}x{:.0}), texture extent={}x{}",
-                        sprite.bounds.origin.x.0,
-                        sprite.bounds.origin.y.0,
-                        sprite.bounds.size.width.0,
-                        sprite.bounds.size.height.0,
-                        tex_size.width,
-                        tex_size.height,
-                    );
-                }
-
                 // Inline draw, NOT via `draw_instances_with_texture`, so
                 // the bind group binds `external_sampler` (NEAREST)
                 // instead of the atlas's LINEAR sampler. Atlas filtering
