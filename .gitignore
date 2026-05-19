@@ -78,3 +78,9 @@ support/macos/Brewfile.lock.json
 
 # Justfiles
 justfile
+
+# Torii snapshots (created by torii history reauthor / rebase / etc.
+# as backup before destructive operations — useful locally, must never
+# be committed: each one contains a full copy of .git including upstream
+# refs, which inflates the repo by ~600 MB per snapshot)
+/.torii/

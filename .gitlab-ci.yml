@@ -30,6 +30,10 @@ check-paint-api:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "merge_request_event"'
   before_script:
+    # Shell executor doesn't run a login shell, so rustup isn't on PATH.
+    # The runner user (outsider or gitlab-runner) has rustup installed in
+    # ~/.cargo; surface it before invoking rustup/cargo.
+    - export PATH="$HOME/.cargo/bin:$PATH"
     # Keep ../stylo up to date (clone first time, fetch+reset every run).
     - |
       if [ -d ../stylo/.git ]; then
