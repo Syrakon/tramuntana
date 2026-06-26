@@ -30,10 +30,10 @@
 #![cfg(any(target_os = "linux", target_os = "freebsd"))]
 #![allow(unsafe_code)]
 
-use std::os::fd::IntoRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 
 use ash::vk;
-use gpui::external_texture::ExternalTextureDescriptor;
+use gpui::external_texture::{ExternalFence, ExternalTextureDescriptor};
 
 /// Import an external GPU texture descriptor (currently only the
 /// `DmaBuf` variant) into a `wgpu::Texture` backed by the same physical
@@ -65,6 +65,76 @@ pub fn import_external_texture(
             );
             None
         }
+    }
+}
+
+/// Block until the producer's GPU work behind `fence` has completed, so the
+/// draw that samples the imported texture reads a finished frame instead of
+/// racing the blit that fills the dma-buf.
+///
+/// `fence` is a Linux `sync_file` fd (exported on the producer via
+/// `EGL_ANDROID_native_fence_sync` right after the blit). It becomes readable
+/// (`POLLIN`) once the GL commands it snapshots — Servo's paint plus our blit
+/// into the shared texture — finish on the GPU.
+///
+/// We wait on the CPU with `poll()` rather than importing the fd as a
+/// `VkSemaphore` and waiting on the queue. Reason: gpui draws through wgpu, and
+/// wgpu does not expose a way to inject a wait semaphore into the submission
+/// that samples the texture. A separate wait-only `vkQueueSubmit` would only
+/// order ahead of wgpu's submission by relying on driver-specific intra-queue
+/// behaviour — the exact "correct by luck" hazard this fence exists to remove.
+/// The CPU wait is unconditionally correct, and because a lot of scene-building
+/// happens between the producer's `glFlush` and this call, the blit is usually
+/// already done by the time we get here: the stall is near-zero when the GPU
+/// keeps up and only blocks (correctly, as back-pressure) under load.
+///
+/// Best-effort: on timeout or `poll` error we log and return, letting the draw
+/// proceed rather than hang the UI thread on a fence that never signals.
+pub fn wait_external_fence(fence: ExternalFence) {
+    match fence {
+        ExternalFence::SyncFd(fd) => {
+            // A blit at 1920x1080 completes in well under a millisecond;
+            // anything near this bound means the producer fence never signalled
+            // (driver bug) and blocking the UI thread longer helps no one.
+            const TIMEOUT_MS: libc::c_int = 1000;
+            let mut pfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = loop {
+                // SAFETY: `pfd` is a single valid `pollfd`; `fd` is kept alive
+                // by the `OwnedFd` binding for the whole loop, so the
+                // descriptor stays valid across the call.
+                let rc = unsafe { libc::poll(&mut pfd, 1, TIMEOUT_MS) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue; // EINTR — resume waiting rather than skip it
+                    }
+                    break Err(err);
+                }
+                break Ok(rc);
+            };
+            match result {
+                // 1 fd ready: the sync_file signalled (or surfaced POLLERR/HUP,
+                // in which case there is nothing better to do than proceed).
+                Ok(1) => {}
+                Ok(_) => log::warn!(
+                    "wait_external_fence: sync fd did not signal within {TIMEOUT_MS}ms; \
+                     sampling a possibly-incomplete frame"
+                ),
+                Err(err) => log::warn!("wait_external_fence: poll() failed: {err}"),
+            }
+            // `fd` (OwnedFd) drops here, closing the sync_file descriptor now
+            // that it has been waited on.
+        }
+        // ExternalFence is #[non_exhaustive]; future variants (MachPort,
+        // Win32Event) need their own wait path. Until one exists, NOT waiting
+        // is unsound, so make the gap loud instead of silently racing.
+        other => log::warn!(
+            "wait_external_fence: unsupported fence variant on this build: {other:?}"
+        ),
     }
 }
 

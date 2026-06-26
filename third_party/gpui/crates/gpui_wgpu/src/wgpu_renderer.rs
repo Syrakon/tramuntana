@@ -1535,6 +1535,19 @@ impl WgpuRenderer {
                         continue;
                     }
                 };
+
+                // Wait for the producer's blit into the dma-buf to finish
+                // before sampling it below. Without this the GPU read races the
+                // GL blit that fills the shared texture — only a bare glFlush
+                // sits on the producer side, which gives no GL→Vulkan ordering
+                // guarantee — and shows as tearing or a half-painted frame under
+                // load. The fence is single-use per paint: on frames where
+                // Servo produced nothing new `fence()` returns None and we skip,
+                // since that buffer was already waited on when first exported.
+                if let Some(fence) = sprite.handle.fence() {
+                    crate::external_texture_import::wait_external_fence(fence);
+                }
+
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
                 let instance = ExternalSpriteInstance {
