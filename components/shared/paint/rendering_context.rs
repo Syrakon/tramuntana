@@ -1224,18 +1224,29 @@ mod dma_buf_export {
         dup_fence_fd: Option<EglDupNativeFenceFdAndroid>,
     }
 
-    /// Per-(WindowRenderingContext, size) cached state for the Stage 2 export.
-    pub(super) struct Cache {
-        /// Our private GL texture, owned by this `Cache`. Never bound to any
-        /// surfman surface, so EGL doesn't see another sibling claim it.
-        /// Kept in the struct purely for lifetime/ownership tracking — the
-        /// EGLImage we build from it must outlive the texture, so we hold a
-        /// reference here until the cache is invalidated. Read directly only
-        /// during `build_cache`.
+    /// Number of dma-buf slots in the export ring. The producer round-robins
+    /// through these so it never blits into the buffer the consumer is still
+    /// sampling from a previous frame — the write-after-read hazard a single
+    /// reused buffer has.
+    ///
+    /// 2 (double-buffering) is the minimum that makes the common case — the
+    /// consumer at most one frame behind — safe. Bump to 3 (triple) if tearing
+    /// ever shows under a deeper GPU pipeline (wgpu + the compositor can keep
+    /// two frames in flight); the only cost is one extra full-resolution buffer
+    /// (~8 MB at 1080p). The forward fence (`make_fence_fd`) covers the
+    /// read-after-write direction; this ring covers write-after-read.
+    const EXPORT_RING_LEN: usize = 2;
+
+    /// One slot of the export ring: a private GL texture + FBO, exported once
+    /// as a dma-buf. The producer blits into a different slot each frame.
+    struct ExportBuffer {
+        /// Our private GL texture, owned by this buffer. Never bound to any
+        /// surfman surface, so EGL doesn't see another sibling claim it. Kept
+        /// purely for lifetime/ownership tracking and the build-time log; the
+        /// EGLImage built from it must outlive the texture.
         #[allow(dead_code)]
         gl_texture: u32,
-        /// FBO whose color attachment is `gl_texture`. Used as the BLIT
-        /// destination from surfman's read framebuffer.
+        /// FBO whose color attachment is `gl_texture`. The BLIT destination.
         gl_fbo: u32,
         /// Owned dma-buf fd. Dup'd into each emitted [`DmaBufHandle`] so the
         /// consumer can close their copy independently.
@@ -1243,34 +1254,60 @@ mod dma_buf_export {
         /// Owned EGLImage backing `gl_texture`. Kept alive so the dma-buf fd
         /// remains valid; destroyed on cache invalidation.
         egl_image: egl::EGLImage,
-        /// EGL display handle the cache was built with. Stored so we can
-        /// tear down `egl_image` and any fence sync correctly.
-        egl_display: egl::EGLDisplay,
-        /// EGL extension entry points. Loaded once, reused across frames.
-        egl_funcs: EglFuncs,
-        /// Texture dimensions matching `gl_texture` and `egl_image`.
-        width: u32,
-        height: u32,
+        /// Export format, queried per buffer. Identical across the ring in
+        /// practice (same size/format) but each EGLImage reports its own.
         fourcc: u32,
         modifier: u64,
         stride: u32,
         offset: u32,
     }
 
+    /// Per-(WindowRenderingContext, size) cached state for the Stage 2 export:
+    /// a ring of [`ExportBuffer`]s plus the shared EGL handles, rebuilt only on
+    /// resize.
+    pub(super) struct Cache {
+        /// The export ring. Length is [`EXPORT_RING_LEN`].
+        buffers: Vec<ExportBuffer>,
+        /// Index of the slot to blit into on the next export. Advances
+        /// round-robin, wrapping at `buffers.len()`.
+        next: usize,
+        /// EGL display handle the cache was built with. Stored so we can tear
+        /// down each `egl_image` and any fence sync correctly.
+        egl_display: egl::EGLDisplay,
+        /// EGL extension entry points. Loaded once, reused across frames and
+        /// shared by every buffer in the ring.
+        egl_funcs: EglFuncs,
+        /// Ring dimensions. All buffers match; used for the resize check and to
+        /// stamp emitted [`DmaBufHandle`]s.
+        width: u32,
+        height: u32,
+    }
+
+    /// Destroy the EGLImages backing a set of export buffers so the kernel can
+    /// release the dma-buf memory once all importers close their copies. The
+    /// owned `dma_buf_fd`s close themselves via `OwnedFd`'s Drop afterwards
+    /// (when the `Vec<ExportBuffer>` drops). Used both on cache teardown and on
+    /// the partial-failure path in `build_cache`.
+    fn destroy_export_buffers(
+        buffers: &[ExportBuffer],
+        egl_funcs: &EglFuncs,
+        display: egl::EGLDisplay,
+    ) {
+        for buf in buffers {
+            unsafe {
+                (egl_funcs.destroy_image)(display, buf.egl_image);
+            }
+        }
+        // GL textures and FBOs leak deliberately: we don't have access to the
+        // surfman gl handle here, and they belong to a context that is about to
+        // be destroyed when the RenderingContext drops anyway. Not worth
+        // carrying an Rc<dyn Gl> in Cache to clean GL ids the driver releases on
+        // context teardown.
+    }
+
     impl Drop for Cache {
         fn drop(&mut self) {
-            // Destroy the EGLImage so the kernel can release the dma-buf
-            // backing memory once all importers also close their copies.
-            // The owned `dma_buf_fd` closes itself via OwnedFd::Drop right
-            // after.
-            unsafe {
-                (self.egl_funcs.destroy_image)(self.egl_display, self.egl_image);
-            }
-            // GL texture and FBO leak deliberately: we don't have access to
-            // the surfman gl handle from Drop, and they belong to a context
-            // that is about to be destroyed when the RenderingContext drops
-            // anyway. Not worth carrying an Rc<dyn Gl> in Cache to clean a
-            // pair of GL ids that the driver releases on context teardown.
+            destroy_export_buffers(&self.buffers, &self.egl_funcs, self.egl_display);
         }
     }
 
@@ -1304,6 +1341,50 @@ mod dma_buf_export {
             dup_fence_fd: unsafe { load(&egl_instance, "eglDupNativeFenceFDANDROID") },
         };
 
+        // Build the export ring. On any per-buffer failure, tear down the
+        // buffers built so far before bailing so we don't leak EGLImages /
+        // dma-buf fds.
+        let mut buffers = Vec::with_capacity(EXPORT_RING_LEN);
+        for i in 0..EXPORT_RING_LEN {
+            match build_export_buffer(size, gl, display.as_ptr(), context.as_ptr(), &egl_funcs) {
+                Some(buffer) => buffers.push(buffer),
+                None => {
+                    log::warn!(
+                        "Stage 2 cache: failed to build export buffer {}/{EXPORT_RING_LEN}",
+                        i + 1
+                    );
+                    destroy_export_buffers(&buffers, &egl_funcs, display.as_ptr());
+                    return None;
+                }
+            }
+        }
+
+        log::info!(
+            "Stage 2 cache: built {EXPORT_RING_LEN}-buffer export ring {}x{}",
+            size.width, size.height
+        );
+
+        Some(Cache {
+            buffers,
+            next: 0,
+            egl_display: display.as_ptr(),
+            egl_funcs,
+            width: size.width,
+            height: size.height,
+        })
+    }
+
+    /// Build one ring slot: a private RGBA8 texture + FBO, wrapped as an
+    /// EGLImage and exported as a single-plane dma-buf. Cleans up its own
+    /// partial GL state on failure. `display` / `context` are the current EGL
+    /// handles; `egl_funcs` the shared entry points.
+    fn build_export_buffer(
+        size: PhysicalSize<u32>,
+        gl: &Rc<dyn Gl>,
+        display: egl::EGLDisplay,
+        context: egl::EGLContext,
+        egl_funcs: &EglFuncs,
+    ) -> Option<ExportBuffer> {
         // Create the private intermediate texture: RGBA8, linear filtering,
         // wrap clamp-to-edge. The format/modifier we get out of the EGL
         // export query is determined by the driver but for GL_RGBA8 + linear
@@ -1363,8 +1444,8 @@ mod dma_buf_export {
         let buffer = texture as usize as egl::EGLClientBuffer;
         let image = unsafe {
             (egl_funcs.create_image)(
-                display.as_ptr(),
-                context.as_ptr(),
+                display,
+                context,
                 EGL_GL_TEXTURE_2D_KHR,
                 buffer,
                 attrib_list.as_ptr(),
@@ -1384,7 +1465,7 @@ mod dma_buf_export {
         let mut modifier: u64 = 0;
         let ok = unsafe {
             (egl_funcs.export_query)(
-                display.as_ptr(),
+                display,
                 image,
                 &mut fourcc,
                 &mut num_planes,
@@ -1394,7 +1475,7 @@ mod dma_buf_export {
         if ok != EGL_TRUE {
             log::warn!("Stage 2 cache: eglExportDMABUFImageQueryMESA failed");
             unsafe {
-                (egl_funcs.destroy_image)(display.as_ptr(), image);
+                (egl_funcs.destroy_image)(display, image);
             }
             gl.delete_framebuffers(&fbos);
             gl.delete_textures(&textures);
@@ -1405,7 +1486,7 @@ mod dma_buf_export {
                 "Stage 2 cache: dma-buf export returned {num_planes} planes; single-plane only"
             );
             unsafe {
-                (egl_funcs.destroy_image)(display.as_ptr(), image);
+                (egl_funcs.destroy_image)(display, image);
             }
             gl.delete_framebuffers(&fbos);
             gl.delete_textures(&textures);
@@ -1417,7 +1498,7 @@ mod dma_buf_export {
         let mut offset: egl::Int = 0;
         let ok = unsafe {
             (egl_funcs.export_image)(
-                display.as_ptr(),
+                display,
                 image,
                 &mut fd_raw,
                 &mut stride,
@@ -1427,7 +1508,7 @@ mod dma_buf_export {
         if ok != EGL_TRUE || fd_raw < 0 {
             log::warn!("Stage 2 cache: eglExportDMABUFImageMESA failed (returned fd = {fd_raw})");
             unsafe {
-                (egl_funcs.destroy_image)(display.as_ptr(), image);
+                (egl_funcs.destroy_image)(display, image);
             }
             gl.delete_framebuffers(&fbos);
             gl.delete_textures(&textures);
@@ -1437,19 +1518,15 @@ mod dma_buf_export {
         let dma_buf_fd = unsafe { OwnedFd::from_raw_fd(fd_raw) };
 
         log::info!(
-            "Stage 2 cache: built intermediate {}x{} (texture={}, fbo={}, fourcc=0x{:08x}, modifier=0x{:016x}, stride={}, offset={})",
+            "Stage 2 cache: built ring buffer {}x{} (texture={}, fbo={}, fourcc=0x{:08x}, modifier=0x{:016x}, stride={}, offset={})",
             size.width, size.height, texture, fbo, fourcc as u32, modifier, stride, offset
         );
 
-        Some(Cache {
+        Some(ExportBuffer {
             gl_texture: texture,
             gl_fbo: fbo,
             dma_buf_fd,
             egl_image: image,
-            egl_display: display.as_ptr(),
-            egl_funcs,
-            width: size.width,
-            height: size.height,
             fourcc: fourcc as u32,
             modifier,
             stride: stride as u32,
@@ -1500,7 +1577,20 @@ mod dma_buf_export {
         if cache_slot.is_none() {
             *cache_slot = Some(build_cache(size, gl)?);
         }
-        let cache = cache_slot.as_ref()?;
+        let cache = cache_slot.as_mut()?;
+
+        // Round-robin to the next ring slot. This is the write-after-read fix:
+        // blit into a buffer the consumer is NOT currently sampling instead of
+        // stomping a single shared buffer mid-read. Advance the cursor before
+        // borrowing the slot so the next frame moves on; copy the slot's scalar
+        // fields out so the immutable borrow ends before `make_fence_fd` and the
+        // fd dup re-borrow `cache`.
+        let idx = cache.next;
+        cache.next = (cache.next + 1) % cache.buffers.len();
+        let (gl_fbo, fourcc, modifier, stride, offset) = {
+            let buf = &cache.buffers[idx];
+            (buf.gl_fbo, buf.fourcc, buf.modifier, buf.stride, buf.offset)
+        };
 
         // GPU-side blit: surfman's FBO -> our private FBO.
         // Servo's FBO has Y=0 at the top in our coordinate space; for the
@@ -1508,7 +1598,7 @@ mod dma_buf_export {
         // orientation. glBlitFramebuffer copies in source coords directly, no
         // flip needed.
         gl.bind_framebuffer(gl::READ_FRAMEBUFFER, source_fbo);
-        gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, cache.gl_fbo);
+        gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, gl_fbo);
         gl.blit_framebuffer(
             0,
             0,
@@ -1527,9 +1617,9 @@ mod dma_buf_export {
 
         let fence_fd = make_fence_fd(cache);
 
-        // Dup the cached dma-buf fd so the consumer owns an independent fd
-        // that they can close without affecting our cache.
-        let fd = cache.dma_buf_fd.try_clone().ok().or_else(|| {
+        // Dup this slot's dma-buf fd so the consumer owns an independent fd it
+        // can close without affecting our cache.
+        let fd = cache.buffers[idx].dma_buf_fd.try_clone().ok().or_else(|| {
             log::warn!("Stage 2 export: failed to dup cached dma-buf fd");
             None
         })?;
@@ -1538,10 +1628,10 @@ mod dma_buf_export {
             fd,
             width: cache.width,
             height: cache.height,
-            fourcc: cache.fourcc,
-            stride: cache.stride,
-            offset: cache.offset,
-            modifier: cache.modifier,
+            fourcc,
+            stride,
+            offset,
+            modifier,
             fence_fd,
         })
     }
