@@ -1694,6 +1694,27 @@ impl WebGLImpl {
                     Cow::Borrowed(data),
                 );
 
+                // WebGL zero-initializes texture storage, but for a *depth*
+                // texture 0.0 is the near plane. A shadow map that a page
+                // allocates but never renders into then reads back as 0.0, and
+                // `step(distance, depth)` depth-compare lookups treat every
+                // surface as fully occluded — the scene goes black (fatal when
+                // a single light, e.g. one star, is the only illumination).
+                // Initialize empty depth allocations to the far plane (1.0)
+                // instead so an unrendered shadow map lights rather than blacks
+                // out. Real renders overwrite this; non-empty uploads are left
+                // untouched.
+                let pixels = if is_depth_gl_format(internal_format.as_gl_constant()) &&
+                    !pixels.is_empty() &&
+                    pixels.iter().all(|&b| b == 0)
+                {
+                    let mut owned = pixels.into_owned();
+                    fill_far_depth(&mut owned, effective_data_type);
+                    Cow::Owned(owned)
+                } else {
+                    pixels
+                };
+
                 unsafe {
                     gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, unpacking_alignment as i32);
                     gl.tex_image_2d(
@@ -2029,7 +2050,9 @@ impl WebGLImpl {
                 count,
                 type_,
                 offset,
-            } => unsafe { gl.draw_elements(mode, count, type_, offset as _) },
+            } => unsafe {
+                gl.draw_elements(mode, count, type_, offset as _)
+            },
             WebGLCommand::DrawElementsInstanced {
                 mode,
                 count,
@@ -2844,6 +2867,51 @@ fn map_dot_separated<F: Fn(&str, &mut String)>(s: &str, f: F) -> String {
 }
 
 #[expect(clippy::too_many_arguments)]
+/// Whether a GL internal format is a depth (or depth-stencil) format.
+fn is_depth_gl_format(internal_format: u32) -> bool {
+    matches!(
+        internal_format,
+        0x1902 | // DEPTH_COMPONENT
+        0x81A5 | // DEPTH_COMPONENT16
+        0x81A6 | // DEPTH_COMPONENT24
+        0x81A7 | // DEPTH_COMPONENT32
+        0x8CAC | // DEPTH_COMPONENT32F
+        0x84F9 | // DEPTH_STENCIL
+        0x88F0 | // DEPTH24_STENCIL8
+        0x8CAD //   DEPTH32F_STENCIL8
+    )
+}
+
+/// Fill a freshly-allocated depth texture buffer with the *far* plane (1.0)
+/// for the given pixel transfer type, so an empty depth/shadow map reads as
+/// "nothing occludes" rather than "everything occludes". `step(dist, depth)`
+/// shadow lookups on an unrendered map then light the scene instead of
+/// blacking it out. See the `TexImage2D` call site for the rationale.
+fn fill_far_depth(buf: &mut [u8], effective_data_type: u32) {
+    const FLOAT: u32 = 0x1406;
+    const FLOAT_32_UNSIGNED_INT_24_8_REV: u32 = 0x8DAD;
+    match effective_data_type {
+        // 32-bit float depth: far = 1.0f.
+        FLOAT => {
+            for texel in buf.chunks_exact_mut(4) {
+                texel.copy_from_slice(&1.0f32.to_ne_bytes());
+            }
+        },
+        // DEPTH32F_STENCIL8 packs an f32 depth then a 24_8 word: depth 1.0,
+        // stencil 0.
+        FLOAT_32_UNSIGNED_INT_24_8_REV => {
+            for texel in buf.chunks_exact_mut(8) {
+                texel[..4].copy_from_slice(&1.0f32.to_ne_bytes());
+                texel[4..].fill(0);
+            }
+        },
+        // UNSIGNED_SHORT / UNSIGNED_INT / UNSIGNED_INT_24_8: the maximum
+        // normalized depth is all-ones (the stencil byte being 0xFF is
+        // harmless for shadow sampling).
+        _ => buf.fill(0xFF),
+    }
+}
+
 fn prepare_pixels(
     internal_format: TexFormat,
     data_type: TexDataType,
