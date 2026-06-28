@@ -4921,7 +4921,16 @@ impl WebGL2RenderingContextMethods<crate::DomTypeHolder> for WebGL2RenderingCont
             }
 
             self.default_fb_readbuffer.set(src);
-            self.base.send_command(WebGLCommand::ReadBuffer(src));
+
+            // Same emulated-default-framebuffer translation as `DrawBuffers`:
+            // `BACK` is invalid for the FBO that backs the default framebuffer,
+            // so map it to `COLOR_ATTACHMENT0` for the GL call (`NONE` passes
+            // through). The stored value stays `BACK` for `getParameter`.
+            let gl_src = match src {
+                constants::BACK => constants::COLOR_ATTACHMENT0,
+                src => src,
+            };
+            self.base.send_command(WebGLCommand::ReadBuffer(gl_src));
         }
     }
 
@@ -4940,7 +4949,21 @@ impl WebGL2RenderingContextMethods<crate::DomTypeHolder> for WebGL2RenderingCont
             }
 
             self.default_fb_drawbuffer.set(buffers[0]);
-            self.base.send_command(WebGLCommand::DrawBuffers(buffers));
+
+            // Servo emulates the WebGL default framebuffer with an FBO whose
+            // colour is at `COLOR_ATTACHMENT0`. `BACK` is only a valid draw
+            // buffer for a real window-system framebuffer, so passing it to
+            // `glDrawBuffers` on the emulated FBO raises `INVALID_ENUM` and the
+            // draw-buffer state is left unchanged. Map `BACK` →
+            // `COLOR_ATTACHMENT0` for the underlying GL call (`NONE` is valid
+            // for an FBO and passes through unchanged). The WebGL-visible value
+            // stored above is still `BACK`, so `getParameter(DRAW_BUFFER0)`
+            // reports the spec value.
+            let gl_buffers = vec![match buffers[0] {
+                constants::BACK => constants::COLOR_ATTACHMENT0,
+                buffer => buffer,
+            }];
+            self.base.send_command(WebGLCommand::DrawBuffers(gl_buffers));
         }
     }
 
