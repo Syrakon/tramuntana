@@ -15,7 +15,7 @@ use style::attr::AttrValue;
 use style::parser::ParserContext;
 use style::stylesheets::Origin;
 use style::values::specified::LengthPercentage;
-use style_traits::ParsingMode;
+use style_traits::{ParsingMode, ToCss};
 use uuid::Uuid;
 use xml5ever::serialize::TraversalScope;
 
@@ -92,7 +92,21 @@ impl SVGSVGElement {
             return;
         };
 
-        let xml_source: String = xml_source.into();
+        let mut xml_source: String = xml_source.into();
+
+        // The serialized markup carries no CSS context, so resvg resolves
+        // `currentColor` to its default (black) when it rasterizes. Icon
+        // libraries that paint with `stroke="currentColor"` /
+        // `fill="currentColor"` (Lucide, Feather, Heroicons, …) then come out
+        // black and vanish on dark UIs. Inject the element's computed `color`
+        // onto the root `<svg>` as a presentation attribute so `currentColor`
+        // resolves to the inherited colour; any `color` set inside the SVG
+        // still wins over a presentation attribute.
+        if let Some(style) = self.upcast::<Element>().style() {
+            let color = style.get_inherited_text().clone_color().to_css_string();
+            xml_source = xml_source.replacen("<svg", &format!("<svg color=\"{color}\""), 1);
+        }
+
         let base64_encoded_source = base64::engine::general_purpose::STANDARD.encode(xml_source);
         let data_url = format!("data:image/svg+xml;base64,{}", base64_encoded_source);
         match ServoUrl::parse(&data_url) {
