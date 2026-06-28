@@ -598,6 +598,7 @@ impl StackingContext {
         let effects = style.get_effects();
         let transform_style = style.get_used_transform_style();
         if effects.filter.0.is_empty() &&
+            effects.backdrop_filter.0.is_empty() &&
             effects.opacity == 1.0 &&
             effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
             !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
@@ -644,6 +645,52 @@ impl StackingContext {
             wr::StackingContextFlags::empty(),
             None, // snapshot
         );
+
+        // `backdrop-filter` wiring (DRAFT — needs build + visual verification).
+        // Servo parses the property but upstream marks it `layout.unimplemented`;
+        // we un-gated it in our stylo fork. The element's stacking context is now
+        // on the stack, so a BackdropFilterDisplayItem pushed here filters the
+        // backdrop *before* the element's own content paints over it. Reuses the
+        // same Filter -> FilterOp conversion as the regular `filter` property.
+        let backdrop_filters: Vec<wr::FilterOp> = effects
+            .backdrop_filter
+            .0
+            .iter()
+            .map(|filter| FilterToWebRender::to_webrender(filter, &current_color))
+            .collect();
+        if !backdrop_filters.is_empty() {
+            // The filtered region is the element's border box, expressed in the
+            // coordinate space of the stacking context's spatial node.
+            //
+            // `cumulative_border_box_rect()` gives the border box in *root*
+            // (document) space — the same convention as hit-testing. The spatial
+            // node may be a reference frame (e.g. when the element has a
+            // `transform`, as in `position: fixed; transform: translateX(-50%)`),
+            // whose local coordinate system is offset to the element's border box
+            // origin. Subtract that reference-frame offset to land the rect in the
+            // node-local space, mirroring `offset_in_fragment`. Without this, a
+            // transformed panel's rect falls outside the reference frame's local
+            // viewport and the blur is clipped away entirely.
+            let reference_frame_offset = builder
+                .paint_info
+                .scroll_tree
+                .reference_frame_offset(self.scroll_tree_node_id);
+            let border_rect = fragment
+                .cumulative_border_box_rect()
+                .to_webrender()
+                .translate(-reference_frame_offset.to_vector());
+            let mut common = builder.common_properties(border_rect, &style);
+            // Pin the item to the same spatial node and clip as the stacking
+            // context we just pushed, so the rect is interpreted in the matching
+            // space rather than the builder's `current_scroll_node_id`.
+            common.spatial_id = spatial_id;
+            if let Some(clip_chain_id) = clip_chain_id {
+                common.clip_chain_id = clip_chain_id;
+            }
+            builder
+                .wr()
+                .push_backdrop_filter(&common, &backdrop_filters, &[], &[]);
+        }
 
         true
     }
