@@ -45,6 +45,13 @@ textarea:disabled {
 /* FIXME(#36982): Use `display: block; align-content: center` instead of flex. */
 input::-servo-text-control-inner-container {
   display: flex;
+  /* Centre the value vertically. `align-items: center` (unlike the previous
+     `margin-block: auto` on the editor) keeps the text centred even when its
+     line box is taller than the field's content box — `margin: auto` collapses
+     to 0 when there is no free space, which top-aligned the text and let the
+     bottom half / descenders overflow into the input's `overflow: clip` and get
+     cut off (e.g. Google's search box). */
+  align-items: center;
   height: stretch;
   pointer-events: none;
   position: relative;
@@ -55,8 +62,6 @@ input::placeholder {
   /* This limits the block size of the inner div to that of the text size so that
      it can be centered in the container. This is only necessary for <input>. */
   block-size: fit-content !important;
-  inset-block: 0 !important;
-  margin-block: auto !important;
   white-space: pre;
 }
 

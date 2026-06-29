@@ -322,7 +322,14 @@ table:matches(
 }
 
 input:not([type=image i], [type=range i], [type=checkbox i], [type=radio i]) {
-  overflow: clip !important;
+  /* Clip long values horizontally (the field scrolls), but do NOT clip in the
+     block direction. When a page gives the field a line-height / height that
+     makes the value's line box taller than its content box, clipping the block
+     axis cuts off the top or bottom of the (centered) text — e.g. Google's
+     search box rendered "patata" as "natata". overflow-x: clip + overflow-y:
+     visible is a legal pairing and keeps the value fully visible. */
+  overflow-x: clip !important;
+  overflow-y: visible !important;
   overflow-clip-margin: 0 !important;
 }
 
