@@ -266,11 +266,14 @@ impl WebGLBuffer {
     }
 
     pub(crate) fn decrement_attached_counter(&self, operation_fallibility: Operation) {
-        self.set_attached_counter(
-            self.get_attached_counter()
-                .checked_sub(1)
-                .expect("refcount underflowed"),
-        );
+        // Saturate instead of `checked_sub(...).expect(...)`: during JS-runtime
+        // teardown, GC finalizers run in an arbitrary order, so a
+        // `WebGLVertexArrayObject` finalizer can decrement a buffer whose
+        // counter is already 0. Panicking there happens inside a finalizer that
+        // cannot unwind, which aborts the whole process. In normal operation the
+        // counter never underflows, so this matches the old behaviour; on
+        // teardown it degrades to a harmless clamp.
+        self.set_attached_counter(self.get_attached_counter().saturating_sub(1));
         if self.is_deleted() {
             self.delete(operation_fallibility);
         }
