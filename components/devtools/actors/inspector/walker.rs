@@ -23,7 +23,10 @@ use crate::{ActorMsg, EmptyReplyMsg, StreamId};
 #[derive(Serialize)]
 pub(crate) struct WalkerMsg {
     actor: String,
-    root: NodeActorMsg,
+    /// `None` when the document root can't be resolved (e.g. the pipeline is
+    /// gone mid-navigation). Optional rather than `unwrap()` so a transient
+    /// failure can't panic the devtools thread and abort the process.
+    root: Option<NodeActorMsg>,
 }
 
 #[derive(MallocSizeOf)]
@@ -439,7 +442,7 @@ impl ActorEncode<WalkerMsg> for WalkerActor {
     fn encode(&self, registry: &ActorRegistry) -> WalkerMsg {
         WalkerMsg {
             actor: self.name(),
-            root: self.root(registry).unwrap(),
+            root: self.root(registry).ok(),
         }
     }
 }
