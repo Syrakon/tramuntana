@@ -40,6 +40,14 @@ pub trait ExternalGpuTexture: Send + Sync {
     /// idle wait), which is correct but slower.
     fn fence(&self) -> Option<ExternalFence>;
 
+    /// Stable, unique id of the buffer the next [`Self::descriptor`] will
+    /// export. Lets the compositor cache the imported GPU texture per physical
+    /// buffer and skip re-importing — and even skip calling `descriptor()` —
+    /// when the producer hands back the same buffer. `None` until the first
+    /// frame is produced. Distinct buffers (double-buffer ring slots,
+    /// post-resize rebuilds) must return distinct ids.
+    fn buffer_id(&self) -> Option<u64>;
+
     /// Logical size of the texture in device pixels. Used for layout
     /// hints and bounds clipping; must match the texture extent the
     /// descriptor will export.
@@ -53,6 +61,10 @@ pub trait ExternalGpuTexture: Send + Sync {
 pub enum ExternalTextureDescriptor {
     /// Linux dma-buf single-plane RGBA texture.
     DmaBuf {
+        /// Stable, unique id of this physical buffer (see
+        /// [`ExternalGpuTexture::buffer_id`]). The compositor keys its import
+        /// cache on it.
+        buffer_id: u64,
         /// Owned dma-buf fd. Single-plane only. Closed by gpui after import.
         fd: OwnedFd,
         /// DRM fourcc (e.g. `DRM_FORMAT_ABGR8888 = 0x34324241`).

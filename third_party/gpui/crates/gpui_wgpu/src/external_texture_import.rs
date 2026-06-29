@@ -45,6 +45,9 @@ pub fn import_external_texture(
 ) -> Option<wgpu::Texture> {
     match descriptor {
         ExternalTextureDescriptor::DmaBuf {
+            // buffer_id keys the compositor's import cache (see wgpu_renderer);
+            // the importer itself doesn't need it.
+            buffer_id: _,
             fd,
             fourcc,
             modifier,

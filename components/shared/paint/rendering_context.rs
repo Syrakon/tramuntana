@@ -428,6 +428,11 @@ impl RenderingContext for SoftwareRenderingContext {
 /// `VK_EXT_image_drm_format_modifier`.
 #[derive(Debug)]
 pub struct DmaBufHandle {
+    /// Stable, unique id of the export-ring buffer this handle came from. Lets
+    /// the consumer cache the imported GPU texture per physical buffer instead
+    /// of re-importing each frame. Distinct buffers (ring slots, post-resize
+    /// rebuilds) always get distinct ids.
+    pub buffer_id: u64,
     /// Owned dma-buf file descriptor (O_CLOEXEC). Single-plane only.
     pub fd: OwnedFd,
     pub width: u32,
@@ -928,6 +933,10 @@ pub struct OffscreenRenderingContext {
     parent_context: Rc<WindowRenderingContext>,
     size: Cell<PhysicalSize<u32>>,
     framebuffer: RefCell<Framebuffer>,
+    /// Stage 2 dma-buf export cache for this context's FBO (tramuntana). Sized
+    /// to `size`; rebuilt when the offscreen FBO is resized. Mirrors the cache
+    /// on [`WindowRenderingContext`] but sources from our own framebuffer.
+    dma_buf_cache: RefCell<Option<dma_buf_export::Cache>>,
 }
 
 type RenderToParentCallback = Box<dyn Fn(&glow::Context, Rect<i32>) + Send + Sync>;
@@ -944,7 +953,24 @@ impl OffscreenRenderingContext {
             parent_context,
             size: Cell::new(size),
             framebuffer,
+            dma_buf_cache: RefCell::new(None),
         }
+    }
+
+    /// Tramuntana-only: export this offscreen context's framebuffer as a
+    /// dma-buf for zero-copy Stage 2 sharing — the same path as
+    /// [`WindowRenderingContext::export_framebuffer_dma_buf`], but sourcing
+    /// from our own FBO. The embedder can resize that FBO safely (the
+    /// `RenderingContext::resize` impl for this type just swaps the FBO),
+    /// unlike the surfman window surface. See `docs/STAGE_2_GPU_SHARING.md`.
+    pub fn export_framebuffer_dma_buf(&self) -> Option<DmaBufHandle> {
+        // Make our GL/EGL context current so the EGL export queries see the
+        // right display/context.
+        self.parent_context.make_current().ok()?;
+        let source_fbo = self.framebuffer.borrow().framebuffer_id;
+        let gl = self.parent_context.gleam_gl_api();
+        let mut cache = self.dma_buf_cache.borrow_mut();
+        dma_buf_export::blit_and_export(&mut cache, self.size.get(), source_fbo, &gl)
     }
 
     pub fn parent_context(&self) -> &WindowRenderingContext {
@@ -1157,6 +1183,7 @@ fn print_diagnostics_information_on_context_creation_failure(
 mod dma_buf_export {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use dpi::PhysicalSize;
     use gleam::gl::{self, Gl};
@@ -1224,6 +1251,12 @@ mod dma_buf_export {
         dup_fence_fd: Option<EglDupNativeFenceFdAndroid>,
     }
 
+    /// Monotonic source of unique [`ExportBuffer`] / [`DmaBufHandle`] ids. One
+    /// per physical buffer created (first build + each resize rebuild); never
+    /// reused, so the consumer can key its import cache on it without aliasing
+    /// across rebuilds.
+    static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(0);
+
     /// Number of dma-buf slots in the export ring. The producer round-robins
     /// through these so it never blits into the buffer the consumer is still
     /// sampling from a previous frame — the write-after-read hazard a single
@@ -1240,6 +1273,9 @@ mod dma_buf_export {
     /// One slot of the export ring: a private GL texture + FBO, exported once
     /// as a dma-buf. The producer blits into a different slot each frame.
     struct ExportBuffer {
+        /// Stable unique id of this physical buffer (see
+        /// [`DmaBufHandle::buffer_id`]). Keys the consumer's import cache.
+        buffer_id: u64,
         /// Our private GL texture, owned by this buffer. Never bound to any
         /// surfman surface, so EGL doesn't see another sibling claim it. Kept
         /// purely for lifetime/ownership tracking and the build-time log; the
@@ -1516,13 +1552,15 @@ mod dma_buf_export {
         }
 
         let dma_buf_fd = unsafe { OwnedFd::from_raw_fd(fd_raw) };
+        let buffer_id = NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed);
 
         log::info!(
-            "Stage 2 cache: built ring buffer {}x{} (texture={}, fbo={}, fourcc=0x{:08x}, modifier=0x{:016x}, stride={}, offset={})",
+            "Stage 2 cache: built ring buffer {}x{} (id={buffer_id}, texture={}, fbo={}, fourcc=0x{:08x}, modifier=0x{:016x}, stride={}, offset={})",
             size.width, size.height, texture, fbo, fourcc as u32, modifier, stride, offset
         );
 
         Some(ExportBuffer {
+            buffer_id,
             gl_texture: texture,
             gl_fbo: fbo,
             dma_buf_fd,
@@ -1587,9 +1625,9 @@ mod dma_buf_export {
         // fd dup re-borrow `cache`.
         let idx = cache.next;
         cache.next = (cache.next + 1) % cache.buffers.len();
-        let (gl_fbo, fourcc, modifier, stride, offset) = {
+        let (gl_fbo, buffer_id, fourcc, modifier, stride, offset) = {
             let buf = &cache.buffers[idx];
-            (buf.gl_fbo, buf.fourcc, buf.modifier, buf.stride, buf.offset)
+            (buf.gl_fbo, buf.buffer_id, buf.fourcc, buf.modifier, buf.stride, buf.offset)
         };
 
         // GPU-side blit: surfman's FBO -> our private FBO.
@@ -1625,6 +1663,7 @@ mod dma_buf_export {
         })?;
 
         Some(DmaBufHandle {
+            buffer_id,
             fd,
             width: cache.width,
             height: cache.height,
