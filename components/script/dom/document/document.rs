@@ -3786,6 +3786,12 @@ impl Document {
         );
     }
 
+    /// Whether script or layout is currently blocked (the DOM is mid-mutation).
+    /// A reflow must not run in that state.
+    pub(crate) fn script_and_layout_blocked(&self) -> bool {
+        self.script_and_layout_blockers.get() > 0
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         window: &Window,

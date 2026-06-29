@@ -2610,7 +2610,15 @@ impl Window {
             return Default::default();
         }
 
-        self.Document().ensure_safe_to_run_script_or_layout();
+        // A reflow while script/layout is blocked (the DOM is mid-mutation)
+        // would re-enter and previously `assert!`-panicked, killing the script
+        // thread — and hanging the compositor that waits on it (the whole
+        // browser stops responding). Skip instead; the reflow runs once the
+        // blocker clears, which is how real browsers behave.
+        if document.script_and_layout_blocked() {
+            warn!("reflow requested while DOM is mid-mutation; skipping to avoid re-entrancy");
+            return Default::default();
+        }
 
         // If layouts are blocked, we block all layouts that are for display only. Other
         // layouts (for queries and scrolling) are not blocked, as they do not display
