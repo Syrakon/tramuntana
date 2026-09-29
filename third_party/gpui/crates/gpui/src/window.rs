@@ -2,7 +2,8 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
+    AccessNode, AccessNodeId, AccessSpec, AccessUpdate, AsyncWindowContext, AvailableSpace,
+    Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -809,6 +810,11 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// Elements that declared an accessibility role this frame, in paint
+    /// order, plus the ids already handed out — two controls with the same
+    /// name must not collapse into one node for assistive technology.
+    pub(crate) accessibility: Vec<AccessNode>,
+    pub(crate) accessibility_ids: FxHashSet<AccessNodeId>,
 }
 
 #[derive(Clone, Default)]
@@ -858,6 +864,8 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            accessibility: Vec::new(),
+            accessibility_ids: FxHashSet::default(),
         }
     }
 
@@ -874,6 +882,8 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.accessibility.clear();
+        self.accessibility_ids.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -2582,6 +2592,14 @@ impl Window {
     #[profiling::function]
     fn present(&mut self) {
         self.platform_window.draw(&self.rendered_frame.scene);
+        // Assistive technology sees the frame that was just presented, not the
+        // one being built. Backends with no accessibility support ignore this.
+        self.platform_window
+            .update_accessibility(AccessUpdate {
+                nodes: &self.rendered_frame.accessibility,
+                focus: self.rendered_frame.focus,
+                window_active: self.rendered_frame.window_active,
+            });
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);
@@ -4051,6 +4069,48 @@ impl Window {
             self.next_frame.focus = Some(focus_handle.id);
         }
         self.next_frame.dispatch_tree.set_focus_id(focus_handle.id);
+    }
+
+    /// Describe the element being painted to assistive technology.
+    ///
+    /// Called from the paint phase once the element's bounds are known.
+    /// Elements that never call this are invisible to screen readers, so the
+    /// chrome has to annotate its controls — see [`crate::accessibility`].
+    ///
+    /// `element_id` only steers the node's identity: it keeps the id stable
+    /// across frames even when the label changes (a tab being renamed stays
+    /// the same tab). Elements without one fall back to hashing role + label.
+    pub fn insert_accessible_node(
+        &mut self,
+        spec: AccessSpec,
+        element_id: Option<&ElementId>,
+        bounds: Bounds<Pixels>,
+        focus_id: Option<FocusId>,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        // Two controls can legitimately share a name (two tabs both titled
+        // "New Tab"). Walk the disambiguator until the id is free so each one
+        // is its own node.
+        let mut disambiguator = 0;
+        let id = loop {
+            let id = AccessNodeId::derive(element_id, spec.role, &spec.label, disambiguator);
+            if self.next_frame.accessibility_ids.insert(id) {
+                break id;
+            }
+            disambiguator += 1;
+        };
+
+        self.next_frame.accessibility.push(AccessNode {
+            id,
+            role: spec.role,
+            label: spec.label,
+            value: spec.value,
+            selected: spec.selected,
+            disabled: spec.disabled,
+            bounds,
+            focus_id,
+        });
     }
 
     /// Sets the view id for the current element, which will be used to manage view caching.

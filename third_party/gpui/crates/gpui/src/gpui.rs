@@ -9,6 +9,8 @@ extern crate self as gpui;
 pub static GPUI_MANIFEST_DIR: &'static str = env!("CARGO_MANIFEST_DIR");
 #[macro_use]
 mod action;
+/// Opt-in accessibility metadata for assistive technology.
+pub mod accessibility;
 mod app;
 
 mod arena;
@@ -79,6 +81,7 @@ mod seal {
     pub trait Sealed {}
 }
 
+pub use accessibility::*;
 pub use action::*;
 pub use anyhow::Result;
 pub use app::*;

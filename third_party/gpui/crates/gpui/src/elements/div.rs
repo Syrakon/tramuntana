@@ -17,7 +17,8 @@
 
 use crate::PinchEvent;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
+    AccessRole, AccessSpec, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds,
+    ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, Hitbox,
     HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent,
     KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
@@ -680,6 +681,46 @@ pub trait InteractiveElement: Sized {
     /// Assign this element to a group of elements that can be styled together
     fn group(mut self, group: impl Into<SharedString>) -> Self {
         self.interactivity().group = Some(group.into());
+        self
+    }
+
+    /// Describe this element to assistive technology: what it is, and how it
+    /// is named when read aloud.
+    ///
+    /// Elements without this are not in the accessibility tree at all — GPUI
+    /// does not infer semantics from layout, so a screen reader sees only what
+    /// is declared here. See [`crate::accessibility`].
+    fn a11y(mut self, role: AccessRole, label: impl Into<SharedString>) -> Self {
+        self.interactivity().accessibility = Some(AccessSpec::new(role, label));
+        self
+    }
+
+    /// Set the current contents reported for this element — the text in a
+    /// field, the title of the selected tab. No effect unless [`Self::a11y`]
+    /// was called on the same element.
+    fn a11y_value(mut self, value: impl Into<SharedString>) -> Self {
+        if let Some(spec) = self.interactivity().accessibility.as_mut() {
+            spec.value = Some(value.into());
+        }
+        self
+    }
+
+    /// Report whether this element is the selected one among its siblings —
+    /// the active tab, the chosen option. No effect unless [`Self::a11y`] was
+    /// called on the same element.
+    fn a11y_selected(mut self, selected: bool) -> Self {
+        if let Some(spec) = self.interactivity().accessibility.as_mut() {
+            spec.selected = Some(selected);
+        }
+        self
+    }
+
+    /// Report this element as present but unusable. No effect unless
+    /// [`Self::a11y`] was called on the same element.
+    fn a11y_disabled(mut self, disabled: bool) -> Self {
+        if let Some(spec) = self.interactivity().accessibility.as_mut() {
+            spec.disabled = disabled;
+        }
         self
     }
 
@@ -1672,6 +1713,9 @@ pub struct Interactivity {
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) group: Option<SharedString>,
+    /// What this element is, for assistive technology. `None` — the default —
+    /// keeps the element out of the accessibility tree entirely.
+    pub(crate) accessibility: Option<AccessSpec>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
     pub base_style: Box<StyleRefinement>,
@@ -2008,6 +2052,15 @@ impl Interactivity {
                 }
                 if let Some(focus_handle) = &self.tracked_focus_handle {
                     window.next_frame.tab_stops.insert(focus_handle);
+                }
+
+                if let Some(spec) = self.accessibility.clone() {
+                    window.insert_accessible_node(
+                        spec,
+                        self.element_id.as_ref(),
+                        bounds,
+                        self.tracked_focus_handle.as_ref().map(|handle| handle.id),
+                    );
                 }
 
                 window.with_element_opacity(style.opacity, |window| {
