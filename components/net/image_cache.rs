@@ -63,6 +63,82 @@ const MAX_SVG_PIXMAP_DIMENSION: u32 = 5000;
 // Helper functions.
 // ======================================================================
 
+/// Families to try for each generic, in order, when configuring the font
+/// database used to rasterize SVGs.
+const GENERIC_FONT_FAMILY_CANDIDATES: [(&str, &[&str]); 5] = [
+    (
+        "serif",
+        &[
+            "Times New Roman",
+            "Liberation Serif",
+            "DejaVu Serif",
+            "Noto Serif",
+            "Nimbus Roman",
+            "Tinos",
+        ],
+    ),
+    (
+        "sans-serif",
+        &[
+            "Arial",
+            "Helvetica",
+            "Liberation Sans",
+            "DejaVu Sans",
+            "Noto Sans",
+            "Nimbus Sans",
+            "Arimo",
+        ],
+    ),
+    (
+        "monospace",
+        &[
+            "Courier New",
+            "Liberation Mono",
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+            "Nimbus Mono PS",
+            "Cousine",
+        ],
+    ),
+    ("cursive", &["Comic Sans MS", "Z003", "URW Chancery L"]),
+    ("fantasy", &["Impact", "P052", "URW Bookman"]),
+];
+
+/// Point each generic family at a font that is installed.
+///
+/// [`fontdb`] starts out naming Windows fonts — "Times New Roman" for serif,
+/// "Courier New" for monospace — which most Linux systems do not have. When a
+/// generic resolves to nothing, [`usvg`] drops the text that asked for it and
+/// the SVG rasterizes without it: an icon drawn with `<text>` comes out empty.
+fn configure_generic_font_families(fontdb: &mut fontdb::Database) {
+    let installed = |fontdb: &fontdb::Database, family: &str| {
+        fontdb
+            .query(&fontdb::Query {
+                families: &[fontdb::Family::Name(family)],
+                ..Default::default()
+            })
+            .is_some()
+    };
+
+    for (generic, candidates) in GENERIC_FONT_FAMILY_CANDIDATES {
+        let Some(family) = candidates
+            .iter()
+            .find(|candidate| installed(fontdb, candidate))
+        else {
+            warn!("No font installed for the generic family {generic}");
+            continue;
+        };
+        let family = (*family).to_owned();
+        match generic {
+            "serif" => fontdb.set_serif_family(family),
+            "sans-serif" => fontdb.set_sans_serif_family(family),
+            "monospace" => fontdb.set_monospace_family(family),
+            "cursive" => fontdb.set_cursive_family(family),
+            _ => fontdb.set_fantasy_family(family),
+        }
+    }
+}
+
 fn parse_svg_document_in_memory(
     bytes: &[u8],
     fontdb: Arc<fontdb::Database>,
@@ -72,11 +148,16 @@ fn parse_svg_document_in_memory(
         None
     });
 
+    // The family an SVG falls back to when it names none, which has the same
+    // Windows-centric default as the generics configured on the database.
+    let font_family = fontdb.family_name(&fontdb::Family::SansSerif).to_owned();
+
     let opt = usvg::Options {
         image_href_resolver: usvg::ImageHrefResolver {
             resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
             resolve_string: image_string_href_resolver,
         },
+        font_family,
         fontdb,
         ..usvg::Options::default()
     };
@@ -730,6 +811,7 @@ impl ImageCacheFactoryImpl {
         debug!("Creating new ImageCacheFactoryImpl");
         let mut fontdb = fontdb::Database::new();
         fontdb.load_system_fonts();
+        configure_generic_font_families(&mut fontdb);
 
         Self {
             broken_image_icon_data: Arc::new(broken_image_icon_data),
