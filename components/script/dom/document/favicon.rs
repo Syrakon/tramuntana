@@ -147,9 +147,27 @@ fn process_default_favicon_image(document: &Document, image: DecodedImage) {
                 }
                 document.set_favicon(embedder_image_from_raster(&raster_image));
             } else {
-                // Rasterization is under way; the listener calls us again with
-                // the raster image once it finishes.
-                let sender = register_image_cache_callback(document, vector_image.id);
+                // Rasterization is under way. The completed raster image is not
+                // handed to the listener, so it is collected from the cache once
+                // the listener says it is there.
+                let trusted_document = Trusted::new(document);
+                let sender = document.window().register_rasterization_complete_listener(
+                    vector_image.id,
+                    VECTOR_FAVICON_SIZE,
+                    move || {
+                        let document = trusted_document.root();
+                        let rasterized = document.window().image_cache().rasterize_vector_image(
+                            vector_image.id,
+                            VECTOR_FAVICON_SIZE,
+                            None,
+                        );
+                        if let Some(raster_image) = rasterized &&
+                            !document.has_favicon()
+                        {
+                            document.set_favicon(embedder_image_from_raster(&raster_image));
+                        }
+                    },
+                );
                 image_cache.add_rasterization_complete_listener(
                     document.window().pipeline_id(),
                     vector_image.id,

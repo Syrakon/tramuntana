@@ -869,9 +869,30 @@ impl HTMLLinkElement {
                 {
                     send_rasterized_favicon_to_embedder(&raster_image);
                 } else {
-                    // The rasterization callback will end up calling "process_favicon_response" again,
-                    // but this time with a raster image.
-                    let image_cache_sender = self.register_image_cache_callback(vector_image.id);
+                    // The completed raster image is not handed to the listener,
+                    // so "process_favicon_response" is called again with the one
+                    // the cache holds once the listener says it is ready.
+                    let trusted_link = Trusted::new(self);
+                    let request_generation_id = self.get_request_generation_id();
+                    let image_cache_sender = window.register_rasterization_complete_listener(
+                        vector_image.id,
+                        size,
+                        move || {
+                            let link_element = trusted_link.root();
+                            if request_generation_id != link_element.get_request_generation_id() {
+                                // This load is no longer relevant.
+                                return;
+                            }
+                            let rasterized = link_element
+                                .owner_window()
+                                .image_cache()
+                                .rasterize_vector_image(vector_image.id, size, None);
+                            if let Some(raster_image) = rasterized {
+                                link_element
+                                    .process_favicon_response(Image::Raster(raster_image.into()));
+                            }
+                        },
+                    );
                     image_cache.add_rasterization_complete_listener(
                         window.pipeline_id(),
                         vector_image.id,

@@ -212,6 +212,18 @@ pub struct PendingImageCallback(
     Box<dyn Fn(PendingImageResponse, &mut js::context::JSContext) + 'static>,
 );
 
+/// A callback waiting for a vector image to finish rasterizing at a given size,
+/// registered by script rather than by layout. Layout marks its nodes dirty
+/// instead, and tracks them in `pending_images_for_rasterization`.
+///
+/// This is wrapped in a struct so that we can implement `MallocSizeOf`
+/// for this type.
+#[derive(MallocSizeOf)]
+pub struct PendingRasterizationCallback(
+    #[ignore_malloc_size_of = "dyn Fn is currently impossible to measure"]
+    Box<dyn Fn() + 'static>,
+);
+
 /// Current state of the window object
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
 enum WindowState {
@@ -407,6 +419,13 @@ pub(crate) struct Window {
     /// so that the element can be marked dirty once the rasterization is completed.
     pending_images_for_rasterization: DomRefCell<
         HashMapTracedValues<PendingImageRasterizationKey, Vec<Dom<Node>>, FxBuildHasher>,
+    >,
+
+    /// Callbacks waiting for a vector image that script, not layout, asked to
+    /// rasterize — a favicon, for instance, which no node displays.
+    #[no_trace]
+    pending_rasterization_callbacks: DomRefCell<
+        FxHashMap<PendingImageRasterizationKey, Vec<PendingRasterizationCallback>>,
     >,
 
     /// Directory to store unminified css for this window if unminify-css
@@ -713,6 +732,27 @@ impl Window {
         })
     }
 
+    /// Register `callback` to run once `image_id` has been rasterized at `size`.
+    /// The returned sender is the one [`ImageCache::add_rasterization_complete_listener`]
+    /// expects, which routes the completion message back to this `ScriptThread`.
+    pub(crate) fn register_rasterization_complete_listener(
+        &self,
+        image_id: PendingImageId,
+        size: DeviceIntSize,
+        callback: impl Fn() + 'static,
+    ) -> ImageCacheResponseCallback {
+        self.pending_rasterization_callbacks
+            .borrow_mut()
+            .entry((image_id, size))
+            .or_default()
+            .push(PendingRasterizationCallback(Box::new(callback)));
+
+        let image_cache_sender = self.image_cache_sender.clone();
+        Box::new(move |message| {
+            let _ = image_cache_sender.send(message);
+        })
+    }
+
     fn pending_layout_image_notification(&self, response: PendingImageResponse) {
         let mut images = self.pending_layout_images.borrow_mut();
         let nodes = images.entry(response.id);
@@ -748,8 +788,16 @@ impl Window {
         &self,
         response: RasterizationCompleteResponse,
     ) {
+        // Script-side waiters first: a favicon has no node to mark dirty, so it
+        // would otherwise never hear that its image is ready.
+        let key = (response.image_id, response.requested_size);
+        let callbacks = self.pending_rasterization_callbacks.borrow_mut().remove(&key);
+        for callback in callbacks.into_iter().flatten() {
+            callback.0();
+        }
+
         let mut images = self.pending_images_for_rasterization.borrow_mut();
-        let nodes = images.entry((response.image_id, response.requested_size));
+        let nodes = images.entry(key);
         let nodes = match nodes {
             Entry::Occupied(nodes) => nodes,
             Entry::Vacant(_) => return,
@@ -3764,6 +3812,7 @@ impl Window {
             #[cfg(feature = "webxr")]
             webxr_registry,
             pending_image_callbacks: Default::default(),
+            pending_rasterization_callbacks: Default::default(),
             pending_layout_images: Default::default(),
             pending_images_for_rasterization: Default::default(),
             unminified_css_dir: DomRefCell::new(if unminify_css {
