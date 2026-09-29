@@ -56,6 +56,7 @@ use crate::fetch::fetch_params::{
 use crate::filemanager_thread::FileManager;
 use crate::http_loader::{HttpState, determine_requests_referrer, http_fetch, set_default_accept};
 use crate::protocols::{ProtocolRegistry, is_url_potentially_trustworthy};
+use crate::request_filter::{FilterVerdict, FilteredRequest, SharedRequestFilter};
 use crate::request_interceptor::RequestInterceptor;
 use crate::subresource_integrity::is_response_integrity_valid;
 
@@ -102,6 +103,9 @@ pub struct FetchContext {
     pub filemanager: FileManager,
     pub file_token: FileTokenCheck,
     pub request_interceptor: Arc<TokioMutex<RequestInterceptor>>,
+    /// An optional embedder veto on outgoing requests. See
+    /// [`crate::request_filter::RequestFilter`].
+    pub request_filter: SharedRequestFilter,
     pub cancellation_listener: Arc<CancellationListener>,
     pub timing: ResourceFetchTimingContainer,
     pub protocols: Arc<ProtocolRegistry>,
@@ -528,6 +532,16 @@ pub async fn main_fetch(
 
     let current_url = request.current_url();
     let current_scheme = current_url.scheme();
+
+    // Ask the embedder's request filter, if it installed one, whether this request may
+    // go out at all. A blocked request fails here, before the network is touched.
+    if response.is_none() &&
+        let Some(request_filter) = context.request_filter.as_ref() &&
+        request_filter.filter(&FilteredRequest::new(request, &current_url)) ==
+            FilterVerdict::Block
+    {
+        response = Some(Response::network_error(NetworkError::Blocked));
+    }
 
     // Intercept the request and maybe override the response.
     context

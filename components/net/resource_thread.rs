@@ -68,6 +68,7 @@ use crate::hsts::{self, HstsList};
 use crate::http_cache::HttpCache;
 use crate::http_loader::{HttpState, http_redirect_fetch};
 use crate::protocols::ProtocolRegistry;
+use crate::request_filter::SharedRequestFilter;
 use crate::request_interceptor::RequestInterceptor;
 use crate::websocket_loader::create_handshake_request;
 
@@ -95,6 +96,7 @@ pub fn new_resource_threads(
     certificate_path: Option<String>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
+    request_filter: SharedRequestFilter,
 ) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
     // Initialize the async runtime, and get a handle to it for use in clean shutdown.
     let async_runtime = init_async_runtime();
@@ -116,6 +118,7 @@ pub fn new_resource_threads(
         ca_certificates,
         ignore_certificate_errors,
         protocols,
+        request_filter,
     );
     (
         ResourceThreads::new(public_core),
@@ -135,6 +138,7 @@ pub fn new_core_resource_thread(
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
+    request_filter: SharedRequestFilter,
 ) -> (CoreResourceThread, CoreResourceThread) {
     let (public_setup_chan, public_setup_port) = generic_channel::channel().unwrap();
     let (private_setup_chan, private_setup_port) = generic_channel::channel().unwrap();
@@ -156,6 +160,7 @@ pub fn new_core_resource_thread(
                 ca_certificates.clone(),
                 ignore_certificate_errors,
                 blob_token_communicator,
+                request_filter,
             );
 
             let mut channel_manager = ResourceChannelManager {
@@ -699,6 +704,7 @@ pub struct CoreResourceManager {
     sw_managers: HashMap<ImmutableOrigin, IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
     request_interceptor: RequestInterceptor,
+    request_filter: SharedRequestFilter,
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     preloaded_resources: SharedPreloadedResources,
@@ -714,12 +720,14 @@ impl CoreResourceManager {
         ca_certificates: CACertificates<'static>,
         ignore_certificate_errors: bool,
         blob_token_communicator: Arc<Mutex<BlobTokenCommunicator>>,
+        request_filter: SharedRequestFilter,
     ) -> CoreResourceManager {
         CoreResourceManager {
             devtools_sender,
             sw_managers: Default::default(),
             filemanager: FileManager::new(embedder_proxy.clone(), blob_token_communicator),
             request_interceptor: RequestInterceptor::new(embedder_proxy),
+            request_filter,
             ca_certificates,
             ignore_certificate_errors,
             preloaded_resources: Default::default(),
@@ -765,6 +773,7 @@ impl CoreResourceManager {
         let devtools_chan = self.devtools_sender.clone();
         let filemanager = self.filemanager.clone();
         let request_interceptor = self.request_interceptor.clone();
+        let request_filter = self.request_filter.clone();
 
         let timing_type = match request_builder.destination {
             Destination::Document => ResourceTimingType::Navigation,
@@ -818,6 +827,7 @@ impl CoreResourceManager {
                 filemanager,
                 file_token,
                 request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
+                request_filter,
                 cancellation_listener,
                 timing: ResourceFetchTiming::new(request.timing_type()).into(),
                 protocols,
@@ -880,6 +890,7 @@ impl CoreResourceManager {
         let devtools_chan = self.devtools_sender.clone();
         let filemanager = self.filemanager.clone();
         let request_interceptor = self.request_interceptor.clone();
+        let request_filter = self.request_filter.clone();
 
         let ca_certificates = self.ca_certificates.clone();
         let ignore_certificate_errors = self.ignore_certificate_errors;
@@ -910,6 +921,7 @@ impl CoreResourceManager {
                         filemanager,
                         file_token: FileTokenCheck::NotRequired,
                         request_interceptor: Arc::new(TokioMutex::new(request_interceptor)),
+                        request_filter,
                         cancellation_listener,
                         timing: ResourceFetchTiming::new(request.timing_type()).into(),
                         protocols: protocols.clone(),

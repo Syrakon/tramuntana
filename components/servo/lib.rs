@@ -102,6 +102,13 @@ pub mod webxr {
     pub use webxr::{Discovery, MainThreadRegistry, WebXrRegistry};
 }
 
+/// The embedder's hook for blocking requests before they reach the network, installed
+/// with [`ServoBuilder::request_filter`].
+pub mod request_filter {
+    pub use net::request_filter::{FilterVerdict, FilteredRequest, RequestFilter};
+    pub use net_traits::request::Destination;
+}
+
 // TODO: The protocol handler interface needs to be cleaned and simplified.
 pub mod protocol_handler {
     pub use net::fetch::methods::{DoneChannel, FetchContext};

@@ -1124,6 +1124,8 @@ pub struct CookieAsyncResponse {
 #[derive(Clone, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub enum NetworkError {
     LoadCancelled,
+    /// Blocked by the embedder's request filter, e.g. a content blocker.
+    Blocked,
     /// SSL validation error, to be converted to Resource::BadCertHTML in the HTML parser.
     SslValidation(String, Vec<u8>),
     /// Crash error, to be converted to Resource::Crash in the HTML parser.
@@ -1190,6 +1192,7 @@ impl fmt::Debug for NetworkError {
             NetworkError::InvalidPort => write!(f, "Request attempted on bad port"),
             NetworkError::LocalDirectoryError => write!(f, "Local directory access failed"),
             NetworkError::LoadCancelled => write!(f, "Load cancelled"),
+            NetworkError::Blocked => write!(f, "Blocked by the embedder's request filter"),
             NetworkError::SslValidation(s, _) => write!(f, "SSL validation error: {}", s),
             NetworkError::Crash(s) => write!(f, "Crash: {}", s),
             NetworkError::PartialResponseToNonRangeRequestError => write!(

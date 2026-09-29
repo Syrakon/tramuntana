@@ -1480,6 +1480,7 @@ impl FetchResponseListener for ParserContext {
                 NetworkError::TooManyInFlightKeepAliveRequests |
                 NetworkError::InvalidMethod |
                 NetworkError::ContentSecurityPolicy |
+                NetworkError::Blocked |
                 NetworkError::Nosniff |
                 NetworkError::SubresourceIntegrity |
                 NetworkError::MixedContent |

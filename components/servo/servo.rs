@@ -29,6 +29,7 @@ use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::embedder::NetToEmbedderMsg;
 use net::image_cache::ImageCacheFactoryImpl;
 use net::protocols::ProtocolRegistry;
+use net::request_filter::{RequestFilter, SharedRequestFilter};
 use net::resource_thread::new_resource_threads;
 use net_traits::{ResourceThreads, exit_fetch_thread, start_fetch_thread};
 use paint::{InitialPaintState, Paint};
@@ -931,6 +932,7 @@ impl Servo {
                 opts.certificate_path.clone(),
                 opts.ignore_certificate_errors,
                 protocols.clone(),
+                builder.request_filter,
             );
 
         let (private_storage_threads, public_storage_threads) = new_storage_threads(
@@ -1370,6 +1372,7 @@ pub struct ServoBuilder {
     preferences: Option<Box<Preferences>>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
+    request_filter: SharedRequestFilter,
     #[cfg(feature = "webxr")]
     webxr_registry: Box<dyn webxr::WebXrRegistry>,
 }
@@ -1381,6 +1384,7 @@ impl Default for ServoBuilder {
             preferences: Default::default(),
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
+            request_filter: None,
             #[cfg(feature = "webxr")]
             webxr_registry: Box::new(DefaultWebXrRegistry),
         }
@@ -1409,6 +1413,14 @@ impl ServoBuilder {
 
     pub fn protocol_registry(mut self, protocol_registry: ProtocolRegistry) -> Self {
         self.protocol_registry = protocol_registry;
+        self
+    }
+
+    /// Install a filter that is asked about every outgoing request and can block it
+    /// before the network is touched. See
+    /// [`net::request_filter::RequestFilter`](crate::request_filter::RequestFilter).
+    pub fn request_filter(mut self, request_filter: Arc<dyn RequestFilter>) -> Self {
+        self.request_filter = Some(request_filter);
         self
     }
 

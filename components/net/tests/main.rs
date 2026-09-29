@@ -138,6 +138,7 @@ fn new_fetch_context(
         filemanager: FileManager::new(sender.clone(), BlobTokenCommunicator::stub_for_testing()),
         file_token: FileTokenCheck::NotRequired,
         request_interceptor: Arc::new(TokioMutex::new(RequestInterceptor::new(sender))),
+        request_filter: None,
         cancellation_listener: Arc::new(Default::default()),
         timing: ResourceFetchTiming::new(ResourceTimingType::Navigation).into(),
         protocols: Arc::new(ProtocolRegistry::with_internal_protocols()),
