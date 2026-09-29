@@ -291,6 +291,12 @@ impl WebView {
             return;
         }
         self.inner_mut().load_status = new_value;
+        // The icon belongs to the document that is going away. The new document
+        // sends its own, if it has one; without this the old icon would stay on
+        // screen for every later page that declares none.
+        if new_value == LoadStatus::Started {
+            self.clone().clear_favicon();
+        }
         self.delegate().notify_load_status_changed(self, new_value);
     }
 
@@ -332,6 +338,14 @@ impl WebView {
 
     pub(crate) fn set_favicon(self, new_value: Image) {
         self.inner_mut().favicon = Some(new_value);
+        self.delegate().notify_favicon_changed(self);
+    }
+
+    pub(crate) fn clear_favicon(self) {
+        if self.inner().favicon.is_none() {
+            return;
+        }
+        self.inner_mut().favicon = None;
         self.delegate().notify_favicon_changed(self);
     }
 
