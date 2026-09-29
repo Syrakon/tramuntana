@@ -1967,9 +1967,19 @@ impl ScriptThread {
                 self.handle_embedder_control_response(id, response, cx);
             },
             ScriptThreadMessage::SetUserContents(user_content_manager_id, user_contents) => {
+                let user_contents: ScriptThreadUserContents = user_contents.into();
+                let user_stylesheets = user_contents.user_stylesheets.clone();
                 self.user_contents_for_manager_id
                     .borrow_mut()
-                    .insert(user_content_manager_id, user_contents.into());
+                    .insert(user_content_manager_id, user_contents);
+                // Documents created from here on read the new contents when their
+                // pipeline is built. The ones already on screen have their user
+                // stylesheets swapped in place, so a change reaches the page the user
+                // is looking at rather than only the next one.
+                self.update_user_stylesheets_of_live_documents(
+                    user_content_manager_id,
+                    user_stylesheets,
+                );
             },
             ScriptThreadMessage::DestroyUserContentManager(user_content_manager_id) => {
                 self.user_contents_for_manager_id
@@ -3391,7 +3401,7 @@ impl ScriptThread {
             time_profiler_chan: self.senders.time_profiler_sender.clone(),
             paint_api: self.paint_api.clone(),
             viewport_details: incomplete.viewport_details,
-            user_stylesheets,
+            user_stylesheets: user_stylesheets.clone(),
             theme: incomplete.theme,
             embedder_chan: self.senders.pipeline_to_embedder_sender.clone(),
         };
@@ -3435,6 +3445,8 @@ impl ScriptThread {
             self.unminify_css,
             self.local_script_source.clone(),
             user_contents,
+            incomplete.user_content_manager_id,
+            user_stylesheets,
             self.player_context.clone(),
             #[cfg(feature = "webgpu")]
             self.gpu_id_hub.clone(),
@@ -4296,6 +4308,32 @@ impl ScriptThread {
 
     pub(crate) fn is_servo_privileged(url: ServoUrl) -> bool {
         with_script_thread(|script_thread| script_thread.privileged_urls.contains(&url))
+    }
+
+    /// Swap the user stylesheets of every document that belongs to
+    /// `user_content_manager_id` and is already on screen, then dirty it so the new
+    /// rules are applied on the next reflow.
+    fn update_user_stylesheets_of_live_documents(
+        &self,
+        user_content_manager_id: UserContentManagerId,
+        user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
+    ) {
+        let documents: Vec<DomRoot<Document>> = self
+            .documents
+            .borrow()
+            .iter()
+            .map(|(_, document)| document)
+            .filter(|document| {
+                document.window().user_content_manager_id() == Some(user_content_manager_id)
+            })
+            .collect();
+
+        for document in documents {
+            document
+                .window()
+                .replace_user_stylesheets(user_stylesheets.clone());
+            document.dirty_all_nodes();
+        }
     }
 
     fn handle_request_screenshot_readiness(

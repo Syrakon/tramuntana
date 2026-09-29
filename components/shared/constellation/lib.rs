@@ -126,6 +126,10 @@ pub enum UserContentManagerAction {
     RemoveUserScript(UserScriptId),
     AddUserStyleSheet(UserStyleSheet),
     RemoveUserStyleSheet(UserStyleSheetId),
+    /// Replace every user stylesheet of this manager at once. Unlike adding and
+    /// removing one at a time, this leaves no window in which the old sheet and the
+    /// new one are both live, which matters when the sheets are swapped per page.
+    SetUserStyleSheets(Vec<UserStyleSheet>),
 }
 
 /// A description of a paint metric that is sent from the Servo renderer to the

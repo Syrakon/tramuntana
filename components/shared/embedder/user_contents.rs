@@ -12,7 +12,7 @@ use url::Url;
 
 static USER_CONTENT_MANAGER_ID: AtomicU32 = AtomicU32::new(1);
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct UserContentManagerId(u32);
 
 impl UserContentManagerId {

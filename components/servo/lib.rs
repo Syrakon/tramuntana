@@ -31,7 +31,7 @@ mod webview_delegate;
 // These are Servo's public exports. Everything (apart from a couple exceptions below)
 // should be exported at the root. See <https://github.com/servo/servo/issues/18475>.
 pub use accesskit;
-pub use embedder_traits::user_contents::UserScript;
+pub use embedder_traits::user_contents::{UserScript, UserStyleSheet};
 pub use embedder_traits::{submit_resource_reader, *};
 pub use image::RgbaImage;
 pub use keyboard_types::{

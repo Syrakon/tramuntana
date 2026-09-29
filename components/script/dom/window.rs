@@ -23,7 +23,7 @@ use crossbeam_channel::{Sender, unbounded};
 use cssparser::SourceLocation;
 use devtools_traits::{ScriptToDevtoolsControlMsg, TimelineMarker, TimelineMarkerType};
 use dom_struct::dom_struct;
-use embedder_traits::user_contents::UserScript;
+use embedder_traits::user_contents::{UserContentManagerId, UserScript};
 use embedder_traits::{
     AlertResponse, ConfirmResponse, EmbedderMsg, JavaScriptEvaluationError, PromptResponse,
     ScriptToEmbedderChan, SimpleDialogRequest, Theme, UntrustedNodeAddress, ViewportDetails,
@@ -94,7 +94,7 @@ use style::properties::PropertyId;
 use style::properties::style_structs::Font;
 use style::selector_parser::PseudoElement;
 use style::str::HTML_SPACE_CHARACTERS;
-use style::stylesheets::UrlExtraData;
+use style::stylesheets::{DocumentStyleSheet, UrlExtraData};
 use style_traits::CSSPixel;
 use stylo_atoms::Atom;
 use time::Duration as TimeDuration;
@@ -452,6 +452,18 @@ pub(crate) struct Window {
     #[no_trace]
     #[conditional_malloc_size_of]
     user_scripts: Rc<Vec<UserScript>>,
+
+    /// The `UserContentManager` this `Window` was created with, if any. It is what lets a
+    /// later change to that manager find the documents it applies to.
+    #[no_trace]
+    user_content_manager_id: Option<UserContentManagerId>,
+
+    /// The user stylesheets currently installed in this `Window`'s layout. Kept so that
+    /// replacing them can remove exactly the ones that are live — the manager's current
+    /// set may already have moved on.
+    #[no_trace]
+    #[conditional_malloc_size_of]
+    user_stylesheets: DomRefCell<Rc<Vec<DocumentStyleSheet>>>,
 
     /// Window's GL context from application
     #[ignore_malloc_size_of = "defined in script_thread"]
@@ -843,6 +855,31 @@ impl Window {
 
     pub(crate) fn userscripts(&self) -> &[UserScript] {
         &self.user_scripts
+    }
+
+    pub(crate) fn user_content_manager_id(&self) -> Option<UserContentManagerId> {
+        self.user_content_manager_id
+    }
+
+    /// Swap the user stylesheets of the document already on screen: remove the ones
+    /// this `Window` installed and install `user_stylesheets` in their place. The
+    /// caller is responsible for dirtying the document afterwards.
+    pub(crate) fn replace_user_stylesheets(
+        &self,
+        user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
+    ) {
+        let installed = std::mem::replace(
+            &mut *self.user_stylesheets.borrow_mut(),
+            user_stylesheets.clone(),
+        );
+        let web_font_context = self.web_font_context();
+        let mut layout = self.layout_mut();
+        for stylesheet in installed.iter() {
+            layout.remove_stylesheet(stylesheet.0.clone());
+        }
+        for stylesheet in user_stylesheets.iter() {
+            layout.add_stylesheet(stylesheet.0.clone(), None, &web_font_context);
+        }
     }
 
     pub(crate) fn get_player_context(&self) -> WindowGLContext {
@@ -3737,6 +3774,8 @@ impl Window {
         unminify_css: bool,
         local_script_source: Option<String>,
         user_scripts: Rc<Vec<UserScript>>,
+        user_content_manager_id: Option<UserContentManagerId>,
+        user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
         player_context: WindowGLContext,
         #[cfg(feature = "webgpu")] gpu_id_hub: Arc<IdentityHub>,
         inherited_secure_context: Option<bool>,
@@ -3826,6 +3865,8 @@ impl Window {
             exists_mut_observer: Cell::new(false),
             paint_api,
             user_scripts,
+            user_content_manager_id,
+            user_stylesheets: DomRefCell::new(user_stylesheets),
             player_context,
             throttled: Cell::new(false),
             layout_marker: DomRefCell::new(Rc::new(Cell::new(true))),

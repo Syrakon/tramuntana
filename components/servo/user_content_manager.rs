@@ -58,6 +58,18 @@ impl UserContentManager {
         );
     }
 
+    /// Replace every user stylesheet this manager holds. A document loading in a
+    /// `WebView` that uses this manager picks the new set up when it is created; one
+    /// already on screen has its styles swapped in place.
+    pub fn set_stylesheets(&self, user_stylesheets: Vec<UserStyleSheet>) {
+        self.servo.constellation_proxy().send(
+            EmbedderToConstellationMessage::UserContentManagerAction(
+                self.id,
+                UserContentManagerAction::SetUserStyleSheets(user_stylesheets),
+            ),
+        );
+    }
+
     pub fn remove_stylesheet(&self, user_stylesheet: Rc<UserStyleSheet>) {
         self.servo.constellation_proxy().send(
             EmbedderToConstellationMessage::UserContentManagerAction(
