@@ -2,6 +2,7 @@ use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
+use crate::linux::accessibility::{AccessibilityBridge, accessibility_title};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
@@ -285,6 +286,15 @@ pub struct X11WindowState {
     edge_constraints: Option<EdgeConstraints>,
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
+    /// AT-SPI bridge, created on the first presented frame — building it at
+    /// window creation would start AccessKit's bus connection before there is
+    /// anything to describe.
+    accessibility: Option<AccessibilityBridge>,
+    /// Last title set, used to label the window's accessibility root. Reading
+    /// it back from `_NET_WM_NAME` would be a round trip per frame.
+    title: String,
+    /// Last application id set, the fallback label for that root.
+    app_id: String,
 }
 
 impl X11WindowState {
@@ -800,6 +810,9 @@ impl X11WindowState {
                 client_side_decorations_supported,
                 decorations: WindowDecorations::Server,
                 last_insets: [0, 0, 0, 0],
+                accessibility: None,
+                title: String::new(),
+                app_id: String::new(),
                 edge_constraints: None,
                 counter_id: sync_request_counter,
                 last_sync_counter: None,
@@ -1510,6 +1523,16 @@ impl PlatformWindow for X11Window {
         )
         .log_err();
         xcb_flush(&self.0.xcb);
+        self.0.state.borrow_mut().title = title.to_string();
+    }
+
+    fn update_accessibility(&self, update: gpui::AccessUpdate<'_>) {
+        let mut state = self.0.state.borrow_mut();
+        let title = accessibility_title(&state.title, Some(state.app_id.as_str()));
+        let bridge = state
+            .accessibility
+            .get_or_insert_with(|| AccessibilityBridge::new(title.clone()));
+        bridge.update(update, &title);
     }
 
     fn set_app_id(&mut self, app_id: &str) {
@@ -1529,6 +1552,7 @@ impl PlatformWindow for X11Window {
             ),
         )
         .log_err();
+        self.0.state.borrow_mut().app_id = app_id.to_string();
     }
 
     fn map_window(&mut self) -> anyhow::Result<()> {

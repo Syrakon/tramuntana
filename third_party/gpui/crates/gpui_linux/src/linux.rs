@@ -1,3 +1,4 @@
+mod accessibility;
 mod dispatcher;
 mod headless;
 mod keyboard;

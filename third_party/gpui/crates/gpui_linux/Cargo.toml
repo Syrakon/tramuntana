@@ -74,6 +74,11 @@ util.workspace = true
 uuid.workspace = true
 
 # Always used
+# Accessibility: AccessKit's AT-SPI adapter, driven by linux/accessibility.rs.
+# `async-io` matches the smol/async-std stack already used here; the tokio
+# feature would pull a second runtime in.
+accesskit = "0.25"
+accesskit_unix = { version = "0.24", default-features = false, features = ["async-io"] }
 oo7 = { version = "0.6", default-features = false, features = [
     "async-std",
     "native_crypto",

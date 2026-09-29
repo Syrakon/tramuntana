@@ -28,6 +28,7 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
+use crate::linux::accessibility::{AccessibilityBridge, accessibility_title};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
@@ -123,6 +124,13 @@ pub struct WaylandWindowState {
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
+    /// AT-SPI bridge, created on the first presented frame — building it at
+    /// window creation would start AccessKit's bus connection before there is
+    /// anything to describe.
+    accessibility: Option<AccessibilityBridge>,
+    /// Last title set, used to label the window's accessibility root. Wayland
+    /// keeps no readable copy of it.
+    title: String,
 }
 
 pub enum WaylandSurfaceState {
@@ -397,6 +405,8 @@ impl WaylandWindowState {
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
+            accessibility: None,
+            title: String::new(),
         })
     }
 
@@ -1269,6 +1279,19 @@ impl PlatformWindow for WaylandWindow {
     fn set_title(&mut self, title: &str) {
         if let Some(toplevel) = self.borrow().surface_state.toplevel() {
             toplevel.set_title(title.to_string());
+        }
+        self.borrow_mut().title = title.to_string();
+    }
+
+    fn update_accessibility(&self, update: gpui::AccessUpdate<'_>) {
+        let mut state = self.borrow_mut();
+        if state.accessibility.is_none() {
+            let title = accessibility_title(&state.title, state.app_id.as_deref());
+            state.accessibility = Some(AccessibilityBridge::new(title));
+        }
+        let title = accessibility_title(&state.title, state.app_id.as_deref());
+        if let Some(bridge) = state.accessibility.as_ref() {
+            bridge.update(update, &title);
         }
     }
 
