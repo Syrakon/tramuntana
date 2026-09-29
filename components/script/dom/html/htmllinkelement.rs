@@ -19,11 +19,9 @@ use net_traits::request::{Destination, Initiator, ParserMetadata, RequestBuilder
 use net_traits::{
     FetchMetadata, FetchResponseMsg, NetworkError, ReferrerPolicy, ResourceFetchTiming,
 };
-use pixels::PixelFormat;
 use script_bindings::cell::DomRefCell;
 use script_bindings::root::Dom;
 use servo_arc::Arc;
-use servo_base::generic_channel::GenericSharedMemory;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
 use style::media_queries::MediaList as StyleMediaList;
@@ -42,6 +40,7 @@ use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::css::cssstylesheet::CSSStyleSheet;
 use crate::dom::css::stylesheet::StyleSheet as DOMStyleSheet;
 use crate::dom::document::Document;
+use crate::dom::document::favicon::embedder_image_from_raster;
 use crate::dom::documentorshadowroot::StylesheetSource;
 use crate::dom::domtokenlist::DOMTokenList;
 use crate::dom::element::attributes::storage::AttrRef;
@@ -758,6 +757,10 @@ impl HTMLLinkElement {
             return;
         };
 
+        // This document has an icon of its own, so it never falls back to the
+        // `/favicon.ico` at the root of the site.
+        self.owner_document().note_declared_favicon();
+
         // Ignore all previous fetch operations
         self.request_generation_id
             .set(self.request_generation_id.get().increment());
@@ -851,25 +854,7 @@ impl HTMLLinkElement {
         let document = self.owner_document();
 
         let send_rasterized_favicon_to_embedder = |raster_image: &pixels::RasterImage| {
-            // Let's not worry about animated favicons...
-            let frame = raster_image.first_frame();
-
-            let format = match raster_image.format {
-                PixelFormat::K8 => embedder_traits::PixelFormat::K8,
-                PixelFormat::KA8 => embedder_traits::PixelFormat::KA8,
-                PixelFormat::RGB8 => embedder_traits::PixelFormat::RGB8,
-                PixelFormat::RGBA8 => embedder_traits::PixelFormat::RGBA8,
-                PixelFormat::BGRA8 => embedder_traits::PixelFormat::BGRA8,
-            };
-
-            let embedder_image = embedder_traits::Image::new(
-                frame.width,
-                frame.height,
-                std::sync::Arc::new(GenericSharedMemory::from_bytes(&raster_image.bytes)),
-                raster_image.frames[0].byte_range.clone(),
-                format,
-            );
-            document.set_favicon(embedder_image);
+            document.set_favicon(embedder_image_from_raster(raster_image));
         };
 
         match image {

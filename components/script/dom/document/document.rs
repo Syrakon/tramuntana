@@ -126,6 +126,7 @@ use crate::dom::customelementregistry::{
     CustomElementDefinition, CustomElementReactionStack, CustomElementRegistry,
 };
 use crate::dom::customevent::CustomEvent;
+use crate::dom::document::favicon;
 use crate::dom::document::focus::{DocumentFocusHandler, FocusableArea};
 use crate::dom::document_embedder_controls::DocumentEmbedderControls;
 use crate::dom::document_event_handler::DocumentEventHandler;
@@ -621,6 +622,14 @@ pub(crate) struct Document {
     /// The cached favicon for that document.
     #[no_trace]
     favicon: RefCell<Option<Image>>,
+    /// Whether this document declared an icon with `<link rel=icon>`. A
+    /// document that did gets its icon from that link, and never from the
+    /// implicit `/favicon.ico`.
+    declared_favicon: Cell<bool>,
+    /// Whether the implicit `/favicon.ico` was already asked for. It is
+    /// requested at most once per document, and only when the document
+    /// declares no icon of its own. See [`crate::dom::document::favicon`].
+    default_favicon_requested: Cell<bool>,
 
     /// All websockets created that are associated with this document.
     websockets: DOMTracker<WebSocket>,
@@ -1300,7 +1309,10 @@ impl Document {
                 }
                 update_with_current_instant(&self.dom_complete);
             },
-            DocumentReadyState::Interactive => update_with_current_instant(&self.dom_interactive),
+            DocumentReadyState::Interactive => {
+                update_with_current_instant(&self.dom_interactive);
+                self.maybe_fetch_default_favicon();
+            },
         };
 
         self.ready_state.set(state);
@@ -3684,6 +3696,8 @@ impl Document {
             active_sandboxing_flag_set: Cell::new(creation_sandboxing_flag_set),
             creation_sandboxing_flag_set: Cell::new(creation_sandboxing_flag_set),
             favicon: RefCell::new(None),
+            declared_favicon: Cell::new(false),
+            default_favicon_requested: Cell::new(false),
             websockets: DOMTracker::new(),
             details_name_groups: Default::default(),
             protocol_handler_automation_mode: Default::default(),
@@ -4671,6 +4685,36 @@ impl Document {
     pub(crate) fn set_favicon(&self, favicon: Image) {
         *self.favicon.borrow_mut() = Some(favicon);
         self.notify_embedder_favicon();
+    }
+
+    /// Whether this document already found an icon.
+    pub(crate) fn has_favicon(&self) -> bool {
+        self.favicon.borrow().is_some()
+    }
+
+    /// Record that a `<link rel=icon>` pointed this document at an icon, which
+    /// rules out the implicit `/favicon.ico`.
+    pub(crate) fn note_declared_favicon(&self) {
+        self.declared_favicon.set(true);
+    }
+
+    /// Request `/favicon.ico` for a top-level document that declared no icon
+    /// link. Called once the document is parsed, so that every `<link rel=icon>`
+    /// in the markup has been seen: a page that declares an icon must not pay
+    /// for a second request, nor briefly show the icon at the root of the site.
+    fn maybe_fetch_default_favicon(&self) {
+        if !self.window().is_top_level() ||
+            self.declared_favicon.get() ||
+            self.default_favicon_requested.get() ||
+            self.has_favicon()
+        {
+            return;
+        }
+        let Some(url) = favicon::default_favicon_url(&self.url()) else {
+            return;
+        };
+        self.default_favicon_requested.set(true);
+        favicon::fetch_default_favicon(self, url);
     }
 
     pub(crate) fn fullscreen_element(&self) -> Option<DomRoot<Element>> {
