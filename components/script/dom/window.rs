@@ -868,18 +868,10 @@ impl Window {
         &self,
         user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
     ) {
-        let installed = std::mem::replace(
-            &mut *self.user_stylesheets.borrow_mut(),
-            user_stylesheets.clone(),
-        );
+        *self.user_stylesheets.borrow_mut() = user_stylesheets.clone();
         let web_font_context = self.web_font_context();
-        let mut layout = self.layout_mut();
-        for stylesheet in installed.iter() {
-            layout.remove_stylesheet(stylesheet.0.clone());
-        }
-        for stylesheet in user_stylesheets.iter() {
-            layout.add_stylesheet(stylesheet.0.clone(), None, &web_font_context);
-        }
+        self.layout_mut()
+            .replace_user_stylesheets(user_stylesheets, &web_font_context);
     }
 
     pub(crate) fn get_player_context(&self) -> WindowGLContext {

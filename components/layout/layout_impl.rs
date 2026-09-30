@@ -309,6 +309,35 @@ impl Layout for LayoutThread {
         }
     }
 
+    fn replace_user_stylesheets(
+        &mut self,
+        user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
+        document_context: &WebFontDocumentContext,
+    ) {
+        // The user stylesheets held here are appended to the `Stylist` by the first
+        // reflow, not when they arrive. Before that reflow the `Stylist` has none of
+        // them, and asking it to remove one panics, so swapping the field is both
+        // necessary and sufficient. Afterwards the `Stylist` has to be brought in step.
+        if self.have_added_user_agent_stylesheets {
+            for stylesheet in self.user_stylesheets.iter() {
+                let guard = stylesheet.0.shared_lock.read();
+                self.stylist.remove_stylesheet(stylesheet.clone(), &guard);
+                self.font_context
+                    .remove_all_web_fonts_from_stylesheet(stylesheet);
+            }
+            for stylesheet in user_stylesheets.iter() {
+                let guard = stylesheet.0.shared_lock.read();
+                self.stylist.append_stylesheet(stylesheet.clone(), &guard);
+                self.load_all_web_fonts_from_stylesheet_with_guard(
+                    stylesheet,
+                    &guard,
+                    document_context,
+                );
+            }
+        }
+        self.user_stylesheets = user_stylesheets;
+    }
+
     #[servo_tracing::instrument(skip_all)]
     fn remove_stylesheet(&mut self, stylesheet: ServoArc<Stylesheet>) {
         let guard = stylesheet.shared_lock.read();

@@ -298,6 +298,17 @@ pub trait Layout {
         font_context: &WebFontDocumentContext,
     );
 
+    /// Replace this Layout's user stylesheets with `user_stylesheets`, dropping the ones
+    /// it carried before. Unlike [`Layout::add_stylesheet`] and
+    /// [`Layout::remove_stylesheet`], this is safe to call before the first reflow: the
+    /// user stylesheets only reach the `Stylist` when that reflow happens, so until then
+    /// there is nothing there to remove.
+    fn replace_user_stylesheets(
+        &mut self,
+        user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
+        font_context: &WebFontDocumentContext,
+    );
+
     /// Inform the layout that its ScriptThread is about to exit.
     fn exit_now(&mut self);
 
