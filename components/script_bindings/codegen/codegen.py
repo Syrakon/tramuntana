@@ -3363,7 +3363,31 @@ class CGWrapMethod(CGAbstractMethod):
                 proto = "canonical_proto.get()"
                 lazyProto = "false"
 
-            create = f"""
+            # A null class makes SpiderMonkey use its default proxy class.
+            # HTMLAllCollection needs its own, because its [[IsHTMLDDA]] slot
+            # is a class flag. No IDL annotation for this: only this one
+            # legacy interface may ever have it.
+            clasp = "ptr::null()"
+            classDef = ""
+            if self.descriptor.interface.identifier.name == "HTMLAllCollection":
+                clasp = "&PROXY_CLASS"
+                classDef = f"""
+static PROXY_CLASS: JSClass = JSClass {{
+    name: {str_to_cstr_ptr(self.descriptor.interface.identifier.name)},
+    flags: js::jsapi::JSClass_NON_NATIVE |
+        js::jsapi::JSCLASS_IS_PROXY |
+        js::jsapi::JSCLASS_DELAY_METADATA_BUILDER |
+        js::jsapi::JSCLASS_EMULATES_UNDEFINED |
+        ((1 & JSCLASS_RESERVED_SLOTS_MASK) << JSCLASS_RESERVED_SLOTS_SHIFT)
+        /* JSCLASS_HAS_RESERVED_SLOTS(1) */,
+    cOps: unsafe {{ &js::jsapi::ProxyClassOps }},
+    spec: ptr::null(),
+    ext: unsafe {{ &js::jsapi::ProxyClassExtension }},
+    oOps: unsafe {{ &js::jsapi::ProxyObjectOps }},
+}};
+"""
+
+            create = f"""{classDef}
 let handler: *const libc::c_void =
     RegisterBindings::proxy_handlers::{self.descriptor.interface.identifier.name}
     .load(std::sync::atomic::Ordering::Acquire);
@@ -3372,7 +3396,7 @@ rooted!(&in(cx) let obj = NewProxyObject(
     handler,
     Handle::from_raw(UndefinedHandleValue),
     {proto},
-    ptr::null(),
+    {clasp},
     {lazyProto},
 ));
 assert!(!obj.is_null());

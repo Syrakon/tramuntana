@@ -149,6 +149,7 @@ use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::html::htmlareaelement::HTMLAreaElement;
 use crate::dom::html::htmlbaseelement::HTMLBaseElement;
+use crate::dom::html::htmlallcollection::HTMLAllCollection;
 use crate::dom::html::htmlcollection::{CollectionFilter, HTMLCollection};
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlembedelement::HTMLEmbedElement;
@@ -360,6 +361,8 @@ pub(crate) struct Document {
     scripts: MutNullableDom<HTMLCollection>,
     anchors: MutNullableDom<HTMLCollection>,
     applets: MutNullableDom<HTMLCollection>,
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-all>
+    all: MutNullableDom<HTMLAllCollection>,
     /// Information about the `<iframes>` in this [`Document`].
     iframes: RefCell<IFrameCollection>,
     /// Lock use for style attributes and author-origin stylesheet objects in this document.
@@ -3592,6 +3595,7 @@ impl Document {
             scripts: Default::default(),
             anchors: Default::default(),
             applets: Default::default(),
+            all: Default::default(),
             iframes: RefCell::new(IFrameCollection::new()),
             style_shared_lock: {
                 /// Per-process shared lock for author-origin stylesheets
@@ -5641,6 +5645,11 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                     element.has_attribute(&local_name!("href"))
             })
         })
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-all>
+    fn All(&self, cx: &mut js::context::JSContext) -> DomRoot<HTMLAllCollection> {
+        self.all.or_init(|| HTMLAllCollection::new(cx, &self.window, self))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-document-forms>
