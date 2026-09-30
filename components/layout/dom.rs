@@ -648,6 +648,17 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
                 let mut block_level = block_level.borrow_mut();
                 match &mut *block_level {
                     BlockLevelBox::Independent(independent_formatting_context) => {
+                        // Floating and absolute positioning blockify the box, so its outer
+                        // display type does not change, but it has to move out of flow.
+                        // Rebuilding it in place would keep laying it out in flow: a float
+                        // would not float, and an absolute would have no hoisted placeholder,
+                        // so the stacking context tree would skip it and it would get no
+                        // spatial node for geometry queries.
+                        if info.style.clone_position().is_absolutely_positioned() ||
+                            info.style.clone_float().is_floating()
+                        {
+                            return false;
+                        }
                         let DisplayGeneratingBox::OutsideInside {
                             outside: DisplayOutside::Block,
                             inside: display_inside,

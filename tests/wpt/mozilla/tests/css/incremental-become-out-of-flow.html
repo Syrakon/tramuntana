@@ -1,0 +1,84 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>An in-flow box that incrementally becomes out of flow is laid out out of flow</title>
+<link rel="help" href="https://drafts.csswg.org/css-position/#position-property">
+<link rel="help" href="https://drafts.csswg.org/css2/visuren.html#floats">
+<script src="/resources/testharness.js"></script>
+<script src="/resources/testharnessreport.js"></script>
+<style>
+  body { margin: 0; }
+  .container { position: relative; width: 400px; }
+  .box { display: flex; width: 100px; height: 50px; }
+  .filler { height: 20px; }
+</style>
+<body>
+<script>
+  // Each case starts from a box that establishes an independent formatting context
+  // (so incremental box tree reconstruction can run at the box itself) and changes a
+  // property that moves it out of flow.
+  function setUp(initialStyle) {
+    let container = document.createElement("div");
+    container.className = "container";
+    container.innerHTML = "<div class=filler></div><div class=box></div><div class=filler></div>";
+    document.body.appendChild(container);
+    let box = container.querySelector(".box");
+    box.style.cssText = initialStyle;
+    document.body.offsetWidth; // Force layout of the in-flow box.
+    return { container, box };
+  }
+
+  test(t => {
+    let { container, box } = setUp("");
+    t.add_cleanup(() => container.remove());
+    box.style.position = "fixed";
+    box.style.top = "30px";
+    box.style.left = "40px";
+    let rect = box.getBoundingClientRect();
+    assert_equals(rect.width, 100, "width");
+    assert_equals(rect.height, 50, "height");
+    assert_equals(rect.left, 40, "left");
+    assert_equals(rect.top, 30, "top");
+    assert_equals(container.offsetHeight, 40, "the box no longer takes space in flow");
+  }, "In-flow flex container becomes position: fixed");
+
+  test(t => {
+    let { container, box } = setUp("");
+    t.add_cleanup(() => container.remove());
+    box.style.position = "absolute";
+    box.style.top = "5px";
+    box.style.left = "15px";
+    let containerRect = container.getBoundingClientRect();
+    let rect = box.getBoundingClientRect();
+    assert_equals(rect.width, 100, "width");
+    assert_equals(rect.height, 50, "height");
+    assert_equals(rect.left - containerRect.left, 15, "left");
+    assert_equals(rect.top - containerRect.top, 5, "top");
+    assert_equals(container.offsetHeight, 40, "the box no longer takes space in flow");
+  }, "In-flow flex container becomes position: absolute");
+
+  test(t => {
+    let { container, box } = setUp("");
+    t.add_cleanup(() => container.remove());
+    box.style.float = "right";
+    let containerRect = container.getBoundingClientRect();
+    let rect = box.getBoundingClientRect();
+    assert_equals(rect.width, 100, "width");
+    assert_equals(rect.right, containerRect.right, "floated to the right");
+    assert_equals(rect.top - containerRect.top, 20, "the float is placed after the first filler");
+    assert_equals(container.offsetHeight, 40, "the float no longer takes space in flow");
+  }, "In-flow flex container becomes floated");
+
+  test(t => {
+    let { container, box } = setUp("float: right");
+    t.add_cleanup(() => container.remove());
+    box.style.position = "fixed";
+    box.style.top = "30px";
+    box.style.left = "40px";
+    let rect = box.getBoundingClientRect();
+    assert_equals(rect.width, 100, "width");
+    assert_equals(rect.height, 50, "height");
+    assert_equals(rect.left, 40, "left");
+    assert_equals(rect.top, 30, "top");
+  }, "Floated flex container becomes position: fixed");
+</script>
+</body>
