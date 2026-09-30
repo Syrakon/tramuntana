@@ -11,6 +11,7 @@ use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::thread;
+use std::time::Duration;
 
 use cookie::Cookie;
 use crossbeam_channel::Sender;
@@ -216,6 +217,10 @@ fn create_http_states(
         servo_base::read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
         servo_base::read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
         servo_base::read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
+        // The jar on disk may hold session cookies from the last run (it is
+        // written while Servo runs, not only at a clean exit). A new session
+        // starts without them.
+        cookie_jar.clear_session_cookies();
     }
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -250,7 +255,79 @@ fn create_http_states(
         embedder_proxy,
     };
 
-    (Arc::new(http_state), Arc::new(private_http_state))
+    let http_state = Arc::new(http_state);
+    if let Some(config_dir) = config_dir {
+        spawn_http_state_persister(Arc::downgrade(&http_state), config_dir.to_owned());
+    }
+
+    (http_state, Arc::new(private_http_state))
+}
+
+/// How often the public cookie jar, HSTS list and auth cache are written to
+/// `config_dir` while Servo runs. Writing only at exit loses them whenever
+/// the embedder crashes or is killed.
+const PERSIST_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Serialises the writers of the persisted state, so the periodic writer and
+/// the one at exit never interleave on the same temporary file.
+static PERSIST_LOCK: Mutex<()> = Mutex::new(());
+
+/// The persisted state last written, per file name, so an unchanged file is
+/// not rewritten every interval.
+type WrittenState = HashMap<&'static str, Vec<u8>>;
+
+fn spawn_http_state_persister(http_state: Weak<HttpState>, config_dir: PathBuf) {
+    let spawned = thread::Builder::new()
+        .name("NetStatePersist".to_owned())
+        .spawn(move || {
+            let mut written = WrittenState::new();
+            loop {
+                thread::sleep(PERSIST_INTERVAL);
+                // The state is gone once the resource threads shut down.
+                let Some(http_state) = http_state.upgrade() else {
+                    break;
+                };
+                persist_http_state(&http_state, &config_dir, &mut written);
+            }
+        });
+    if let Err(error) = spawned {
+        warn!("Could not start the thread that saves cookies to disk: {error}");
+    }
+}
+
+fn persist_http_state(http_state: &HttpState, config_dir: &Path, written: &mut WrittenState) {
+    let _guard = PERSIST_LOCK.lock();
+    let files = [
+        ("auth_cache.json", serde_json::to_vec_pretty(&*http_state.auth_cache.read())),
+        ("cookie_jar.json", serde_json::to_vec_pretty(&*http_state.cookie_jar.read())),
+        ("hsts_list.json", serde_json::to_vec_pretty(&*http_state.hsts_list.read())),
+    ];
+    for (filename, json) in files {
+        let json = match json {
+            Ok(json) => json,
+            Err(error) => {
+                warn!("Could not serialize {filename}: {error}");
+                continue;
+            },
+        };
+        if written.get(filename) == Some(&json) {
+            continue;
+        }
+        match write_atomically(config_dir, filename, &json) {
+            Ok(()) => {
+                written.insert(filename, json);
+            },
+            Err(error) => warn!("Could not write {filename} to {}: {error}", config_dir.display()),
+        }
+    }
+}
+
+/// Writes through a temporary file and a rename, so a crash mid-write leaves
+/// the previous file intact instead of a truncated one.
+fn write_atomically(config_dir: &Path, filename: &str, contents: &[u8]) -> io::Result<()> {
+    let temporary = config_dir.join(format!("{filename}.tmp"));
+    std::fs::write(&temporary, contents)?;
+    std::fs::rename(&temporary, config_dir.join(filename))
 }
 
 impl ResourceChannelManager {
@@ -658,12 +735,7 @@ impl ResourceChannelManager {
             },
             CoreResourceMsg::Exit(sender) => {
                 if let Some(ref config_dir) = self.config_dir {
-                    let auth_cache = http_state.auth_cache.read();
-                    servo_base::write_json_to_file(&*auth_cache, config_dir, "auth_cache.json");
-                    let jar = http_state.cookie_jar.read();
-                    servo_base::write_json_to_file(&*jar, config_dir, "cookie_jar.json");
-                    let hsts = http_state.hsts_list.read();
-                    servo_base::write_json_to_file(&*hsts, config_dir, "hsts_list.json");
+                    persist_http_state(http_state, config_dir, &mut WrittenState::new());
                 }
                 self.resource_manager.exit();
                 let _ = sender.send(());

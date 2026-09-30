@@ -45,6 +45,7 @@ hyper = { workspace = true, features = ["client", "http1", "http2"] }
 hyper-rustls = { workspace = true }
 hyper-util = { workspace = true }
 hyper_serde = { workspace = true }
+serde_json = { workspace = true }
 imsz = { workspace = true }
 ipc-channel = { workspace = true }
 itertools = { workspace = true }

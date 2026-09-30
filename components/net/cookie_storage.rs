@@ -292,10 +292,13 @@ impl CookieStorage {
     }
 
     pub fn cookie_site_descriptors(&self) -> Vec<SiteDescriptor> {
+        // A lookup leaves an empty entry behind for every host it asks about,
+        // and removing the last cookie of a host does the same. Neither is a
+        // site with data.
         self.cookies_map
-            .keys()
-            .cloned()
-            .map(SiteDescriptor::new)
+            .iter()
+            .filter(|(_, cookies)| !cookies.is_empty())
+            .map(|(site, _)| SiteDescriptor::new(site.clone()))
             .collect()
     }
 }
