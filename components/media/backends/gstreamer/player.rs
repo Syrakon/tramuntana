@@ -912,7 +912,8 @@ impl GStreamerPlayer {
         };
 
         let result = receiver.recv().unwrap();
-        glib::signal::signal_handler_disconnect(&inner.lock().unwrap().player, error_handler_id);
+        // The handler was connected on the signal adapter, not on the player.
+        signal_adapter.disconnect(error_handler_id);
         result
     }
 }
