@@ -8465,6 +8465,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
+ "serde_json",
  "servo-base",
  "servo-config",
  "servo-default-resources",
