@@ -23,12 +23,15 @@ use servo_media_player::context::PlayerGLContext;
 use servo_media_player::metadata::Metadata;
 use servo_media_player::video::VideoFrameRenderer;
 use servo_media_player::{
-    PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, SeekLockMsg, StreamType,
+    PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, SeekLockMsg, SourceBufferId,
+    SourceBufferState, StreamType,
 };
 use servo_media_streams::registry::{MediaStreamId, get_stream};
 use servo_media_traits::{BackendMsg, ClientContextId, MediaInstance};
 
 use super::BACKEND_BASE_TIME;
+use crate::media_source::MediaSource;
+use crate::media_source_src::{ServoMediaSourceSrc, register_servo_media_source_src};
 use crate::media_stream::GStreamerMediaStream;
 use crate::media_stream_source::{ServoMediaStreamSrc, register_servo_media_stream_src};
 use crate::render::GStreamerRender;
@@ -120,6 +123,7 @@ impl AsRef<[f32]> for GStreamerAudioChunk {
 enum PlayerSource {
     Seekable(ServoSrc),
     Stream(ServoMediaStreamSrc),
+    MediaSource(ServoMediaSourceSrc),
 }
 
 struct PlayerInner {
@@ -138,6 +142,11 @@ struct PlayerInner {
     last_metadata: Option<Metadata>,
     cat: gstreamer::DebugCategory,
     enough_data: Arc<AtomicBool>,
+    /// The source buffers, if the stream type is StreamType::MediaSource.
+    media_source: MediaSource,
+    /// Whether the pipeline has been asked to play the source buffers. Until
+    /// then it has no tracks to start with.
+    media_source_started: bool,
 }
 
 impl PlayerInner {
@@ -170,7 +179,7 @@ impl PlayerInner {
     }
 
     pub fn set_playback_rate(&mut self, playback_rate: f64) -> Result<(), PlayerError> {
-        if self.stream_type != StreamType::Seekable {
+        if self.stream_type == StreamType::Stream {
             return Err(PlayerError::NonSeekableStream);
         }
 
@@ -201,8 +210,16 @@ impl PlayerInner {
 
         self.paused.set(false);
         self.can_resume.set(false);
+        if self.is_waiting_for_media_source() {
+            return Ok(());
+        }
         self.player.play();
         Ok(())
+    }
+
+    /// The pipeline cannot be started before the source buffers have their tracks.
+    fn is_waiting_for_media_source(&self) -> bool {
+        self.stream_type == StreamType::MediaSource && !self.media_source_started
     }
 
     pub fn stop(&mut self) -> Result<(), PlayerError> {
@@ -211,6 +228,7 @@ impl PlayerInner {
         self.can_resume.set(false);
         self.last_metadata = None;
         self.source = None;
+        self.media_source.stop();
         Ok(())
     }
 
@@ -221,6 +239,9 @@ impl PlayerInner {
 
         self.paused.set(true);
         self.can_resume.set(true);
+        if self.is_waiting_for_media_source() {
+            return Ok(());
+        }
         self.player.pause();
         Ok(())
     }
@@ -250,8 +271,14 @@ impl PlayerInner {
     }
 
     pub fn seek(&mut self, time: f64) -> Result<(), PlayerError> {
-        if self.stream_type != StreamType::Seekable {
+        if self.stream_type == StreamType::Stream {
             return Err(PlayerError::NonSeekableStream);
+        }
+        if self.stream_type == StreamType::MediaSource {
+            self.media_source.seek(time);
+            if self.is_waiting_for_media_source() {
+                return Ok(());
+            }
         }
         if let Some(ref metadata) = self.last_metadata &&
             let Some(ref duration) = metadata.duration &&
@@ -299,6 +326,10 @@ impl PlayerInner {
     }
 
     pub fn buffered(&self) -> Vec<Range<f64>> {
+        if self.stream_type == StreamType::MediaSource {
+            return self.media_source.buffered();
+        }
+
         let mut buffered_ranges = vec![];
 
         let Some(duration) = self
@@ -334,6 +365,17 @@ impl PlayerInner {
     }
 
     pub fn seekable(&self) -> Vec<Range<f64>> {
+        if self.stream_type == StreamType::MediaSource {
+            // <https://w3c.github.io/media-source/#htmlmediaelement-extensions-seekable>
+            return match self.media_source.duration() {
+                Some(duration) => vec![Range {
+                    start: 0.0,
+                    end: duration,
+                }],
+                None => self.media_source.buffered(),
+            };
+        }
+
         // if the servosrc is seekable, we should return the duration of the media
         if let Some(metadata) = self.last_metadata.as_ref() &&
             metadata.is_seekable &&
@@ -388,6 +430,93 @@ impl PlayerInner {
             .set_video_track(stream_index)
             .map_err(|_| PlayerError::SetTrackFailed)?;
         self.player.set_video_track_enabled(enabled);
+        Ok(())
+    }
+
+    fn media_source(&mut self) -> Result<&mut MediaSource, PlayerError> {
+        if self.stream_type != StreamType::MediaSource {
+            return Err(PlayerError::MediaSourceUnsupported);
+        }
+        Ok(&mut self.media_source)
+    }
+
+    fn add_source_buffer(&mut self, media_type: &str) -> Result<SourceBufferId, PlayerError> {
+        if self.media_source_started {
+            // The pipeline has been given its tracks already.
+            return Err(PlayerError::QuotaExceeded);
+        }
+        self.media_source()?.add_source_buffer(media_type)
+    }
+
+    fn remove_source_buffer(&mut self, id: SourceBufferId) -> Result<(), PlayerError> {
+        self.media_source()?.remove_source_buffer(id)
+    }
+
+    fn change_source_buffer_type(
+        &mut self,
+        id: SourceBufferId,
+        media_type: &str,
+    ) -> Result<(), PlayerError> {
+        self.media_source()?.change_type(id, media_type)
+    }
+
+    fn append_data(
+        &mut self,
+        id: SourceBufferId,
+        data: Vec<u8>,
+    ) -> Result<SourceBufferState, PlayerError> {
+        self.media_source()?.append(id, data)
+    }
+
+    fn reset_source_buffer_parser(&mut self, id: SourceBufferId) -> Result<(), PlayerError> {
+        self.media_source()?.reset_parser(id)
+    }
+
+    fn remove_source_buffer_range(
+        &mut self,
+        id: SourceBufferId,
+        range: Range<f64>,
+    ) -> Result<SourceBufferState, PlayerError> {
+        self.media_source()?.remove_range(id, range)
+    }
+
+    fn set_source_buffer_timestamp_offset(
+        &mut self,
+        id: SourceBufferId,
+        offset: f64,
+    ) -> Result<(), PlayerError> {
+        self.media_source()?.set_timestamp_offset(id, offset)
+    }
+
+    fn set_source_buffer_append_window(
+        &mut self,
+        id: SourceBufferId,
+        window: Range<f64>,
+    ) -> Result<(), PlayerError> {
+        self.media_source()?.set_append_window(id, window)
+    }
+
+    fn start_media_source(&mut self) -> Result<(), PlayerError> {
+        self.media_source()?;
+        if self.media_source_started {
+            return Ok(());
+        }
+        self.media_source_started = true;
+        if self.paused.get() {
+            self.player.pause();
+        } else {
+            self.player.play();
+        }
+        Ok(())
+    }
+
+    fn set_media_source_duration(&mut self, duration: Option<f64>) -> Result<(), PlayerError> {
+        self.media_source()?.set_duration(duration);
+        Ok(())
+    }
+
+    fn set_media_source_ended(&mut self, ended: bool) -> Result<(), PlayerError> {
+        self.media_source()?.set_ended(ended);
         Ok(())
     }
 }
@@ -496,7 +625,9 @@ impl GStreamerPlayer {
         let pipeline = player.pipeline();
 
         // FIXME(#282): The progressive downloading breaks playback on Windows and Android.
-        if !cfg!(any(target_os = "windows", target_os = "android")) {
+        if !cfg!(any(target_os = "windows", target_os = "android")) &&
+            self.stream_type != StreamType::MediaSource
+        {
             // Set player to perform progressive downloading. This will make the
             // player store the downloaded media in a local temporary file for
             // faster playback of already-downloaded chunks.
@@ -528,9 +659,14 @@ impl GStreamerPlayer {
         // Set max size for the player buffer.
         pipeline.set_property("buffer-size", MAX_BUFFER_SIZE);
 
-        // Set player position interval update to 0.5 seconds.
+        // Set player position interval update to 0.5 seconds. With source buffers
+        // the position is also what tells that playback is about to run out of
+        // data, which has to be noticed sooner.
         let mut config = player.config();
-        config.set_position_update_interval(500u32);
+        config.set_position_update_interval(match self.stream_type {
+            StreamType::MediaSource => 100u32,
+            _ => 500u32,
+        });
         player
             .set_config(config)
             .map_err(|e| PlayerError::Backend(e.to_string()))?;
@@ -611,6 +747,14 @@ impl GStreamerPlayer {
                 })?;
                 "servosrc://".to_value()
             },
+            StreamType::MediaSource => {
+                register_servo_media_source_src().map_err(|error| {
+                    PlayerError::Backend(format!(
+                        "servomediasourcesrc registration error: {error:?}"
+                    ))
+                })?;
+                "servomediasource://".to_value()
+            },
         };
         player.set_property("uri", &uri);
 
@@ -635,6 +779,8 @@ impl GStreamerPlayer {
             last_metadata: None,
             cat: gstreamer::DebugCategory::get("servoplayer").unwrap(),
             enough_data: Arc::new(AtomicBool::new(false)),
+            media_source: MediaSource::default(),
+            media_source_started: false,
         })));
 
         let inner = self.inner.borrow();
@@ -669,10 +815,14 @@ impl GStreamerPlayer {
             }
         });
 
+        let inner_clone = inner.clone();
         let observer = self.observer.clone();
         // Handle `position-update` signal.
         signal_adapter.connect_position_updated(move |_, position| {
             if let Some(seconds) = position.map(|p| p.seconds_f64()) {
+                if let Ok(inner) = inner_clone.lock() {
+                    inner.media_source.set_position(seconds);
+                }
                 let _ = notify!(observer, PlayerEvent::PositionChanged(seconds));
             }
         });
@@ -893,6 +1043,32 @@ impl GStreamerPlayer {
                         });
                         PlayerSource::Stream(media_stream_src)
                     },
+                    StreamType::MediaSource => {
+                        let started = source
+                            .dynamic_cast::<ServoMediaSourceSrc>()
+                            .map_err(|_| {
+                                "The source element is not a ServoMediaSourceSrc".to_owned()
+                            })
+                            .and_then(|media_source_src| {
+                                inner
+                                    .media_source
+                                    .start(&media_source_src)
+                                    .map_err(|error| error.to_string())?;
+                                Ok(media_source_src)
+                            });
+                        match started {
+                            Ok(media_source_src) => PlayerSource::MediaSource(media_source_src),
+                            Err(error) => {
+                                let _ = notify!(
+                                    observer,
+                                    PlayerEvent::Error(format!(
+                                        "Could not set up the tracks of the source buffers: {error}"
+                                    ))
+                                );
+                                return None;
+                            },
+                        }
+                    },
                 };
 
                 inner.set_src(source);
@@ -906,6 +1082,13 @@ impl GStreamerPlayer {
                     signal_adapter.play().stop();
                 });
 
+            if inner.stream_type == StreamType::MediaSource {
+                // The pipeline is started once the source buffers have their
+                // tracks, and its errors are for the observer from the beginning.
+                signal_adapter.disconnect(error_handler_id);
+                return Ok(());
+            }
+
             inner.player.pause();
 
             (receiver, error_handler_id)
@@ -915,6 +1098,24 @@ impl GStreamerPlayer {
         // The handler was connected on the signal adapter, not on the player.
         signal_adapter.disconnect(error_handler_id);
         result
+    }
+}
+
+impl GStreamerPlayer {
+    /// Run `f` on the player, setting it up first.
+    fn with_inner<T>(
+        &self,
+        f: impl FnOnce(&mut PlayerInner) -> Result<T, PlayerError>,
+    ) -> Result<T, PlayerError> {
+        self.setup()?;
+        let inner = self.inner.borrow();
+        let inner = inner
+            .as_ref()
+            .ok_or_else(|| PlayerError::Backend("The player is not set up".to_owned()))?;
+        let mut inner = inner
+            .lock()
+            .map_err(|_| PlayerError::Backend("The player lock is poisoned".to_owned()))?;
+        f(&mut inner)
     }
 }
 
@@ -982,6 +1183,53 @@ impl Player for GStreamerPlayer {
     inner_player_proxy!(set_stream, stream, &MediaStreamId, only_stream, bool);
     inner_player_proxy!(set_audio_track, stream_index, i32, enabled, bool);
     inner_player_proxy!(set_video_track, stream_index, i32, enabled, bool);
+    inner_player_proxy!(remove_source_buffer, id, SourceBufferId);
+    inner_player_proxy!(reset_source_buffer_parser, id, SourceBufferId);
+    inner_player_proxy!(
+        set_source_buffer_timestamp_offset,
+        id,
+        SourceBufferId,
+        offset,
+        f64
+    );
+    inner_player_proxy!(
+        set_source_buffer_append_window,
+        id,
+        SourceBufferId,
+        window,
+        Range<f64>
+    );
+    inner_player_proxy!(start_media_source, ());
+    inner_player_proxy!(set_media_source_duration, duration, Option<f64>);
+    inner_player_proxy!(set_media_source_ended, ended, bool);
+
+    fn add_source_buffer(&self, media_type: &str) -> Result<SourceBufferId, PlayerError> {
+        self.with_inner(|inner| inner.add_source_buffer(media_type))
+    }
+
+    fn change_source_buffer_type(
+        &self,
+        id: SourceBufferId,
+        media_type: &str,
+    ) -> Result<(), PlayerError> {
+        self.with_inner(|inner| inner.change_source_buffer_type(id, media_type))
+    }
+
+    fn append_data(
+        &self,
+        id: SourceBufferId,
+        data: Vec<u8>,
+    ) -> Result<SourceBufferState, PlayerError> {
+        self.with_inner(|inner| inner.append_data(id, data))
+    }
+
+    fn remove_source_buffer_range(
+        &self,
+        id: SourceBufferId,
+        range: Range<f64>,
+    ) -> Result<SourceBufferState, PlayerError> {
+        self.with_inner(|inner| inner.remove_source_buffer_range(id, range))
+    }
 
     fn render_use_gl(&self) -> bool {
         self.render.lock().unwrap().is_gl()

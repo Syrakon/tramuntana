@@ -46,6 +46,47 @@ pub enum PlayerError {
     SetStreamFailed,
     // Setting an audio or video track failed.
     SetTrackFailed,
+    /// The player was not created with StreamType::MediaSource, or the backend
+    /// has no Media Source Extensions support.
+    MediaSourceUnsupported,
+    /// The media type given to a source buffer cannot be demuxed or decoded.
+    UnsupportedMediaType,
+    /// There is no source buffer with the given identifier.
+    UnknownSourceBuffer,
+    /// The appended bytes could not be parsed.
+    AppendFailed(String),
+    /// The source buffer is full and nothing could be evicted.
+    QuotaExceeded,
+}
+
+/// Identifies a source buffer of a player created with StreamType::MediaSource.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct SourceBufferId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SourceBufferTrackKind {
+    Audio,
+    Video,
+}
+
+/// A track found in the initialization segment of a source buffer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SourceBufferTrack {
+    pub kind: SourceBufferTrackKind,
+    pub codec: String,
+    /// Zero for audio tracks.
+    pub width: u32,
+    /// Zero for audio tracks.
+    pub height: u32,
+}
+
+/// What a source buffer holds once an append has been processed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceBufferState {
+    /// Empty until an initialization segment has been parsed.
+    pub tracks: Vec<SourceBufferTrack>,
+    /// The time ranges in seconds held by every track of the source buffer.
+    pub buffered: Vec<Range<f64>>,
 }
 
 pub type SeekLockMsg = (bool, IpcSender<()>);
@@ -94,6 +135,8 @@ pub enum StreamType {
     Stream,
     /// The stream is seekable.
     Seekable,
+    /// The media data is appended to source buffers, as Media Source Extensions do.
+    MediaSource,
 }
 
 pub trait Player: Send + MediaInstance {
@@ -129,4 +172,74 @@ pub trait Player: Send + MediaInstance {
     fn render_use_gl(&self) -> bool;
     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
+
+    // The methods below require the player to be constructed with
+    // StreamType::MediaSource.
+
+    /// Create a source buffer that takes data of the given media type.
+    fn add_source_buffer(&self, _media_type: &str) -> Result<SourceBufferId, PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    fn remove_source_buffer(&self, _id: SourceBufferId) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// The data appended to the source buffer from now on is of the given media type.
+    fn change_source_buffer_type(
+        &self,
+        _id: SourceBufferId,
+        _media_type: &str,
+    ) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// Parse the given bytes and add the coded frames found to the source buffer.
+    /// Returns once the bytes have been processed.
+    fn append_data(
+        &self,
+        _id: SourceBufferId,
+        _data: Vec<u8>,
+    ) -> Result<SourceBufferState, PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// Drop whatever part of a segment the parser is holding, so the next append
+    /// can start with any segment.
+    fn reset_source_buffer_parser(&self, _id: SourceBufferId) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// Remove the coded frames in the given range of seconds.
+    fn remove_source_buffer_range(
+        &self,
+        _id: SourceBufferId,
+        _range: Range<f64>,
+    ) -> Result<SourceBufferState, PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// Seconds added to the timestamps of the coded frames appended from now on.
+    fn set_source_buffer_timestamp_offset(
+        &self,
+        _id: SourceBufferId,
+        _offset: f64,
+    ) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// Coded frames outside of this range of seconds are dropped when appended.
+    fn set_source_buffer_append_window(
+        &self,
+        _id: SourceBufferId,
+        _window: Range<f64>,
+    ) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// Start playback. To be called once every source buffer has got its
+    /// initialization segment; source buffers cannot be added afterwards.
+    fn start_media_source(&self) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// The duration in seconds, or None if it is unknown or unbounded.
+    fn set_media_source_duration(&self, _duration: Option<f64>) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// Whether no more data is to be appended. Appending again takes it back.
+    fn set_media_source_ended(&self, _ended: bool) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
 }

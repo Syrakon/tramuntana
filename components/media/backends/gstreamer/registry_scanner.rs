@@ -32,7 +32,14 @@ impl GStreamerRegistryScanner {
     }
 
     fn is_codec_supported(&self, codec: &str) -> bool {
-        self.supported_codecs.contains(codec)
+        // A codec string carries the profile and level after the name of the
+        // codec, as in "avc1.42E01E", and those are registered as "avc*".
+        self.supported_codecs.contains(codec) ||
+            self.supported_codecs.iter().any(|supported| {
+                supported
+                    .strip_suffix('*')
+                    .is_some_and(|prefix| codec.starts_with(prefix))
+            })
     }
 
     pub fn are_all_codecs_supported(&self, codecs: &Vec<&str>) -> bool {
@@ -107,6 +114,7 @@ impl GStreamerRegistryScanner {
                 self.supported_codecs.insert("vp9");
                 self.supported_codecs.insert("x-vp9");
                 self.supported_codecs.insert("vp9.0");
+                self.supported_codecs.insert("vp09*");
             }
 
             if is_opus_supported {
@@ -254,7 +262,10 @@ fn has_element_for_media_type(
     match gstreamer::caps::Caps::from_str(media_type) {
         Ok(caps) => {
             for factory in factories {
-                if factory.can_sink_all_caps(&caps) {
+                // A decoder may ask for more than the media type tells, the channel
+                // layout of Opus for one, so it is enough that it takes some
+                // stream of the type.
+                if factory.can_sink_any_caps(&caps) {
                     return true;
                 }
             }

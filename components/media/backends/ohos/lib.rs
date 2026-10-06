@@ -112,7 +112,9 @@ impl Backend for OhosBackend {
             StreamType::Stream => {
                 todo!("Stream Type currently not supported!")
             },
-            StreamType::Seekable => (),
+            // Source buffers are not supported: the player reports so when one is
+            // added.
+            StreamType::Seekable | StreamType::MediaSource => (),
         }
 
         if let Some(_audio_renderer) = audio_renderer {

@@ -8,6 +8,8 @@ pub mod audio_stream_reader;
 mod datachannel;
 mod device_monitor;
 pub mod media_capture;
+mod media_source;
+mod media_source_src;
 pub mod media_stream;
 mod media_stream_source;
 pub mod player;
