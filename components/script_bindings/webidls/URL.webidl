@@ -26,7 +26,8 @@ interface URL {
            attribute USVString hash;
 
   // https://w3c.github.io/FileAPI/#creating-revoking
-  static DOMString createObjectURL(Blob blob);
+  // https://w3c.github.io/media-source/#dom-url-createobjecturl
+  static DOMString createObjectURL((Blob or MediaSource) obj);
   // static DOMString createFor(Blob blob);
   static undefined revokeObjectURL(DOMString url);
 

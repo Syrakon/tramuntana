@@ -61,7 +61,6 @@ use crate::dom::bindings::codegen::Bindings::MediaErrorBinding::MediaErrorMethod
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::Navigator_Binding::NavigatorMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::TextTrackBinding::{TextTrackKind, TextTrackMode};
-use crate::dom::bindings::codegen::Bindings::URLBinding::URLMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::codegen::UnionTypes::{
     MediaStreamOrBlob, VideoTrackOrAudioTrackOrTextTrack,
@@ -90,6 +89,7 @@ use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::mediaerror::MediaError;
 use crate::dom::mediafragmentparser::MediaFragmentParser;
 use crate::dom::medialist::MediaList;
+use crate::dom::mediasource::MediaSource;
 use crate::dom::mediastream::MediaStream;
 use crate::dom::node::{Node, NodeDamage, NodeTraits, UnbindContext};
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
@@ -120,6 +120,23 @@ static MEDIA_CONTROL_JS: &str = include_str!("../../resources/media-controls.js"
 /// requested position (e.g. snapping to the nearest keyframe), so we use a threshold
 /// instead of strict equality. (Unit is second)
 const SEEK_POSITION_THRESHOLD: f64 = 0.5;
+
+/// How far ahead of the playback position a media source has to be buffered, in seconds, for
+/// the ready state to be HAVE_ENOUGH_DATA.
+const MEDIA_SOURCE_ENOUGH_DATA: f64 = 3.;
+
+/// How far ahead of the playback position a media source has to be buffered, in seconds, for
+/// the ready state to become HAVE_FUTURE_DATA.
+const MEDIA_SOURCE_FUTURE_DATA: f64 = 1.;
+
+/// The ready state of an element with a media source stays HAVE_FUTURE_DATA or more for as
+/// long as this many seconds are buffered ahead of the playback position. It is lower than
+/// [`MEDIA_SOURCE_FUTURE_DATA`] so that playback does not stop and start at every append.
+const MEDIA_SOURCE_LOW_DATA: f64 = 0.3;
+
+/// A buffered range that starts this many seconds after the playback position, or less, has
+/// the data of that position: the media player plays over gaps of this length.
+const MEDIA_SOURCE_GAP_TOLERANCE: f64 = 0.25;
 
 #[derive(MallocSizeOf, PartialEq)]
 enum FrameStatus {
@@ -595,6 +612,9 @@ pub(crate) struct HTMLMediaElement {
     /// is a blob.
     #[no_trace]
     blob_url: DomRefCell<Option<ServoUrl>>,
+    /// The media source attached to this element, if its media resource is one.
+    /// <https://w3c.github.io/media-source/#mediasource-attach>
+    media_source: MutNullableDom<MediaSource>,
     /// <https://html.spec.whatwg.org/multipage/#dom-media-played>
     played: DomRefCell<TimeRangesContainer>,
     // https://html.spec.whatwg.org/multipage/#dom-media-audiotracks
@@ -689,6 +709,7 @@ impl HTMLMediaElement {
             current_seek_position: Cell::new(f64::NAN),
             resource_url: DomRefCell::new(None),
             blob_url: DomRefCell::new(None),
+            media_source: Default::default(),
             played: DomRefCell::new(TimeRangesContainer::default()),
             audio_tracks_list: Default::default(),
             video_tracks_list: Default::default(),
@@ -723,7 +744,9 @@ impl HTMLMediaElement {
             .as_ref()
             .is_some_and(|player| !player.lock().unwrap().paused());
 
-        if self.is_potentially_playing() && !is_playing {
+        let is_potentially_playing = self.is_potentially_playing();
+
+        if is_potentially_playing && !is_playing {
             if let Some(ref player) = *self.player.borrow() {
                 let player = player.lock().unwrap();
 
@@ -737,11 +760,20 @@ impl HTMLMediaElement {
                     error!("Could not play media: {error:?}");
                 }
             }
-        } else if is_playing &&
-            let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().pause()
+        } else if !is_potentially_playing &&
+            is_playing &&
+            let Some(ref player) = *self.player.borrow()
         {
-            error!("Could not pause player: {error:?}");
+            debug!(
+                "Pausing the media player: paused {}, ready state {:?}, position {}, duration {}",
+                self.paused.get(),
+                self.ready_state.get(),
+                self.current_playback_position.get(),
+                self.duration.get()
+            );
+            if let Err(error) = player.lock().unwrap().pause() {
+                error!("Could not pause player: {error:?}");
+            }
         }
     }
 
@@ -1000,9 +1032,33 @@ impl HTMLMediaElement {
                 // or HaveFutureData also apply here, as per the next match
                 // expression.
             },
-            (ReadyState::HaveFutureData, new) if new <= ReadyState::HaveCurrentData => {
-                // FIXME(nox): Queue a task to fire timeupdate and waiting
-                // events if the conditions call from the spec are met.
+            // => "If the previous ready state was HAVE_FUTURE_DATA or more, and the new ready
+            // state is HAVE_CURRENT_DATA or less"
+            (old, new)
+                if old >= ReadyState::HaveFutureData && new <= ReadyState::HaveCurrentData =>
+            {
+                // If the media element was potentially playing before its readyState attribute
+                // changed to a value lower than HAVE_FUTURE_DATA, and the element has not ended
+                // playback, and playback has not stopped due to errors, paused for user
+                // interaction, or paused for in-band content, the user agent must queue a media
+                // element task given the media element to fire an event named timeupdate at the
+                // element, and queue a media element task given the media element to fire an
+                // event named waiting at the element.
+                // The ready state is HAVE_NOTHING when the media resource is let go of, which
+                // is not playback running out of data.
+                if new != ReadyState::HaveNothing &&
+                    !self.paused.get() &&
+                    !self.ended_playback(LoopCondition::Included) &&
+                    !self.in_error_state() &&
+                    !self.is_paused_for_user_interaction() &&
+                    !self.is_paused_for_in_band_content()
+                {
+                    self.queue_media_element_task_to_fire_event(atom!("timeupdate"));
+                    self.queue_media_element_task_to_fire_event(atom!("waiting"));
+                }
+
+                // The media player has to stop too: its clock does not wait for the data.
+                self.update_media_state();
 
                 // No other steps are applicable in this case.
                 return;
@@ -1518,6 +1574,16 @@ impl HTMLMediaElement {
 
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
     fn resource_fetch_algorithm(&self, resource: Resource) {
+        // <https://w3c.github.io/media-source/#mediasource-attach>
+        // The URL record may be the object URL of a media source.
+        let resource = match resource {
+            Resource::Url(url) => match self.owner_window().media_source_for_url(url.as_str()) {
+                Some(media_source) => Resource::MediaSource(media_source),
+                None => Resource::Url(url),
+            },
+            resource => resource,
+        };
+
         if let Err(e) = self.create_media_player(&resource) {
             error!("Create media player error {:?}", e);
             self.resource_selection_algorithm_failure_steps();
@@ -1584,7 +1650,7 @@ impl HTMLMediaElement {
                 if let Some(ref src_object) = *self.src_object.borrow() {
                     match src_object {
                         SrcObject::Blob(blob) => {
-                            let blob_url = URL::CreateObjectURL(&self.global(), blob);
+                            let blob_url = URL::create_blob_url(&self.global(), blob);
                             *self.blob_url.borrow_mut() =
                                 Some(ServoUrl::parse(&blob_url.str()).expect("infallible"));
                             self.fetch_request(None, None);
@@ -1608,6 +1674,33 @@ impl HTMLMediaElement {
                         },
                     }
                 }
+            },
+            Resource::MediaSource(media_source) => {
+                // <https://w3c.github.io/media-source/#mediasource-attach>
+                // If readyState is NOT set to "closed", run the "If the media data cannot be
+                // fetched at all, due to network errors, causing the user agent to give up
+                // trying to fetch the resource" steps of the resource fetch algorithm.
+                if !media_source.attach(self) {
+                    self.resource_selection_algorithm_failure_steps();
+                    return;
+                }
+                self.media_source.set(Some(&media_source));
+
+                // Step 1. Set the media element's delaying-the-load-event-flag to false.
+                let this = Trusted::new(self);
+                let generation_id = self.generation_id.get();
+
+                self.owner_global()
+                    .task_manager()
+                    .media_element_task_source()
+                    .queue(task!(media_source_stop_delaying_load_event: move |cx| {
+                        let this = this.root();
+                        if generation_id != this.generation_id.get() {
+                            return;
+                        }
+
+                        this.delay_load_event(false, cx);
+                    }));
             },
         }
     }
@@ -1665,7 +1758,7 @@ impl HTMLMediaElement {
             }));
     }
 
-    fn in_error_state(&self) -> bool {
+    pub(crate) fn in_error_state(&self) -> bool {
         self.error.get().is_some()
     }
 
@@ -1752,8 +1845,9 @@ impl HTMLMediaElement {
                 current_fetch_context.cancel(CancelReason::Abort);
             }
 
-            // TODO Step 7.3. If the media element's assigned media provider object is a MediaSource
+            // Step 7.3. If the media element's assigned media provider object is a MediaSource
             // object, then detach it.
+            // Done in `reset_media_player` above.
 
             // Step 7.4. Forget the media element's media-resource-specific tracks.
             self.AudioTracks(CanGc::from_cx(cx)).clear();
@@ -2075,6 +2169,7 @@ impl HTMLMediaElement {
         // play back that position.
         // The rest of the steps are handled when the media engine signals a ready state change or
         // otherwise satisfies seek completion and signals a position change.
+        self.media_source_data_changed();
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-seek>
@@ -2131,6 +2226,7 @@ impl HTMLMediaElement {
                     return Err(());
                 }
             },
+            Resource::MediaSource(_) => StreamType::MediaSource,
             _ => StreamType::Seekable,
         };
 
@@ -2210,6 +2306,12 @@ impl HTMLMediaElement {
     }
 
     fn reset_media_player(&self) {
+        // <https://w3c.github.io/media-source/#mediasource-detach>
+        if let Some(media_source) = self.media_source.get() {
+            self.media_source.set(None);
+            media_source.detach();
+        }
+
         if self.player.borrow().is_none() {
             return;
         }
@@ -2355,6 +2457,17 @@ impl HTMLMediaElement {
         // Abort the following steps of the end of playback if seeking is in progress.
         if self.seeking.get() {
             return;
+        }
+
+        // The last coded frame of a media source may end before its duration does, in which
+        // case the media player stops short of the end of the media resource.
+        let duration = self.duration.get();
+        if self.media_source.get().is_some() &&
+            self.direction_of_playback() == PlaybackDirection::Forwards &&
+            duration.is_finite()
+        {
+            self.current_playback_position.set(duration);
+            self.official_playback_position.set(duration);
         }
 
         match self.direction_of_playback() {
@@ -2734,6 +2847,14 @@ impl HTMLMediaElement {
             return;
         }
 
+        // The media player goes back to the start once it has played to the end. That is not
+        // the playback position moving: only a seek takes it away from the end.
+        if position < self.current_playback_position.get() &&
+            self.ended_playback(LoopCondition::Ignored)
+        {
+            return;
+        }
+
         let _ = self
             .played
             .borrow_mut()
@@ -2749,6 +2870,8 @@ impl HTMLMediaElement {
             media_position_state
         );
         self.send_media_session_event(MediaSessionEvent::SetPositionState(media_position_state));
+
+        self.media_source_data_changed();
     }
 
     fn playback_seek_done(&self, position: f64) {
@@ -2770,17 +2893,21 @@ impl HTMLMediaElement {
     }
 
     fn playback_state_changed(&self, state: &PlaybackState) {
+        // The ready state of an element with a media source follows what is buffered, see
+        // `media_source_data_changed`.
+        let has_enough_data = self.ready_state.get() == ReadyState::HaveMetadata &&
+            self.media_source.get().is_none();
         let mut media_session_playback_state = MediaSessionPlaybackState::None_;
         match *state {
             PlaybackState::Paused => {
                 media_session_playback_state = MediaSessionPlaybackState::Paused;
-                if self.ready_state.get() == ReadyState::HaveMetadata {
+                if has_enough_data {
                     self.change_ready_state(ReadyState::HaveEnoughData);
                 }
             },
             PlaybackState::Playing => {
                 media_session_playback_state = MediaSessionPlaybackState::Playing;
-                if self.ready_state.get() == ReadyState::HaveMetadata {
+                if has_enough_data {
                     self.change_ready_state(ReadyState::HaveEnoughData);
                 }
             },
@@ -2809,7 +2936,152 @@ impl HTMLMediaElement {
                 let _ = seekable.add(range.start, range.end);
             }
         }
+
+        // <https://w3c.github.io/media-source/#htmlmediaelement-extensions-seekable>
+        // If duration equals positive Infinity and live seekable range is not empty, the
+        // seekable ranges are the union of live seekable range and the buffered ranges.
+        if self.duration.get() == f64::INFINITY &&
+            let Some(media_source) = self.media_source.get() &&
+            let Some((start, end)) = media_source.live_seekable_range() &&
+            let Err(error) = seekable.add(start, end)
+        {
+            warn!("Ignoring the live seekable range of a media source: {error:?}");
+        }
         seekable
+    }
+
+    /// The media player of the media resource, if there is one.
+    pub(crate) fn media_player(&self) -> Option<Arc<Mutex<dyn Player>>> {
+        self.player.borrow().clone()
+    }
+
+    /// The source buffers of the media source attached to this element have all got their
+    /// initialization segment.
+    /// <https://w3c.github.io/media-source/#sourcebuffer-init-segment-received>
+    pub(crate) fn media_source_received_metadata(
+        &self,
+        duration: f64,
+        has_audio: bool,
+        video_size: Option<(u32, u32)>,
+        can_gc: CanGc,
+    ) {
+        if self.ready_state.get() != ReadyState::HaveNothing {
+            return;
+        }
+
+        let (width, height) = video_size.unwrap_or_default();
+        let metadata = servo_media::player::metadata::Metadata {
+            // A duration that is not a number of seconds is an unbounded one.
+            duration: Duration::try_from_secs_f64(duration).ok(),
+            width,
+            height,
+            format: String::new(),
+            is_seekable: true,
+            video_tracks: video_size.iter().map(|_| String::new()).collect(),
+            audio_tracks: has_audio.then(String::new).into_iter().collect(),
+            is_live: false,
+            title: None,
+        };
+        self.playback_metadata_updated(&metadata, can_gc);
+    }
+
+    /// The duration of the media source attached to this element is another one.
+    /// <https://w3c.github.io/media-source/#duration-change-algorithm>
+    pub(crate) fn media_source_duration_changed(&self, duration: f64) {
+        // The duration is part of the metadata for as long as the element has not got it.
+        if self.ready_state.get() == ReadyState::HaveNothing {
+            return;
+        }
+
+        self.playback_duration_changed(Duration::try_from_secs_f64(duration).ok());
+    }
+
+    /// The end of stream algorithm of the media source attached to this element has run
+    /// with an error, one of the `MediaError` codes.
+    /// <https://w3c.github.io/media-source/#end-of-stream-algorithm>
+    pub(crate) fn media_source_failed(&self, error: u16, cx: &mut js::context::JSContext) {
+        if self.in_error_state() {
+            return;
+        }
+
+        if self.ready_state.get() == ReadyState::HaveNothing {
+            self.media_data_processing_failure_steps();
+        } else {
+            self.media_data_processing_fatal_steps(error, cx);
+        }
+    }
+
+    /// Set the ready state from what the media source attached to this element holds for the
+    /// current playback position. To be called whenever either of them changes.
+    /// <https://w3c.github.io/media-source/#buffer-monitoring>
+    pub(crate) fn media_source_data_changed(&self) {
+        let Some(media_source) = self.media_source.get() else {
+            return;
+        };
+
+        let old_ready_state = self.ready_state.get();
+        if old_ready_state == ReadyState::HaveNothing || self.in_error_state() {
+            return;
+        }
+
+        let seek_position = self.current_seek_position.get();
+        let is_seeking = self.seeking.get() && !seek_position.is_nan();
+
+        // Playback that has reached the end is not waiting for anything.
+        if !is_seeking && self.ended_playback(LoopCondition::Ignored) {
+            return;
+        }
+
+        let position = if is_seeking {
+            seek_position
+        } else {
+            self.current_playback_position.get()
+        };
+
+        // The last coded frames of an ended media source are being played, and there is
+        // nothing after them to wait for.
+        if media_source.is_ended() && position + MEDIA_SOURCE_GAP_TOLERANCE >= self.duration.get()
+        {
+            return;
+        }
+
+        let buffered = self
+            .media_player()
+            .and_then(|player| player.lock().ok().map(|player| player.buffered()))
+            .unwrap_or_default();
+        let buffered_end = buffered
+            .iter()
+            .find(|range| {
+                range.start - MEDIA_SOURCE_GAP_TOLERANCE <= position && position < range.end
+            })
+            .map(|range| range.end);
+
+        let ready_state = match buffered_end {
+            // => "If the HTMLMediaElement.buffered does not contain a TimeRanges for the
+            // current playback position"
+            None => ReadyState::HaveMetadata,
+            Some(end) => {
+                let ahead = end - position;
+                // Nothing more is to come once the media source has ended.
+                let reaches_the_end = media_source.is_ended() &&
+                    end + MEDIA_SOURCE_GAP_TOLERANCE >= self.duration.get();
+                if reaches_the_end || ahead >= MEDIA_SOURCE_ENOUGH_DATA {
+                    ReadyState::HaveEnoughData
+                } else if old_ready_state >= ReadyState::HaveFutureData &&
+                    ahead > MEDIA_SOURCE_LOW_DATA
+                {
+                    old_ready_state
+                } else if ahead > MEDIA_SOURCE_FUTURE_DATA {
+                    ReadyState::HaveFutureData
+                } else {
+                    ReadyState::HaveCurrentData
+                }
+            },
+        };
+
+        if ready_state != old_ready_state {
+            self.change_ready_state(ready_state);
+        }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#earliest-possible-position>
@@ -3546,6 +3818,7 @@ impl MicrotaskRunnable for MediaElementMicrotask {
 enum Resource {
     Object,
     Url(ServoUrl),
+    MediaSource(DomRoot<MediaSource>),
 }
 
 #[derive(Debug, MallocSizeOf, PartialEq)]
@@ -4034,12 +4307,20 @@ impl HTMLMediaElementEventHandler {
         }
 
         match event {
-            PlayerEvent::DurationChanged(duration) => element.playback_duration_changed(duration),
+            // The duration and the metadata of a media source are the ones its source
+            // buffers got, not the ones the media player finds.
+            PlayerEvent::DurationChanged(duration) => {
+                if element.media_source.get().is_none() {
+                    element.playback_duration_changed(duration)
+                }
+            },
             PlayerEvent::EndOfStream => element.playback_end(),
             PlayerEvent::EnoughData => element.playback_enough_data(),
             PlayerEvent::Error(ref error) => element.playback_error(error, cx),
             PlayerEvent::MetadataUpdated(ref metadata) => {
-                element.playback_metadata_updated(metadata, CanGc::from_cx(cx))
+                if element.media_source.get().is_none() {
+                    element.playback_metadata_updated(metadata, CanGc::from_cx(cx))
+                }
             },
             PlayerEvent::NeedData => element.playback_need_data(),
             PlayerEvent::PositionChanged(position) => element.playback_position_changed(position),

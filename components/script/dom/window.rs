@@ -164,6 +164,7 @@ use crate::dom::location::Location;
 use crate::dom::medialist::MediaList;
 use crate::dom::mediaquerylist::{MediaQueryList, MediaQueryListMatchState};
 use crate::dom::mediaquerylistevent::MediaQueryListEvent;
+use crate::dom::mediasource::MediaSource;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::navigator::Navigator;
 use crate::dom::node::{Node, NodeDamage, NodeTraits, from_untrusted_node_address};
@@ -427,6 +428,11 @@ pub(crate) struct Window {
     pending_rasterization_callbacks: DomRefCell<
         FxHashMap<PendingImageRasterizationKey, Vec<PendingRasterizationCallback>>,
     >,
+
+    /// The media sources that `URL.createObjectURL()` has made an object URL for,
+    /// by that URL.
+    /// <https://w3c.github.io/media-source/#mediasource-attach>
+    media_source_urls: DomRefCell<HashMapTracedValues<String, Dom<MediaSource>, FxBuildHasher>>,
 
     /// Directory to store unminified css for this window if unminify-css
     /// opt is enabled.
@@ -794,6 +800,24 @@ impl Window {
                 nodes.remove();
             },
         }
+    }
+
+    /// Make the media source the one a media element gets when it loads `url`.
+    pub(crate) fn register_media_source_url(&self, url: String, media_source: &MediaSource) {
+        self.media_source_urls
+            .borrow_mut()
+            .insert(url, Dom::from_ref(media_source));
+    }
+
+    pub(crate) fn revoke_media_source_url(&self, url: &str) {
+        self.media_source_urls.borrow_mut().0.remove(url);
+    }
+
+    pub(crate) fn media_source_for_url(&self, url: &str) -> Option<DomRoot<MediaSource>> {
+        self.media_source_urls
+            .borrow()
+            .get(url)
+            .map(|media_source| DomRoot::from_ref(&**media_source))
     }
 
     pub(crate) fn handle_image_rasterization_complete_notification(
@@ -3844,6 +3868,7 @@ impl Window {
             webxr_registry,
             pending_image_callbacks: Default::default(),
             pending_rasterization_callbacks: Default::default(),
+            media_source_urls: Default::default(),
             pending_layout_images: Default::default(),
             pending_images_for_rasterization: Default::default(),
             unminified_css_dir: DomRefCell::new(if unminify_css {
