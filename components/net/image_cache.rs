@@ -1055,6 +1055,9 @@ impl ImageCache for ImageCacheImpl {
             return Some(result.clone());
         }
 
+        // An image is stretched over the box it is given. An `<svg>` element is a
+        // viewport instead, and what it draws keeps its proportions inside of it.
+        let is_svg_element = svg_id.is_some();
         if let Some(svg_id) = svg_id &&
             let Some(old_mapped_image_id) =
                 self.svg_id_image_id_map.lock().insert(svg_id, image_id) &&
@@ -1089,10 +1092,22 @@ impl ImageCache for ImageCacheImpl {
                     .min(MAX_SVG_PIXMAP_DIMENSION);
                 tiny_skia::IntSize::from_wh(width, height).unwrap_or(natural_size)
             };
-            let transform = tiny_skia::Transform::from_scale(
-                tinyskia_requested_size.width() as f32 / natural_size.width() as f32,
-                tinyskia_requested_size.height() as f32 / natural_size.height() as f32,
-            );
+            let scale_x = tinyskia_requested_size.width() as f32 / natural_size.width() as f32;
+            let scale_y = tinyskia_requested_size.height() as f32 / natural_size.height() as f32;
+            let transform = if is_svg_element {
+                // The default of `preserveAspectRatio`, "xMidYMid meet": the largest
+                // uniform scale that fits, centered. Other values are not looked at.
+                let scale = scale_x.min(scale_y);
+                tiny_skia::Transform::from_scale(scale, scale).post_translate(
+                    (tinyskia_requested_size.width() as f32 - natural_size.width() as f32 * scale) /
+                        2.,
+                    (tinyskia_requested_size.height() as f32 -
+                        natural_size.height() as f32 * scale) /
+                        2.,
+                )
+            } else {
+                tiny_skia::Transform::from_scale(scale_x, scale_y)
+            };
             let mut pixmap = tiny_skia::Pixmap::new(
                 tinyskia_requested_size.width(),
                 tinyskia_requested_size.height(),
