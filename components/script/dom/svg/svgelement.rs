@@ -22,8 +22,9 @@ use crate::dom::document::Document;
 use crate::dom::document::focus::FocusableArea;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
-use crate::dom::node::{Node, NodeTraits};
+use crate::dom::node::{ChildrenMutation, Node, NodeTraits, ShadowIncluding};
 use crate::dom::scrolling_box::{ScrollAxisState, ScrollRequirement};
+use crate::dom::svg::svgsvgelement::SVGSVGElement;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
 
@@ -72,6 +73,19 @@ impl SVGElement {
     fn as_element(&self) -> &Element {
         self.upcast::<Element>()
     }
+
+    /// What an `<svg>` element draws is rasterized from the markup of its
+    /// subtree, so a change anywhere inside of it makes that out of date.
+    fn invalidate_svg_ancestor(&self) {
+        let svg_ancestor = self
+            .upcast::<Node>()
+            .inclusive_ancestors(ShadowIncluding::No)
+            .skip(1)
+            .find_map(DomRoot::downcast::<SVGSVGElement>);
+        if let Some(svg_ancestor) = svg_ancestor {
+            svg_ancestor.invalidate_cached_serialized_subtree();
+        }
+    }
 }
 
 impl VirtualMethods for SVGElement {
@@ -100,6 +114,14 @@ impl VirtualMethods for SVGElement {
                 },
             }
         }
+        self.invalidate_svg_ancestor();
+    }
+
+    fn children_changed(&self, cx: &mut JSContext, mutation: &ChildrenMutation) {
+        if let Some(super_type) = self.super_type() {
+            super_type.children_changed(cx, mutation);
+        }
+        self.invalidate_svg_ancestor();
     }
 }
 

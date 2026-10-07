@@ -173,7 +173,7 @@ impl SVGSVGElement {
         }
     }
 
-    fn invalidate_cached_serialized_subtree(&self) {
+    pub(crate) fn invalidate_cached_serialized_subtree(&self) {
         *self.cached_serialized_data_url.borrow_mut() = None;
         self.upcast::<Node>().dirty(NodeDamage::Other);
     }
