@@ -713,10 +713,12 @@ impl ServoInner {
                 webview_id,
                 pipeline_id,
                 servo_url,
+                is_for_main_frame,
             ) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let request = NavigationRequest {
                         url: servo_url.into_url(),
+                        is_for_main_frame,
                         pipeline_id,
                         constellation_proxy: self.constellation_proxy.clone(),
                         response_sent: false,

@@ -1671,6 +1671,14 @@ where
                     },
                 );
             },
+            UserContentManagerAction::SetUserScripts(user_scripts) => {
+                self.mutate_user_contents_for_manager_id_and_notify_script_threads(
+                    user_content_manager_id,
+                    |user_contents| {
+                        user_contents.scripts = user_scripts;
+                    },
+                );
+            },
             UserContentManagerAction::DestroyUserContentManager => {
                 self.user_contents_for_manager_id
                     .remove(&user_content_manager_id);
@@ -3843,12 +3851,16 @@ where
                 });
             },
         };
+        let is_for_main_frame = self.pipelines.get(&source_id).is_some_and(|pipeline| {
+            pipeline.browsing_context_id == BrowsingContextId::from(webview_id)
+        });
         // Allow the embedder to handle the url itself
         self.constellation_to_embedder_proxy.send(
             ConstellationToEmbedderMsg::AllowNavigationRequest(
                 webview_id,
                 source_id,
                 load_data.url,
+                is_for_main_frame,
             ),
         );
     }

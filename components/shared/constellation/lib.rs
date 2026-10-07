@@ -130,6 +130,9 @@ pub enum UserContentManagerAction {
     /// removing one at a time, this leaves no window in which the old sheet and the
     /// new one are both live, which matters when the sheets are swapped per page.
     SetUserStyleSheets(Vec<UserStyleSheet>),
+    /// Replace every user script of this manager at once, for scripts that are chosen
+    /// per page. Only documents created afterwards run the new set.
+    SetUserScripts(Vec<UserScript>),
 }
 
 /// A description of a paint metric that is sent from the Servo renderer to the

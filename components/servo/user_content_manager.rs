@@ -49,6 +49,18 @@ impl UserContentManager {
         );
     }
 
+    /// Replace every user script this manager holds. A document that is created in a
+    /// `WebView` that uses this manager afterwards runs the new set; one that already
+    /// exists keeps what it ran.
+    pub fn set_scripts(&self, user_scripts: Vec<UserScript>) {
+        self.servo.constellation_proxy().send(
+            EmbedderToConstellationMessage::UserContentManagerAction(
+                self.id,
+                UserContentManagerAction::SetUserScripts(user_scripts),
+            ),
+        );
+    }
+
     pub fn add_stylesheet(&self, user_stylesheet: Rc<UserStyleSheet>) {
         self.servo.constellation_proxy().send(
             EmbedderToConstellationMessage::UserContentManagerAction(
