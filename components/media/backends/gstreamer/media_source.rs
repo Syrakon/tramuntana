@@ -371,7 +371,13 @@ impl Track {
     }
 
     /// Take a frame out of the demuxer.
-    fn ingest(&self, sample: &gstreamer::Sample, timestamp_offset: i64, window: &Range<u64>) {
+    fn ingest(
+        &self,
+        sample: &gstreamer::Sample,
+        container: Container,
+        timestamp_offset: i64,
+        window: &Range<u64>,
+    ) {
         let (Some(mut buffer), Some(caps)) = (sample.buffer_owned(), sample.caps_owned()) else {
             return;
         };
@@ -380,13 +386,21 @@ impl Track {
         };
 
         // Move the timestamps from the segment of the demuxer to the media timeline.
-        let segment_offset = sample
-            .segment()
-            .and_then(|segment| segment.downcast_ref::<gstreamer::ClockTime>())
-            .and_then(|segment| Some((segment.time()?, segment.start()?)))
-            .map_or(0, |(time, start)| {
-                time.nseconds() as i64 - start.nseconds() as i64
-            });
+        let segment_offset = match container {
+            Container::Mp4 => sample
+                .segment()
+                .and_then(|segment| segment.downcast_ref::<gstreamer::ClockTime>())
+                .and_then(|segment| Some((segment.time()?, segment.start()?)))
+                .map_or(0, |(time, start)| {
+                    time.nseconds() as i64 - start.nseconds() as i64
+                }),
+            // matroskademux takes the first cluster it is given as the start of
+            // the stream and makes its segment map that cluster to time zero.
+            // The first cluster appended is anywhere in the media when playback
+            // starts in the middle of it, and the timestamps of the frames are
+            // those of the media timeline as they come.
+            Container::WebM => 0,
+        };
         let offset = segment_offset.saturating_add(timestamp_offset);
         let pts = (pts.nseconds() as i64).saturating_add(offset);
         let dts = buffer
@@ -681,11 +695,22 @@ impl SourceBuffer {
                 return;
             };
 
-            // A later initialization segment brings the same tracks again.
+            // A later initialization segment brings the same tracks again, and
+            // so does the demuxer of another container after a change of type,
+            // which may not name its pads the same way.
             let track = {
                 let mut tracks = lock(&tracks);
-                match tracks.iter().find(|track| track.pad_name == name.as_str()) {
-                    Some(track) => track.clone(),
+                let known = tracks
+                    .iter()
+                    .find(|track| track.pad_name == name.as_str())
+                    .or_else(|| {
+                        tracks
+                            .iter()
+                            .find(|track| lock(&track.buffer).info.kind == kind)
+                    })
+                    .cloned();
+                match known {
+                    Some(track) => track,
                     None => {
                         let track = Arc::new(Track::new(name.as_str(), kind, shared.clone()));
                         tracks.push(track.clone());
@@ -715,6 +740,7 @@ impl SourceBuffer {
                             let window = lock(&settings.window).clone();
                             track.ingest(
                                 &sample,
+                                container,
                                 settings.timestamp_offset.load(Ordering::Relaxed),
                                 &window,
                             );
@@ -823,11 +849,37 @@ impl SourceBuffer {
         {
             log::warn!("Could not flush the append pipeline");
         }
+        self.forget_last_append();
+    }
+
+    /// What comes next does not follow what was appended last.
+    fn forget_last_append(&self) {
         for track in self.tracks() {
             let mut track = lock(&track.buffer);
             track.last_appended = None;
             track.need_keyframe = true;
         }
+    }
+
+    /// Go on with data of another container. A demuxer for it takes the place
+    /// of the one there was, and the tracks keep their frames.
+    fn change_container(
+        &mut self,
+        container: Container,
+        shared: Arc<Shared>,
+    ) -> Result<(), PlayerError> {
+        let (pipeline, appsrc, outcome) =
+            Self::build_pipeline(container, shared, self.tracks.clone(), self.settings.clone())
+                .map_err(|error| PlayerError::Backend(error.to_string()))?;
+        let replaced = std::mem::replace(&mut self.pipeline, pipeline);
+        if let Err(error) = replaced.set_state(gstreamer::State::Null) {
+            log::warn!("Could not stop the append pipeline of the previous type: {error}");
+        }
+        self.appsrc = appsrc;
+        self.outcome = outcome;
+        self.container = container;
+        self.forget_last_append();
+        Ok(())
     }
 
     fn buffered(&self) -> Vec<Range<u64>> {
@@ -914,19 +966,26 @@ impl MediaSource {
         Ok(())
     }
 
-    /// The source buffer goes on with data of `media_type`, which its demuxer has
-    /// to be able to take.
+    /// The source buffer goes on with data of `media_type`.
     pub(crate) fn change_type(
-        &self,
+        &mut self,
         id: SourceBufferId,
         media_type: &str,
     ) -> Result<(), PlayerError> {
-        let source_buffer = self.source_buffer(id)?;
-        if Container::from_media_type(media_type) != Some(source_buffer.container) {
-            return Err(PlayerError::UnsupportedMediaType);
+        let container =
+            Container::from_media_type(media_type).ok_or(PlayerError::UnsupportedMediaType)?;
+        let shared = self.shared.clone();
+        let source_buffer = self
+            .source_buffers
+            .iter_mut()
+            .find(|(source_buffer_id, _)| *source_buffer_id == id)
+            .map(|(_, source_buffer)| source_buffer)
+            .ok_or(PlayerError::UnknownSourceBuffer)?;
+        if container == source_buffer.container {
+            source_buffer.reset_parser();
+            return Ok(());
         }
-        source_buffer.reset_parser();
-        Ok(())
+        source_buffer.change_container(container, shared)
     }
 
     pub(crate) fn append(

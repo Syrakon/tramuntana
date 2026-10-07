@@ -499,8 +499,7 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
         media_source.reopen_if_ended();
 
         // Step 6. Run the reset parser state algorithm.
-        // The media player does it, and refuses a container other than the one the
-        // source buffer was created with.
+        // The media player does it.
         media_source
             .with_player(|player| player.change_source_buffer_type(self.id(), &media_type))
             .map_err(|_| Error::NotSupported(None))
