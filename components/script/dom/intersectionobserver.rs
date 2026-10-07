@@ -402,6 +402,8 @@ impl IntersectionObserver {
     fn disconnect_from_owner(&self) {
         if self.connected_to_document.get() {
             self.owner_doc.remove_intersection_observer(self);
+            // Observing a target again connects the observer again.
+            self.connected_to_document.set(false);
         }
     }
 
