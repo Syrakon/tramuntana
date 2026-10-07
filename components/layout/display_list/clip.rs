@@ -5,15 +5,24 @@
 use app_units::Au;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_base::id::ScrollTreeNodeId;
-use style::values::computed::LengthPercentage;
+use style::computed_values::mask_clip::single_value::T as MaskClip;
+use style::computed_values::mask_composite::single_value::T as MaskComposite;
+use style::computed_values::mask_mode::single_value::T as MaskMode;
+use style::properties::ComputedValues;
 use style::values::computed::basic_shape::{BasicShape, ClipPath};
+use style::values::computed::image::{Gradient, Image};
 use style::values::computed::position::Position;
+use style::values::computed::{BackgroundRepeat, BackgroundSize, Color, LengthPercentage};
 use style::values::generics::basic_shape::{GenericShapeRadius, ShapeBox, ShapeGeometryBox};
+use style::values::generics::image::GradientItem;
 use style::values::generics::position::GenericPositionOrAuto;
 use webrender_api::BorderRadius;
 use webrender_api::units::{LayoutRect, LayoutSideOffsets, LayoutSize};
 
-use super::{BuilderForBoxFragment, compute_margin_box_radius, normalize_radii};
+use super::background::get_cyclic;
+use super::conversions::ToWebRender;
+use super::{BuilderForBoxFragment, compute_margin_box_radius, normalize_radii, offset_radii};
+use crate::style_ext::ComputedValuesExt;
 
 /// An identifier for a clip used during StackingContextTree construction. This is a simple index in
 /// a [`ClipStore`]s vector of clips.
@@ -33,6 +42,9 @@ pub(crate) struct Clip {
     pub id: ClipId,
     pub radii: BorderRadius,
     pub rect: LayoutRect,
+    /// Whether this clip hides what is inside of its rounded rectangle instead of what is
+    /// outside of it.
+    pub clip_out: bool,
     pub parent_scroll_node_id: ScrollTreeNodeId,
     pub parent_clip_id: ClipId,
 }
@@ -55,23 +67,136 @@ impl StackingContextTreeClipStore {
         parent_scroll_node_id: ScrollTreeNodeId,
         parent_clip_id: ClipId,
     ) -> ClipId {
+        self.add_with_mode(
+            radii,
+            rect,
+            false, /* clip_out */
+            parent_scroll_node_id,
+            parent_clip_id,
+        )
+    }
+
+    fn add_with_mode(
+        &mut self,
+        radii: webrender_api::BorderRadius,
+        rect: LayoutRect,
+        clip_out: bool,
+        parent_scroll_node_id: ScrollTreeNodeId,
+        parent_clip_id: ClipId,
+    ) -> ClipId {
         let id = ClipId(self.0.len());
         self.0.push(Clip {
             id,
             radii,
             rect,
+            clip_out,
             parent_scroll_node_id,
             parent_clip_id,
         });
         id
     }
 
-    pub(super) fn add_for_clip_path(
+    /// Adds the clips that `clip-path` and `mask` put on a fragment, the mask inside of the
+    /// clip path. Returns `None` when neither of them clips anything.
+    pub(super) fn add_for_clip_path_and_mask(
+        &mut self,
+        style: &ComputedValues,
+        parent_scroll_node_id: ScrollTreeNodeId,
+        parent_clip_id: ClipId,
+        fragment_builder: BuilderForBoxFragment,
+    ) -> Option<ClipId> {
+        let clip_path_clip_id = self.add_for_clip_path(
+            style.clone_clip_path(),
+            parent_scroll_node_id,
+            parent_clip_id,
+            &fragment_builder,
+        );
+        let mask_clip_id = self.add_for_mask(
+            style,
+            parent_scroll_node_id,
+            clip_path_clip_id.unwrap_or(parent_clip_id),
+            &fragment_builder,
+        );
+        mask_clip_id.or(clip_path_clip_id)
+    }
+
+    /// Adds the clips for a `mask` that only shows or hides whole boxes of the fragment.
+    ///
+    /// A mask layer whose image is opaque everywhere shows the fragment inside of the box that
+    /// its `mask-clip` names and hides it outside, so compositing such layers yields plain
+    /// geometry. This covers the usual way of drawing a gradient border: `mask:
+    /// linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)` together with
+    /// `mask-composite: exclude`.
+    ///
+    /// TODO: Masks that depend on the pixels of their images are not painted.
+    fn add_for_mask(
+        &mut self,
+        style: &ComputedValues,
+        parent_scroll_node_id: ScrollTreeNodeId,
+        parent_clip_id: ClipId,
+        fragment_builder: &BuilderForBoxFragment,
+    ) -> Option<ClipId> {
+        let bands = opaque_mask_bands(style)?;
+        if bands == 0 {
+            return Some(self.add(
+                BorderRadius::zero(),
+                LayoutRect::from_origin_and_size(
+                    fragment_builder.border_rect.min,
+                    LayoutSize::zero(),
+                ),
+                parent_scroll_node_id,
+                parent_clip_id,
+            ));
+        }
+
+        // The bands have to be next to each other: a rounded rectangle with a smaller one cut
+        // out of it is all that a chain of clips can describe.
+        let innermost = bands.trailing_zeros();
+        let outermost = u8::BITS - 1 - bands.leading_zeros();
+        if !((bands >> innermost) + 1).is_power_of_two() {
+            return None;
+        }
+
+        let fragment = fragment_builder.fragment;
+        let box_for_band = |band: u32| match band {
+            0 => (
+                *fragment_builder.content_rect(),
+                offset_radii(
+                    fragment_builder.border_radius,
+                    -(fragment.border + fragment.padding).to_webrender(),
+                ),
+            ),
+            1 => (
+                *fragment_builder.padding_rect(),
+                offset_radii(
+                    fragment_builder.border_radius,
+                    -fragment.border.to_webrender(),
+                ),
+            ),
+            _ => (fragment_builder.border_rect, fragment_builder.border_radius),
+        };
+
+        let (rect, radii) = box_for_band(outermost);
+        let clip_id = self.add(radii, rect, parent_scroll_node_id, parent_clip_id);
+        if innermost == 0 {
+            return Some(clip_id);
+        }
+        let (rect, radii) = box_for_band(innermost - 1);
+        Some(self.add_with_mode(
+            radii,
+            rect,
+            true, /* clip_out */
+            parent_scroll_node_id,
+            clip_id,
+        ))
+    }
+
+    fn add_for_clip_path(
         &mut self,
         clip_path: ClipPath,
         parent_scroll_node_id: ScrollTreeNodeId,
         parent_clip_chain_id: ClipId,
-        fragment_builder: BuilderForBoxFragment,
+        fragment_builder: &BuilderForBoxFragment,
     ) -> Option<ClipId> {
         let geometry_box = match clip_path {
             ClipPath::Shape(_, ShapeGeometryBox::ShapeBox(shape_box)) => shape_box,
@@ -269,4 +394,72 @@ fn compute_shape_radius(
             .to_used_value(Au::from_f32_px(max_edge - min_edge))
             .to_f32_px(),
     }
+}
+
+/// The part of the content box that a mask shows.
+const CONTENT_BAND: u8 = 0b001;
+/// The part of the padding box outside of the content box that a mask shows.
+const PADDING_BAND: u8 = 0b010;
+/// The part of the border box outside of the padding box that a mask shows.
+const BORDER_BAND: u8 = 0b100;
+
+/// The bands of the fragment that the `mask` of this style shows, when every one of its layers
+/// is opaque over the whole box that it is clipped to. `None` when there is no mask or when the
+/// mask depends on the pixels of its images.
+fn opaque_mask_bands(style: &ComputedValues) -> Option<u8> {
+    if !style.has_mask_image() {
+        return None;
+    }
+
+    let svg = style.get_svg();
+    let layers = &svg.mask_image.0;
+    let mut bands = 0;
+    for (index, image) in layers.iter().enumerate().rev() {
+        let Image::Gradient(gradient) = image else {
+            return None;
+        };
+        let is_opaque = match gradient.as_ref() {
+            Gradient::Linear { items, .. } | Gradient::Radial { items, .. } => {
+                gradient_is_opaque(style, items)
+            },
+            Gradient::Conic { items, .. } => gradient_is_opaque(style, items),
+        };
+        // An image that is tiled at its natural size covers the whole box, which is the only
+        // arrangement where the position and the origin of the layer do not matter.
+        if !is_opaque ||
+            *get_cyclic(&svg.mask_mode.0, index) == MaskMode::Luminance ||
+            *get_cyclic(&svg.mask_size.0, index) != BackgroundSize::auto() ||
+            *get_cyclic(&svg.mask_repeat.0, index) != BackgroundRepeat::repeat()
+        {
+            return None;
+        }
+
+        let layer = match *get_cyclic(&svg.mask_clip.0, index) {
+            MaskClip::ContentBox => CONTENT_BAND,
+            MaskClip::PaddingBox => CONTENT_BAND | PADDING_BAND,
+            MaskClip::BorderBox => CONTENT_BAND | PADDING_BAND | BORDER_BAND,
+        };
+        // `mask-composite` combines a layer with the layers below it, so the last layer has
+        // nothing to be combined with.
+        bands = if index + 1 == layers.len() {
+            layer
+        } else {
+            match *get_cyclic(&svg.mask_composite.0, index) {
+                MaskComposite::Add => layer | bands,
+                MaskComposite::Subtract => layer & !bands,
+                MaskComposite::Intersect => layer & bands,
+                MaskComposite::Exclude => layer ^ bands,
+            }
+        };
+    }
+    Some(bands)
+}
+
+fn gradient_is_opaque<T>(style: &ComputedValues, items: &[GradientItem<Color, T>]) -> bool {
+    items.iter().all(|item| match item {
+        GradientItem::SimpleColorStop(color) | GradientItem::ComplexColorStop { color, .. } => {
+            style.resolve_color(color).alpha == 1.0
+        },
+        GradientItem::InterpolationHint(_) => true,
+    })
 }

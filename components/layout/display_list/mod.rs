@@ -361,7 +361,7 @@ impl DisplayListBuilder<'_> {
         );
 
         let spatial_id = self.spatial_id(clip.parent_scroll_node_id);
-        let new_clip_id = if clip.radii.is_zero() {
+        let new_clip_id = if clip.radii.is_zero() && !clip.clip_out {
             self.wr().define_clip_rect(spatial_id, clip.rect)
         } else {
             self.wr().define_clip_rounded_rect(
@@ -369,7 +369,11 @@ impl DisplayListBuilder<'_> {
                 ComplexClipRegion {
                     rect: clip.rect,
                     radii: clip.radii,
-                    mode: ClipMode::Clip,
+                    mode: if clip.clip_out {
+                        ClipMode::ClipOut
+                    } else {
+                        ClipMode::Clip
+                    },
                 },
             )
         };
@@ -406,6 +410,7 @@ impl DisplayListBuilder<'_> {
             id: ClipId(self.clip_map.len()),
             radii,
             rect,
+            clip_out: false,
             parent_scroll_node_id: self.current_scroll_node_id,
             parent_clip_id: self.current_clip_id,
         }))

@@ -114,7 +114,7 @@ impl<'a> HitTest<'a> {
 
 impl Clip {
     fn contains(&self, point: LayoutPoint) -> bool {
-        rounded_rect_contains_point(self.rect, &self.radii, point)
+        rounded_rect_contains_point(self.rect, &self.radii, point) != self.clip_out
     }
 }
 

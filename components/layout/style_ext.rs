@@ -335,6 +335,8 @@ pub(crate) trait ComputedValuesExt {
     fn effective_overflow(&self, fragment_flags: FragmentFlags) -> AxesOverflow;
     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool;
+    /// Whether `mask-image` has at least one layer with an image.
+    fn has_mask_image(&self) -> bool;
     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_containing_block_for_absolute_descendants(
         &self,
@@ -690,6 +692,14 @@ impl ComputedValuesExt for ComputedValues {
     }
 
     /// Returns true if this fragment establishes a new stacking context and false otherwise.
+    fn has_mask_image(&self) -> bool {
+        self.get_svg()
+            .mask_image
+            .0
+            .iter()
+            .any(|image| !matches!(image, ComputedImageLayer::None))
+    }
+
     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool {
         // From <https://www.w3.org/TR/css-will-change/#valdef-will-change-custom-ident>:
         // > If any non-initial value of a property would create a stacking context on the element,
@@ -768,6 +778,12 @@ impl ComputedValuesExt for ComputedValues {
         // > A computed value of other than `none` results in the creation of a stacking context.
         // Note `will-change: clip-path` is handled above by `STACKING_CONTEXT_UNCONDITIONAL`.
         if self.get_svg().clip_path != ClipPath::None {
+            return true;
+        }
+
+        // From <https://www.w3.org/TR/css-masking-1/#the-mask-image>
+        // > A computed value of other than `none` results in the creation of a stacking context
+        if self.has_mask_image() {
             return true;
         }
 

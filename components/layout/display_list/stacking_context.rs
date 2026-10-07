@@ -603,6 +603,7 @@ impl StackingContext {
             effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
             !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
             style.clone_clip_path() == ClipPath::None &&
+            !style.has_mask_image() &&
             transform_style == TransformStyle::Flat
         {
             return false;
@@ -1236,13 +1237,12 @@ impl BoxFragment {
             );
         }
 
-        // `clip-path` needs to be applied before filters and creates a stacking context, so it can be
-        // applied directly to the stacking context itself.
-        // before
+        // `clip-path` and `mask` need to be applied before filters and create a stacking context,
+        // so they can be applied directly to the stacking context itself.
         let stacking_context_clip_id = stacking_context_tree
             .clip_store
-            .add_for_clip_path(
-                self.style().clone_clip_path(),
+            .add_for_clip_path_and_mask(
+                &self.style(),
                 containing_block.scroll_node_id,
                 containing_block.clip_id,
                 BuilderForBoxFragment::new(
@@ -1326,8 +1326,8 @@ impl BoxFragment {
         }
 
         let style = self.style();
-        if let Some(clip_id) = stacking_context_tree.clip_store.add_for_clip_path(
-            style.clone_clip_path(),
+        if let Some(clip_id) = stacking_context_tree.clip_store.add_for_clip_path_and_mask(
+            &style,
             new_scroll_node_id,
             new_clip_id,
             BuilderForBoxFragment::new(
