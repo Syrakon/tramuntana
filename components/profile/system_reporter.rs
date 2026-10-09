@@ -257,9 +257,9 @@ fn proportional_set_size() -> Option<usize> {
         .split("\n")
         .find(|string| string.contains("Pss:"))?;
 
-    // String looks like: "Pss:                 227 kB"
+    // String looks like: "Pss:                 227 kB". The report is in bytes.
     let pss_str = pss_line.split_whitespace().nth(1)?;
-    pss_str.parse().ok()
+    pss_str.parse::<usize>().ok()?.checked_mul(1024)
 }
 
 #[cfg(not(target_os = "linux"))]

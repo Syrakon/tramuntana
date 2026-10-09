@@ -1,9 +1,422 @@
 <!DOCTYPE html>
-<html>
+<html lang="es">
   <head>
+    <meta charset="utf-8" />
     <title>about:memory</title>
     <script>
       document.addEventListener("DOMContentLoaded", start);
+
+      // What each part of a report's path means, in words for someone who has
+      // never seen a memory report. `what` says what it is; `note` says whether
+      // it goes away and when.
+      const PAGE_PARTS = {
+        "js/malloc-heap": {
+          name: "Datos de JavaScript",
+          what: "Lo que los programas de la página han creado y guardan: textos, listas, el código ya preparado para ejecutarse.",
+          note: "Crece con el uso de la página. Solo baja si la página suelta sus datos o se cierra.",
+        },
+        "js/gc-heap/used": {
+          name: "Objetos de JavaScript en uso",
+          what: "Los objetos vivos de los programas de la página.",
+          note: "El recolector de basura los retira cuando la página deja de usarlos.",
+        },
+        "js/gc-heap/unused": {
+          name: "Hueco libre de JavaScript",
+          what: "Espacio ya reservado para objetos de JavaScript que ahora está vacío.",
+          note: "Se reutiliza para objetos nuevos. «Forzar limpieza» puede devolver parte al sistema.",
+        },
+        "js/gc-heap/admin": {
+          name: "Contabilidad de JavaScript",
+          what: "Lo que el motor de JavaScript necesita para llevar la cuenta de sus propios objetos.",
+          note: "Pequeño y proporcional al número de objetos.",
+        },
+        "js/gc-heap/decommitted": {
+          name: "Devuelto al sistema",
+          what: "Espacio que JavaScript tuvo reservado y ya ha devuelto al sistema operativo.",
+          note: "No ocupa memoria real. Aparece solo como referencia.",
+        },
+        "js/non-heap": {
+          name: "Motor de JavaScript",
+          what: "Memoria del propio motor que ejecuta los programas de la página, fuera de sus objetos.",
+          note: "Casi fija mientras la página está abierta.",
+        },
+        "layout-thread/box-tree": {
+          name: "Estructura de la página",
+          what: "La descripción de cada caja de la página: párrafos, imágenes, tablas, y cómo se anidan.",
+          note: "Se puede volver a calcular a partir del contenido. Crece con el tamaño del documento.",
+        },
+        "layout-thread/fragment-tree": {
+          name: "Posiciones calculadas",
+          what: "Dónde cae exactamente cada trozo de la página una vez repartido en líneas y columnas.",
+          note: "Se recalcula cuando cambia el contenido o el tamaño de la ventana.",
+        },
+        "layout-thread/stacking-context-tree": {
+          name: "Orden de capas",
+          what: "Qué elemento se dibuja encima de cuál.",
+          note: "Se recalcula al volver a dibujar.",
+        },
+        "layout-thread/display-list": {
+          name: "Lista de dibujo",
+          what: "Las órdenes de dibujo de la página, listas para enviarse a la tarjeta gráfica.",
+          note: "Se regenera en cada cambio visible.",
+        },
+        "layout-thread/stylist": {
+          name: "Reglas de estilo",
+          what: "Las hojas de estilo (CSS) de la página, ya analizadas y ordenadas para aplicarlas rápido.",
+          note: "Depende de cuánto CSS traiga la página.",
+        },
+        "layout-thread/font-context": {
+          name: "Tipografías de la página",
+          what: "Las fuentes que la página usa y las medidas de sus letras.",
+          note: "Crece con el número de fuentes y de alfabetos distintos.",
+        },
+        "image-cache": {
+          name: "Imágenes",
+          what: "Las imágenes de la página ya descomprimidas, listas para dibujarse.",
+          note: "Una imagen descomprimida ocupa mucho más que su fichero. Se puede soltar y volver a descomprimir.",
+        },
+        "image-cache/fontdb": {
+          name: "Fuentes para imágenes SVG",
+          what: "El catálogo de fuentes que se usa para dibujar texto dentro de imágenes vectoriales.",
+          note: "Se carga la primera vez que hace falta.",
+        },
+      };
+
+      const BROWSER_PARTS = {
+        "memory-cache/public": {
+          name: "Caché de red en memoria",
+          what: "Copias de ficheros descargados (estilos, programas, imágenes) para no pedirlos otra vez.",
+          note: "Tiene un tope. Lo que no cabe se guarda en disco o se descarta.",
+        },
+        "memory-cache/private": {
+          name: "Caché de red (navegación privada)",
+          what: "Lo mismo que la caché de red, para las pestañas privadas.",
+          note: "Nunca se escribe en disco y se borra al cerrar la sesión privada.",
+        },
+        "webrender/images": {
+          name: "Imágenes en el motor de dibujo",
+          what: "Las imágenes que el motor gráfico tiene preparadas para pintar en pantalla.",
+          note: "Corresponde a lo que está o ha estado hace poco a la vista.",
+        },
+        "webrender/fonts": {
+          name: "Letras en el motor de dibujo",
+          what: "Las fuentes y las letras ya dibujadas que el motor gráfico guarda para reutilizar.",
+          note: "Crece con la variedad de texto mostrado.",
+        },
+        "webrender/display-list": {
+          name: "Órdenes de dibujo pendientes",
+          what: "Las órdenes de dibujo de las pestañas tal como las tiene el motor gráfico.",
+          note: "Se sustituyen en cada fotograma.",
+        },
+        "paint/scroll-tree": {
+          name: "Zonas con desplazamiento",
+          what: "Qué partes de cada página se pueden desplazar y hasta dónde.",
+          note: "Pequeño.",
+        },
+        "storage/local": {
+          name: "Datos guardados por las webs",
+          what: "Lo que las webs guardan en este equipo para recordarte entre visitas (localStorage).",
+          note: "Se queda hasta que la web lo borra o tú limpias sus datos.",
+        },
+        "storage/session": {
+          name: "Datos de sesión de las webs",
+          what: "Lo que las webs guardan solo mientras la pestaña está abierta (sessionStorage).",
+          note: "Se borra al cerrar la pestaña.",
+        },
+        indexeddb: {
+          name: "Bases de datos de las webs",
+          what: "Bases de datos que algunas aplicaciones web mantienen en este equipo (IndexedDB).",
+          note: "Se queda hasta que la web lo borra o tú limpias sus datos.",
+        },
+        "hsts-list/public": {
+          name: "Webs que exigen conexión segura",
+          what: "La lista de webs que han pedido que siempre se las visite por HTTPS.",
+          note: "Protege de conexiones sin cifrar. Pequeño.",
+        },
+        "hsts-list/private": {
+          name: "Webs que exigen conexión segura (privada)",
+          what: "La misma lista para la navegación privada.",
+          note: "Se borra al cerrar la sesión privada.",
+        },
+        "hsts-preload-list": {
+          name: "Lista fija de webs seguras",
+          what: "Una lista que viene con el navegador de webs que solo admiten HTTPS.",
+          note: "Tamaño fijo. No depende de lo que visites.",
+        },
+        "public-suffix-list": {
+          name: "Lista de terminaciones de dominio",
+          what: "La lista que dice qué parte de una dirección es el sitio (por ejemplo, que «co.uk» no es un sitio).",
+          note: "Tamaño fijo. Sirve para separar las cookies de cada sitio.",
+        },
+        "system-fonts": {
+          name: "Catálogo de fuentes del equipo",
+          what: "La lista de tipografías instaladas en el sistema.",
+          note: "Tamaño fijo según las fuentes instaladas.",
+        },
+        devtools: {
+          name: "Herramientas de desarrollo",
+          what: "El servidor que permite inspeccionar las páginas.",
+          note: "Pequeño si no hay nadie conectado.",
+        },
+      };
+
+      const SYSTEM_PARTS = {
+        resident: {
+          name: "Memoria residente",
+          what: "Todo lo que el sistema operativo tiene cargado en memoria física a nombre del navegador, incluido el código de las bibliotecas.",
+          note: "Es la cifra que suelen enseñar los monitores del sistema. Exagera: buena parte se comparte con otros programas o se puede soltar sin perder nada.",
+        },
+        pss: {
+          name: "Memoria proporcional",
+          what: "Como la residente, pero repartiendo lo compartido entre los programas que lo usan.",
+          note: "La medida más justa de cuánto «cuesta» el navegador al equipo.",
+        },
+        vsize: {
+          name: "Espacio de direcciones",
+          what: "Todo lo que el navegador tiene reservado, lo use o no.",
+          note: "No es memoria ocupada. Un valor de varios GiB es normal y no indica un problema.",
+        },
+        "jemalloc-heap-allocated": {
+          name: "Memoria pedida por el navegador",
+          what: "Lo que el código del navegador ha pedido y tiene en uso ahora mismo.",
+          note: "La cifra más cercana a «lo que el navegador necesita de verdad».",
+        },
+        "jemalloc-heap-active": {
+          name: "Páginas de memoria en uso",
+          what: "Lo anterior redondeado a los bloques en los que el sistema reparte la memoria.",
+          note: "Algo mayor que lo pedido. La diferencia es espacio suelto entre datos.",
+        },
+        "jemalloc-heap-mapped": {
+          name: "Memoria reservada al sistema",
+          what: "Lo que el gestor de memoria del navegador tiene tomado del sistema, en uso o a la espera.",
+          note: "Parte vuelve al sistema al cabo de unos segundos sin usarse.",
+        },
+        "system-heap-allocated": {
+          name: "Memoria pedida por las bibliotecas",
+          what: "Lo que han pedido las bibliotecas externas: vídeo, controlador gráfico, fuentes.",
+          note: "El navegador no la controla directamente.",
+        },
+        "system-heap-reserved": {
+          name: "Memoria reservada por las bibliotecas",
+          what: "Lo que esas bibliotecas tienen tomado del sistema, lo usen o no.",
+          note: "La diferencia con lo pedido es espacio libre que aún no han devuelto.",
+        },
+      };
+
+      const KINDS = {
+        own: {
+          name: "Memoria propia",
+          what: "Datos que el navegador ha creado y que solo él usa: las páginas, sus programas, las imágenes descomprimidas.",
+          note: "Es la que importa. Solo se libera cerrando pestañas o cuando el navegador suelta lo que no necesita.",
+        },
+        files: {
+          name: "Programa y bibliotecas",
+          what: "El código del navegador, del controlador gráfico y de las bibliotecas, y los ficheros de fuentes, cargados desde el disco.",
+          note: "Si el equipo anda justo de memoria, el sistema lo descarta y lo vuelve a leer del disco cuando hace falta. Mucho se comparte con otros programas.",
+        },
+        driver: {
+          name: "Controlador gráfico",
+          what: "Memoria compartida con el controlador de la tarjeta gráfica.",
+          note: "La gestiona el controlador. La memoria de vídeo de la tarjeta no aparece aquí.",
+        },
+        other: {
+          name: "Resto",
+          what: "La suma de muchas zonas pequeñas que el informe no detalla una a una.",
+          note: "Mezcla de código de bibliotecas menores y de datos. No se puede repartir entre los otros grupos.",
+        },
+      };
+
+      // The headline split of the physical memory, by what can be done about
+      // it. `tone` picks the colour of its piece of the bar.
+      const USES = {
+        used: {
+          name: "En uso",
+          tone: "used",
+          what: "Datos que el navegador y sus bibliotecas han pedido y tienen ocupados ahora mismo.",
+          note: "Es el gasto real. Solo baja cerrando pestañas o cuando una página suelta lo que ya no necesita.",
+        },
+        spare: {
+          name: "Reserva sin usar",
+          tone: "spare",
+          what: "Memoria que el navegador ya tomó del sistema y tiene libre, a la espera de volver a usarla: huecos entre datos y bloques recién vaciados.",
+          note: "No es gasto de ninguna página. Parte vuelve sola al sistema al cabo de unos segundos; «Forzar limpieza» adelanta otra parte.",
+        },
+        unknown: {
+          name: "Propia sin detallar",
+          tone: "unknown",
+          what: "Memoria solo del navegador que ninguno de sus contadores reclama: pilas de los hilos, el motor de JavaScript, zonas del controlador gráfico.",
+          note: "Cuenta como gasto, aunque no se sepa de quién. Si crece sin parar es donde buscar una fuga.",
+        },
+        files: {
+          name: "Código en disco",
+          tone: "files",
+          what: "El programa, las bibliotecas y las fuentes, leídos del disco.",
+          note: "No es gasto propio: si falta memoria el sistema lo descarta y lo relee después, y mucho se comparte con otros programas.",
+        },
+        driver: {
+          name: "Controlador gráfico",
+          tone: "driver",
+          what: "Memoria compartida con el controlador de la tarjeta gráfica.",
+          note: "La gestiona el controlador, no el navegador.",
+        },
+        other: {
+          name: "Resto",
+          tone: "other",
+          what: "Zonas pequeñas que el informe no detalla una a una.",
+          note: "",
+        },
+      };
+
+      // Splits the physical memory into the groups of `USES`. `own` is the
+      // memory only the browser uses, which the allocators' own figures divide
+      // into what is in use and what is held spare. Those figures can add up
+      // to more than `own`: memory that was asked for and never written to is
+      // counted by the allocator and not by the operating system. They are
+      // then scaled down together, keeping their proportion.
+      function splitByUse(kinds, system, pages) {
+        let fromPages = (part) =>
+          Object.values(pages).reduce((sum, parts) => sum + (parts[part] || 0), 0);
+        let asked =
+          (system["jemalloc-heap-allocated"] || 0) +
+          (system["system-heap-allocated"] || 0) +
+          fromPages("js/gc-heap/used") +
+          fromPages("js/gc-heap/admin");
+        let held =
+          Math.max(0, (system["jemalloc-heap-mapped"] || 0) - (system["jemalloc-heap-allocated"] || 0)) +
+          Math.max(0, (system["system-heap-reserved"] || 0) - (system["system-heap-allocated"] || 0)) +
+          fromPages("js/gc-heap/unused");
+        let fit = Math.min(1, kinds.own / Math.max(1, asked + held));
+        let used = Math.round(asked * fit);
+        let spare = Math.round(held * fit);
+        return {
+          used,
+          spare,
+          unknown: Math.max(0, kinds.own - used - spare),
+          files: kinds.files,
+          driver: kinds.driver,
+          other: kinds.other,
+        };
+      }
+
+      // One bar cut into the groups of `USES`, and under it one line per group.
+      function useBar(uses, total) {
+        let node = element("div", "use");
+        let bar = element("div", "use-bar");
+        let legend = element("div", "use-legend");
+        for (let [key, size] of Object.entries(uses)) {
+          if (size <= 0) {
+            continue;
+          }
+          let info = USES[key];
+          let piece = element("div", "use-piece tone-" + info.tone);
+          piece.style.width = (size / total) * 100 + "%";
+          piece.title = `${info.name}: ${formatBytes(size)}`;
+          bar.append(piece);
+
+          let item = element("div", "use-item");
+          let head = element("div", "row-head");
+          let name = element("span", "row-name");
+          name.append(element("span", "use-dot tone-" + info.tone), info.name);
+          head.append(name);
+          head.append(
+            element("span", "row-size", `${formatBytes(size)} · ${Math.round((size / total) * 100)} %`)
+          );
+          item.append(head);
+          item.append(element("p", "what", info.what));
+          if (info.note) {
+            item.append(element("p", "note", info.note));
+          }
+          legend.append(item);
+        }
+        node.append(bar, legend);
+        return node;
+      }
+
+      function formatBytes(bytes) {
+        if (bytes < 1024) {
+          return bytes + " B";
+        } else if (bytes < 1024 * 1024) {
+          return (bytes / 1024).toFixed(1) + " KiB";
+        } else if (bytes < 1024 * 1024 * 1024) {
+          return (bytes / (1024 * 1024)).toFixed(1) + " MiB";
+        }
+        return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GiB";
+      }
+
+      function element(tag, className, text) {
+        let node = document.createElement(tag);
+        if (className) {
+          node.className = className;
+        }
+        if (text !== undefined) {
+          node.textContent = text;
+        }
+        return node;
+      }
+
+      // One row: a name, a size, a bar relative to `scale`, and the explanation.
+      function row(info, size, scale, technical) {
+        let node = element("div", "row");
+        let head = element("div", "row-head");
+        head.append(element("span", "row-name", info.name));
+        head.append(element("span", "row-size", formatBytes(size)));
+        node.append(head);
+        let bar = element("div", "bar");
+        let fill = element("div", "bar-fill");
+        fill.style.width = (isFinite(scale) ? Math.max(0.5, Math.min(100, (size / scale) * 100)) : 0) + "%";
+        bar.append(fill);
+        node.append(bar);
+        node.append(element("p", "what", info.what));
+        if (info.note) {
+          node.append(element("p", "note", info.note));
+        }
+        if (technical) {
+          node.append(element("code", "technical", technical));
+        }
+        return node;
+      }
+
+      function section(title, intro) {
+        let node = element("section");
+        node.append(element("h2", null, title));
+        if (intro) {
+          node.append(element("p", "intro", intro));
+        }
+        return node;
+      }
+
+      // Which group a mapping that the operating system reports belongs to.
+      function kindOfMapping(name) {
+        if (name.startsWith("anonymous") || name.startsWith("[heap]") || name.startsWith("[anon")) {
+          return "own";
+        }
+        if (name.startsWith("/dev/")) {
+          return "driver";
+        }
+        if (name.startsWith("/")) {
+          return "files";
+        }
+        return "other";
+      }
+
+      function shortMappingName(name) {
+        let withoutFlags = name.replace(/ \([-rwxps]+\)$/, "");
+        return withoutFlags.startsWith("/") ? withoutFlags.split("/").pop() : withoutFlags;
+      }
+
+      function rowsFrom(parts, sizes, scale) {
+        return Object.entries(sizes)
+          .filter(([key, size]) => size > 0)
+          .sort((a, b) => b[1] - a[1])
+          .map(([key, size]) => {
+            let info = parts[key] || {
+              name: key,
+              what: "Sin descripción todavía.",
+              note: "",
+            };
+            return row(info, size, scale, key);
+          });
+      }
 
       function insertNode(root, report) {
         let currentNode = root;
@@ -18,206 +431,474 @@
         currentNode.container = false;
       }
 
-      function formatBytes(bytes) {
-        if (bytes < 1024) {
-          return bytes + " B";
-        } else if (bytes < 1024 * 1024) {
-          return (bytes / 1024).toFixed(2) + " KiB";
-        } else if (bytes < 1024 * 1024 * 1024) {
-          return (bytes / (1024 * 1024)).toFixed(2) + " MiB";
-        } else {
-          return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GiB";
-        }
-      }
-
-      function formattedSize(size) {
-        // Use enough padding to take into account the "MiB" part.
-        return formatBytes(size).padStart(10);
-      }
-
-      function convertNodeToDOM(node, name = null) {
+      function convertNodeToDOM(node, name) {
         let result = document.createDocumentFragment();
-
         if (node.container) {
           let details = document.createElement("details");
-          let summary = document.createElement("summary");
-          summary.textContent = `${formattedSize(node.total)} -- ${name}`;
-          details.append(summary);
+          details.append(
+            element("summary", null, `${formatBytes(node.total).padStart(10)} -- ${name}`)
+          );
           result.append(details);
-
-          // Add the children in descending order of total size.
-          let entries = Object.entries(node)
-            .filter((item) => {
-              return !["total", "size", "container"].includes(item[0]);
-            })
+          Object.entries(node)
+            .filter((item) => !["total", "size", "container"].includes(item[0]))
             .sort((a, b) => b[1].total - a[1].total)
-            .forEach((item) =>
-              details.append(convertNodeToDOM(item[1], item[0]))
-            );
+            .forEach((item) => details.append(convertNodeToDOM(item[1], item[0])));
         } else {
-          let inner = document.createElement("div");
-          inner.textContent = `${formattedSize(node.size)} -- ${name}`;
-          result.append(inner);
+          result.append(
+            element("div", null, `${formatBytes(node.size).padStart(10)} -- ${name}`)
+          );
         }
-
         return result;
       }
 
-      function reportsForProcess(processReport) {
-        let explicitRoot = {};
-        let nonExplicitRoot = {};
+      function render(processReports) {
+        let pages = {}; // url -> { part -> size }
+        let browser = {}; // part -> size
+        let system = {}; // name -> size
+        let kinds = { own: 0, files: 0, driver: 0, other: 0 };
+        let mappings = { own: {}, files: {}, driver: {}, other: {} };
+        let tree = {};
 
-        let jemallocHeapReportedSize = 0;
-        let systemHeapReportedSize = 0;
-
-        let jemallocHeapAllocatedSize = NaN;
-        let systemHeapAllocatedSize = NaN;
-
-        // In content processes, get the list of urls.
-        let urls = new Set();
-
-        processReport.reports.forEach((report) => {
-          if (report.path[0].startsWith("url(")) {
-            // This can be a list of urls.
-            let path_urls = report.path[0].slice(4, -1).split(", ");
-            path_urls.forEach((url) => urls.add(url));
-          }
-
-          // Add "explicit" to the start of the path, when appropriate.
-          if (report.kind.startsWith("Explicit")) {
-            report.path.unshift("explicit");
-          }
-
-          // Update the reported fractions of the heaps, when appropriate.
-          if (report.kind == "ExplicitJemallocHeapSize") {
-            jemallocHeapReportedSize += report.size;
-          } else if (report.kind == "ExplicitSystemHeapSize") {
-            systemHeapReportedSize += report.size;
-          }
-
-          // Record total size of the heaps, when we see them.
-          if (report.path.length == 1) {
-            if (report.path[0] == "jemalloc-heap-allocated") {
-              jemallocHeapAllocatedSize = report.size;
-            } else if (report.path[0] == "system-heap-allocated") {
-              systemHeapAllocatedSize = report.size;
+        for (let processReport of processReports) {
+          for (let report of processReport.reports) {
+            insertNode(tree, { path: [...report.path], size: report.size });
+            let [first, ...rest] = report.path;
+            if (first.startsWith("url(")) {
+              let page = (pages[first.slice(4, -1)] ||= {});
+              let part = rest.join("/");
+              page[part] = (page[part] || 0) + report.size;
+            } else if (first == "resident-according-to-smaps") {
+              let kind = kindOfMapping(rest[0]);
+              let name = shortMappingName(rest[0]);
+              kinds[kind] += report.size;
+              mappings[kind][name] = (mappings[kind][name] || 0) + report.size;
+            } else if (report.path.length == 1 && SYSTEM_PARTS[first]) {
+              system[first] = (system[first] || 0) + report.size;
+            } else {
+              let part = report.path.join("/");
+              browser[part] = (browser[part] || 0) + report.size;
             }
           }
-
-          // Insert this report at the proper position.
-          insertNode(
-            report.kind.startsWith("Explicit") ? explicitRoot : nonExplicitRoot,
-            report
-          );
-        });
-
-        // Compute and insert the heap-unclassified values.
-        if (!isNaN(jemallocHeapAllocatedSize)) {
-          insertNode(explicitRoot, {
-            path: ["explicit", "jemalloc-heap-unclassified"],
-            size: jemallocHeapAllocatedSize - jemallocHeapReportedSize,
-          });
-        }
-        if (!isNaN(systemHeapAllocatedSize)) {
-          insertNode(explicitRoot, {
-            path: ["explicit", "system-heap-unclassified"],
-            size: systemHeapAllocatedSize - systemHeapReportedSize,
-          });
         }
 
-        // Create the DOM structure for each process report:
-        // <div class=process> <h4>...<h4> <pre> ...</pre> </div>
-        let container = document.createElement("div");
-        container.classList.add("process");
-        let reportTitle = document.createElement("h4");
-        reportTitle.textContent = `${
-          processReport.isMainProcess ? "Main Process" : "Content Process"
-        } (pid ${processReport.pid}) ${[...urls.values()].join(", ")}`;
+        let root = document.createDocumentFragment();
+        let mapped = Object.values(kinds).reduce((a, b) => a + b, 0);
 
-        container.append(reportTitle);
-        let reportNode = document.createElement("pre");
-        reportNode.classList.add("report");
-        container.append(reportNode);
-
-        reportNode.append(convertNodeToDOM(explicitRoot.explicit, "explicit"));
-
-        for (let prop in nonExplicitRoot) {
-          reportNode.append(convertNodeToDOM(nonExplicitRoot[prop], prop));
+        // 0. At a glance: what is spent, what is held spare, and what is only
+        // reserved and costs nothing.
+        let glance = section(
+          "De un vistazo",
+          mapped > 0
+            ? `El navegador ocupa ${formatBytes(mapped)} de memoria física. No todo es gasto: la barra separa lo que usa de verdad de lo que tiene en reserva y de lo que el sistema puede recuperar.`
+            : "Este sistema no da el desglose por zonas de memoria."
+        );
+        if (mapped > 0) {
+          glance.append(useBar(splitByUse(kinds, system, pages), mapped));
+          let reservedOnly = (system.vsize || 0) - mapped;
+          if (reservedOnly > 0) {
+            let aside = element("div", "row aside");
+            let head = element("div", "row-head");
+            head.append(element("span", "row-name", "Solo reservado, sin ocupar"));
+            head.append(element("span", "row-size", formatBytes(reservedOnly)));
+            aside.append(head);
+            aside.append(
+              element(
+                "p",
+                "what",
+                "Direcciones que el navegador tiene apartadas y no ha tocado. No ocupan memoria ni disco, por eso no están en la barra."
+              )
+            );
+            aside.append(
+              element("p", "note", "Es el «Espacio de direcciones» menos lo de arriba. Varios GiB es lo normal.")
+            );
+            glance.append(aside);
+          }
         }
+        root.append(glance);
 
-        // Make sure we always put the main process first.
-        if (processReport.isMainProcess) {
-          window.reports.prepend(container);
+        // 1. The same memory, by whose it is.
+        let summary = section(
+          "Según de quién es",
+          "La misma memoria física, repartida según a quién pertenece. Solo el primer grupo depende de lo que tengas abierto."
+        );
+        if (mapped > 0) {
+          for (let [kind, size] of Object.entries(kinds).sort((a, b) => b[1] - a[1])) {
+            if (size > 0) {
+              summary.append(row(KINDS[kind], size, mapped));
+            }
+          }
         } else {
-          window.reports.append(container);
+          summary.append(
+            element("p", "intro", "Este sistema no da el desglose por zonas de memoria.")
+          );
+        }
+        root.append(summary);
+
+        // 2. Each open page.
+        let pageTotals = Object.entries(pages)
+          .map(([url, parts]) => [url, parts, Object.values(parts).reduce((a, b) => a + b, 0)])
+          .sort((a, b) => b[2] - a[2]);
+        let pagesTotal = pageTotals.reduce((sum, page) => sum + page[2], 0);
+        let pagesSection = section(
+          "Páginas abiertas",
+          `Lo que el navegador sabe atribuir a cada página: ${formatBytes(pagesTotal)} en total. ` +
+            "Una página ocupa más que esto: parte de su memoria está en el motor de dibujo o no se puede asignar a nadie, y aparece en «Memoria propia» arriba."
+        );
+        for (let [url, parts, total] of pageTotals) {
+          let page = document.createElement("details");
+          page.className = "page";
+          let pageSummary = document.createElement("summary");
+          pageSummary.append(element("span", "page-url", url || "(página sin dirección)"));
+          pageSummary.append(element("span", "row-size", formatBytes(total)));
+          page.append(pageSummary);
+          page.append(...rowsFrom(PAGE_PARTS, parts, total));
+          pagesSection.append(page);
+        }
+        if (pageTotals.length == 1) {
+          pagesSection.querySelector("details").open = true;
+        }
+        root.append(pagesSection);
+
+        // 3. What belongs to the browser as a whole.
+        let browserTotal = Object.values(browser).reduce((a, b) => a + b, 0);
+        let browserSection = section(
+          "Navegador",
+          `Memoria que no es de ninguna página en concreto: ${formatBytes(browserTotal)}.`
+        );
+        browserSection.append(...rowsFrom(BROWSER_PARTS, browser, browserTotal));
+        root.append(browserSection);
+
+        // 4. The operating system's own figures.
+        let systemSection = section(
+          "Cifras del sistema",
+          "Totales medidos desde fuera. No se suman entre sí: son maneras distintas de contar la misma memoria."
+        );
+        let systemScale = Math.max(1, system.resident || 0, system["jemalloc-heap-mapped"] || 0);
+        for (let [key, size] of Object.entries(system).sort((a, b) => b[1] - a[1])) {
+          // The address space is not memory in use: against the others its
+          // bar would be full and say the opposite, so it is left empty.
+          let scale = key == "vsize" ? Infinity : Math.max(systemScale, size);
+          systemSection.append(row(SYSTEM_PARTS[key], size, scale, key));
+        }
+        root.append(systemSection);
+
+        // 5. Every mapping, for whoever wants to see which library is which.
+        let mappingSection = section(
+          "Zonas de memoria, una a una",
+          "Cada fichero o zona que el sistema operativo tiene cargada para el navegador."
+        );
+        for (let kind of ["own", "files", "driver", "other"]) {
+          let entries = Object.entries(mappings[kind]).sort((a, b) => b[1] - a[1]);
+          if (!entries.length) {
+            continue;
+          }
+          let group = document.createElement("details");
+          group.append(
+            element("summary", null, `${KINDS[kind].name} — ${formatBytes(kinds[kind])}`)
+          );
+          let list = element("pre", "report");
+          for (let [name, size] of entries) {
+            list.append(element("div", null, `${formatBytes(size).padStart(10)}  ${name}`));
+          }
+          group.append(list);
+          mappingSection.append(group);
+        }
+        root.append(mappingSection);
+
+        // 6. The raw report, as Servo gives it.
+        let rawSection = section(
+          "Informe completo",
+          "El informe tal como lo da el motor, con sus nombres internos."
+        );
+        let raw = element("pre", "report");
+        Object.entries(tree)
+          .sort((a, b) => b[1].total - a[1].total)
+          .forEach(([name, node]) => raw.append(convertNodeToDOM(node, name)));
+        rawSection.append(raw);
+        root.append(rawSection);
+
+        window.reports.replaceChildren(root);
+      }
+
+      async function measure() {
+        window.startButton.disabled = true;
+        window.measureStatus.textContent = "Midiendo…";
+        try {
+          let reports = JSON.parse(await navigator.servo.reportMemory());
+          if (reports.error || !Array.isArray(reports)) {
+            window.measureStatus.textContent =
+              "No se pudo medir: " + (reports.error || "formato de informe inesperado");
+            return;
+          }
+          render(reports);
+          window.measureStatus.textContent = "Medido a las " + new Date().toLocaleTimeString();
+        } catch (error) {
+          window.measureStatus.textContent = "No se pudo medir: " + error;
+        } finally {
+          window.startButton.disabled = false;
         }
       }
 
       function start() {
+        window.startButton.onclick = measure;
         window.gcButton.onclick = async () => {
           window.gcButton.disabled = true;
           navigator.servo.garbageCollectAllContexts();
           window.gcButton.disabled = false;
+          measure();
         };
-
-        window.startButton.onclick = async () => {
-          let content = await navigator.servo.reportMemory();
-          let reports = JSON.parse(content);
-          if (reports.error) {
-            console.error(reports.error);
-            return;
-          }
-          window.reports.innerHTML = "";
-          window.reports.classList.remove("hidden");
-
-          if (!Array.isArray(reports)) {
-            console.error("Unexpected memory report format!");
-            return;
-          }
-
-          reports.forEach(reportsForProcess);
+        // The shell opens the tabs: a page cannot. It reads the number from
+        // this address and brings the tab back here. The time makes each
+        // request a new address, so asking for the same number twice works.
+        window.stressButton.onclick = () => {
+          const asked = parseInt(window.stressCount.value, 10) || 1;
+          const count = Math.max(1, Math.min(Number(window.stressCount.max), asked));
+          location.replace("rumb://settings?stress_tabs=" + count + "&at=" + Date.now());
         };
+        measure();
       }
     </script>
     <style>
+      :root {
+        color-scheme: light dark;
+        --text: #1c1c1e;
+        --muted: #5f6368;
+        --surface: #f4f4f6;
+        --line: #d9d9de;
+        --accent: #3b6fd4;
+        --tone-used: #2f8f5b;
+        --tone-spare: #d9a13b;
+        --tone-unknown: #c2553f;
+        --tone-files: #7d8aa0;
+        --tone-driver: #7a5fc4;
+        --tone-other: #b4b8c0;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #e8e8ea;
+          --muted: #a0a3a8;
+          --surface: #26262a;
+          --line: #3a3a40;
+          --accent: #7aa2f7;
+          --tone-used: #58c98a;
+          --tone-spare: #e0b455;
+          --tone-unknown: #e07a62;
+          --tone-files: #8693a8;
+          --tone-driver: #a08be0;
+          --tone-other: #5a5e68;
+        }
+      }
+
       html {
-        font-family: sans-serif;
+        font-family: system-ui, sans-serif;
+        color: var(--text);
+        line-height: 1.45;
       }
 
-      details,
-      details div {
-        margin-left: 1em;
+      body {
+        max-width: 52em;
+        margin: 0 auto;
+        padding: 1.5em 1em 4em;
       }
 
-      summary:hover {
+      h1 {
+        font-size: 1.5em;
+        margin-bottom: 0.2em;
+      }
+
+      h2 {
+        font-size: 1.15em;
+        margin: 2em 0 0.3em;
+      }
+
+      .lead,
+      .intro,
+      .what,
+      .note {
+        margin: 0.2em 0;
+      }
+
+      .lead,
+      .intro {
+        color: var(--muted);
+      }
+
+      .controls {
+        margin: 1em 0;
+        display: flex;
+        gap: 0.6em;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      button {
+        font: inherit;
+        padding: 0.35em 0.9em;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--surface);
+        color: var(--text);
         cursor: pointer;
       }
 
-      div.process {
-        margin: 0.5em;
-        border: 2px solid gray;
-        border-radius: 10px;
-        padding: 5px;
-        background-color: lightgray;
+      input {
+        font: inherit;
+        width: 4.5em;
+        padding: 0.35em 0.5em;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--surface);
+        color: var(--text);
+      }
+
+      #measureStatus {
+        color: var(--muted);
+        font-size: 0.9em;
+      }
+
+      .row {
+        padding: 0.7em 0.9em;
+        margin: 0.5em 0;
+        background: var(--surface);
+        border-radius: 8px;
+      }
+
+      .row-head,
+      details.page > summary {
+        display: flex;
+        justify-content: space-between;
+        gap: 1em;
+        font-weight: 600;
+      }
+
+      .row-size {
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .bar {
+        height: 5px;
+        margin: 0.4em 0 0.5em;
+        background: var(--line);
+        border-radius: 3px;
+        overflow: hidden;
+      }
+
+      .bar-fill {
+        height: 100%;
+        background: var(--accent);
+      }
+
+      .what {
+        font-size: 0.95em;
+      }
+
+      .use-bar {
+        display: flex;
+        height: 18px;
+        margin: 0.8em 0;
+        border-radius: 5px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      .use-item {
+        padding: 0.5em 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .use-dot {
+        display: inline-block;
+        width: 0.7em;
+        height: 0.7em;
+        margin-right: 0.5em;
+        border-radius: 2px;
+      }
+
+      .tone-used { background: var(--tone-used); }
+      .tone-spare { background: var(--tone-spare); }
+      .tone-unknown { background: var(--tone-unknown); }
+      .tone-files { background: var(--tone-files); }
+      .tone-driver { background: var(--tone-driver); }
+      .tone-other { background: var(--tone-other); }
+
+      .row.aside {
+        background: none;
+        border: 1px dashed var(--line);
+      }
+
+      .note,
+      .technical {
+        font-size: 0.85em;
+        color: var(--muted);
+      }
+
+      .technical {
+        display: block;
+        margin-top: 0.3em;
+      }
+
+      details.page {
+        margin: 0.6em 0;
+        padding: 0.5em 0.7em;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+      }
+
+      .page-url {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      summary {
+        cursor: pointer;
       }
 
       .report {
         line-height: 1.5em;
+        font-size: 0.85em;
+        overflow-x: auto;
       }
 
-      .report > details {
-        margin-bottom: 1em;
+      .report details,
+      .report details div {
+        margin-left: 1em;
       }
-
-      .hidden {
-        display: none;
+      a.back {
+        display: inline-block;
+        margin: 0 0 0.9rem;
+        color: var(--muted);
+        font-size: 0.9rem;
+        text-decoration: none;
+      }
+      a.back:hover {
+        color: var(--accent);
       }
     </style>
   </head>
   <body>
-    <h2>Memory Reports</h2>
-    <button id="startButton">Measure</button>
-    <button id="gcButton">Force GC</button>
-    <div id="reports" class="hidden"></div>
+    <a class="back" href="rumb://settings">← Ajustes</a>
+    <h1>Memoria</h1>
+    <p class="lead">
+      Cuánta memoria usa el navegador ahora mismo, en qué, y qué parte se
+      liberaría al cerrar cada página.
+    </p>
+    <div class="controls">
+      <button id="startButton">Volver a medir</button>
+      <button id="gcButton" title="Pide a todas las páginas que retiren ya los datos de JavaScript que no usan">
+        Forzar limpieza
+      </button>
+      <span id="measureStatus"></span>
+    </div>
+    <div class="controls">
+      <label for="stressCount">Prueba de carga:</label>
+      <input id="stressCount" type="number" min="1" max="20" value="5">
+      <button id="stressButton" title="Abre ese número de pestañas con sitios pesados, del más pesado al menos pesado">
+        Abrir pestañas pesadas
+      </button>
+    </div>
+    <div id="reports"></div>
   </body>
 </html>
