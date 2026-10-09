@@ -2,12 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use bytes::Bytes;
 use content_security_policy as csp;
 use headers::{ContentType, HeaderMap, HeaderMapExt};
+use js::context::JSContext;
 use net_traits::request::{
     CredentialsMode, Destination, RequestBody, RequestId, create_request_body_with_content,
 };
 use net_traits::{FetchMetadata, NetworkError, ResourceFetchTiming};
+use script_bindings::str::DOMString;
 use servo_url::ServoUrl;
 use stylo_atoms::Atom;
 
@@ -25,10 +28,11 @@ use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::reporting::reportingobserver::ReportingObserver;
 use crate::dom::securitypolicyviolationevent::SecurityPolicyViolationEvent;
 use crate::dom::types::GlobalScope;
-use crate::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
-use crate::network_listener::{FetchResponseListener, ResourceTimingListener, submit_timing};
-use crate::script_runtime::CanGc;
-use crate::task::TaskOnce;
+use crate::fetch::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
+use crate::fetch::network_listener::{
+    FetchResponseListener, ResourceTimingListener, submit_timing,
+};
+use crate::tasks::task::TaskOnce;
 
 pub(crate) struct CSPViolationReportTask {
     global: Trusted<GlobalScope>,
@@ -52,20 +56,18 @@ impl CSPViolationReportTask {
         }
     }
 
-    fn fire_violation_event(&self, can_gc: CanGc) {
+    fn fire_violation_event(&self, cx: &mut JSContext) {
         let event = SecurityPolicyViolationEvent::new(
+            cx,
             &self.global.root(),
             Atom::from("securitypolicyviolation"),
             EventBubbles::Bubbles,
             EventCancelable::NotCancelable,
             EventComposed::Composed,
             &self.violation_report.clone().convert(),
-            can_gc,
         );
 
-        event
-            .upcast::<Event>()
-            .fire(&self.event_target.root(), can_gc);
+        event.upcast::<Event>().fire(cx, &self.event_target.root());
     }
 
     /// <https://www.w3.org/TR/CSP/#deprecated-serialize-violation>
@@ -76,7 +78,7 @@ impl CSPViolationReportTask {
         };
         // Step 4. Return the result of serialize an infra value to JSON bytes given «[ "csp-report" → body ]».
         Some(create_request_body_with_content(
-            &serde_json::to_string(&report_body).unwrap_or("".to_owned()),
+            serde_json::to_string(&report_body).unwrap_or_default(),
         ))
     }
 
@@ -138,11 +140,11 @@ impl CSPViolationReportTask {
 /// <https://w3c.github.io/webappsec-csp/#report-violation>
 /// > Queue a task to run the following steps:
 impl TaskOnce for CSPViolationReportTask {
-    fn run_once(self, cx: &mut js::context::JSContext) {
+    fn run_once(self, cx: &mut JSContext) {
         // > If target implements EventTarget, fire an event named securitypolicyviolation
         // > that uses the SecurityPolicyViolationEvent interface
         // > at target with its attributes initialized as follows:
-        self.fire_violation_event(CanGc::from_cx(cx));
+        self.fire_violation_event(cx);
         // Step 3.4. If violation’s policy’s directive set contains a directive named "report-uri" directive:
         if let Some(report_uri_directive) = self
             .violation_policy
@@ -165,7 +167,7 @@ impl TaskOnce for CSPViolationReportTask {
             // Step 3.5.3. Generate and queue a report with the following arguments:
             ReportingObserver::generate_and_queue_a_report(
                 &self.global.root(),
-                "csp-violation".into(),
+                DOMString::from_static("csp-violation"),
                 Some(body),
                 report_to_directive.value.join(" ").into(),
             )
@@ -185,25 +187,20 @@ impl FetchResponseListener for CSPReportUriFetchListener {
 
     fn process_response(
         &mut self,
-        _: &mut js::context::JSContext,
+        _: &mut JSContext,
         _: RequestId,
         fetch_metadata: Result<FetchMetadata, NetworkError>,
     ) {
         _ = fetch_metadata;
     }
 
-    fn process_response_chunk(
-        &mut self,
-        _: &mut js::context::JSContext,
-        _: RequestId,
-        chunk: Vec<u8>,
-    ) {
+    fn process_response_chunk(&mut self, _: &mut JSContext, _: RequestId, chunk: Bytes) {
         _ = chunk;
     }
 
     fn process_response_eof(
         self,
-        cx: &mut js::context::JSContext,
+        cx: &mut JSContext,
         _: RequestId,
         response: Result<(), NetworkError>,
         timing: ResourceFetchTiming,
@@ -211,7 +208,13 @@ impl FetchResponseListener for CSPReportUriFetchListener {
         submit_timing(cx, &self, &response, &timing)
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, _violations: Vec<Violation>) {}
+    fn process_csp_violations(
+        &mut self,
+        _cx: &mut JSContext,
+        _request_id: RequestId,
+        _violations: Vec<Violation>,
+    ) {
+    }
 }
 
 impl ResourceTimingListener for CSPReportUriFetchListener {

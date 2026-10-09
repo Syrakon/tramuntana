@@ -4,16 +4,16 @@
 
 //! Layout construction code that is shared between modern layout modes (Flexbox and CSS Grid)
 
-use std::borrow::Cow;
 use std::sync::OnceLock;
 
+use layout_api::LayoutNode;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use style::selector_parser::PseudoElement;
 
 use crate::PropagatedBoxTreeData;
 use crate::context::LayoutContext;
 use crate::dom::{BoxSlot, LayoutBox, NodeExt};
-use crate::dom_traversal::{Contents, NodeAndStyleInfo, TraversalHandler};
+use crate::dom_traversal::{BoxTreeString, Contents, NodeAndStyleInfo, TraversalHandler};
 use crate::flow::inline::SharedInlineStyles;
 use crate::flow::inline::construct::InlineFormattingContextBuilder;
 use crate::flow::{BlockContainer, BlockFormattingContext};
@@ -56,8 +56,11 @@ impl<'dom> ModernContainerJob<'dom> {
     fn finish(self, builder: &ModernContainerBuilder) -> Option<ModernItem<'dom>> {
         match self {
             ModernContainerJob::TextRuns(runs, box_slot) => {
-                let mut inline_formatting_context_builder =
-                    InlineFormattingContextBuilder::new(builder.info, builder.context);
+                let mut inline_formatting_context_builder = InlineFormattingContextBuilder::new(
+                    builder.info,
+                    builder.context,
+                    false, /* should_process_first_letter */
+                );
                 let mut last_style_from_display_contents: Option<SharedInlineStyles> = None;
                 for flex_text_run in runs.into_iter() {
                     match (
@@ -80,8 +83,11 @@ impl<'dom> ModernContainerJob<'dom> {
                         },
                     }
                     last_style_from_display_contents = flex_text_run.style_from_display_contents;
-                    inline_formatting_context_builder
-                        .push_text(flex_text_run.text, &flex_text_run.info);
+                    inline_formatting_context_builder.push_text(
+                        flex_text_run.text,
+                        &flex_text_run.info,
+                        flex_text_run.info.node.text_node_selection(),
+                    );
                 }
 
                 let inline_formatting_context = inline_formatting_context_builder
@@ -122,7 +128,7 @@ impl<'dom> ModernContainerJob<'dom> {
                 let order = if is_abspos {
                     0
                 } else {
-                    info.style.clone_order()
+                    info.style.slow_clone_order()
                 };
 
                 if let Some(layout_box) =
@@ -175,7 +181,7 @@ impl<'dom> ModernContainerJob<'dom> {
 
 struct ModernContainerTextRun<'dom> {
     info: NodeAndStyleInfo<'dom>,
-    text: Cow<'dom, str>,
+    text: BoxTreeString<'dom>,
     style_from_display_contents: Option<SharedInlineStyles>,
 }
 
@@ -204,7 +210,7 @@ pub(crate) struct ModernItem<'dom> {
 }
 
 impl<'dom> TraversalHandler<'dom> for ModernContainerBuilder<'_, 'dom> {
-    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: Cow<'dom, str>) {
+    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: BoxTreeString<'dom>) {
         self.contiguous_text_runs.push(ModernContainerTextRun {
             info: info.clone(),
             text,
@@ -286,7 +292,7 @@ impl<'a, 'dom> ModernContainerBuilder<'a, 'dom> {
         self.wrap_any_text_in_anonymous_block_container();
 
         let jobs = std::mem::take(&mut self.jobs);
-        let mut children: Vec<_> = if self.context.use_rayon {
+        let mut children: Vec<_> = if self.context.should_parallelize(jobs.iter().len()) {
             jobs.into_par_iter()
                 .filter_map(|job| job.finish(&self))
                 .collect()

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::Reflector;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use strum::VariantArray;
@@ -17,6 +18,7 @@ use crate::dom::bindings::str::DOMString;
 /// All supported entry types, in alphabetical order.
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq, VariantArray)]
 pub(crate) enum EntryType {
+    ContainerTiming,
     LargestContentfulPaint,
     Mark,
     Measure,
@@ -29,6 +31,7 @@ pub(crate) enum EntryType {
 impl EntryType {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
+            EntryType::ContainerTiming => "container",
             EntryType::Measure => "measure",
             EntryType::Mark => "mark",
             EntryType::LargestContentfulPaint => "largest-contentful-paint",
@@ -45,6 +48,7 @@ impl<'a> TryFrom<&'a str> for EntryType {
 
     fn try_from(value: &'a str) -> Result<EntryType, ()> {
         Ok(match value {
+            "container" => EntryType::ContainerTiming,
             "measure" => EntryType::Measure,
             "mark" => EntryType::Mark,
             "largest-contentful-paint" => EntryType::LargestContentfulPaint,
@@ -111,11 +115,6 @@ impl PerformanceEntry {
     pub(crate) fn start_time(&self) -> Option<CrossProcessInstant> {
         self.start_time
     }
-
-    /// <https://www.w3.org/TR/performance-timeline/#dom-performanceentry-duration>
-    pub(crate) fn duration(&self) -> Duration {
-        self.duration
-    }
 }
 
 impl PerformanceEntryMethods<crate::DomTypeHolder> for PerformanceEntry {
@@ -130,9 +129,9 @@ impl PerformanceEntryMethods<crate::DomTypeHolder> for PerformanceEntry {
     }
 
     /// <https://w3c.github.io/performance-timeline/#dom-performanceentry-starttime>
-    fn StartTime(&self) -> DOMHighResTimeStamp {
+    fn StartTime(&self, cx: &mut JSContext) -> DOMHighResTimeStamp {
         self.global()
-            .performance()
+            .performance(cx)
             .maybe_to_dom_high_res_time_stamp(self.start_time)
     }
 

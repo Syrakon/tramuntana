@@ -2,15 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use digest::{ExtendableOutput, Update};
-use sha3::{TurboShake128, TurboShake128Core, TurboShake256, TurboShake256Core};
+use keccak::{Keccak, State1600};
+use sponge_cursor::SpongeCursor;
 
 use crate::dom::bindings::error::Error;
-use crate::dom::subtlecrypto::{CryptoAlgorithm, SubtleTurboShakeParams};
+use crate::dom::subtlecrypto::{CryptoAlgorithm, TurboShakeParams};
 
 /// <https://wicg.github.io/webcrypto-modern-algos/#turboshake-operations-digest>
 pub(crate) fn digest(
-    normalized_algorithm: &SubtleTurboShakeParams,
+    normalized_algorithm: &TurboShakeParams,
     message: &[u8],
 ) -> Result<Vec<u8>, Error> {
     // Step 1. Let outputLength be the outputLength member of normalizedAlgorithm.
@@ -47,18 +47,15 @@ pub(crate) fn digest(
     //     of [RFC9861] using message as the M input parameter, domainSeparation as the D input
     //     parameter, and outputLength divided by 8 as the L input parameter.
     // Step 6. If performing the operation results in an error, then throw an OperationError.
-    let result = match normalized_algorithm.name {
+    let mut result = vec![0u8; output_length as usize / 8];
+    match normalized_algorithm.name {
         CryptoAlgorithm::TurboShake128 => {
-            let core = TurboShake128Core::new(domain_separation);
-            let mut hasher = TurboShake128::from_core(core);
-            hasher.update(message);
-            hasher.finalize_boxed(output_length as usize / 8).to_vec()
+            let hasher = TurboShake::<168>::new(domain_separation)?;
+            hasher.hash(message, &mut result);
         },
         CryptoAlgorithm::TurboShake256 => {
-            let core = TurboShake256Core::new(domain_separation);
-            let mut hasher = TurboShake256::from_core(core);
-            hasher.update(message);
-            hasher.finalize_boxed(output_length as usize / 8).to_vec()
+            let hasher = TurboShake::<136>::new(domain_separation)?;
+            hasher.hash(message, &mut result);
         },
         algorithm_name => {
             return Err(Error::NotSupported(Some(format!(
@@ -66,8 +63,68 @@ pub(crate) fn digest(
                 algorithm_name.as_str()
             ))));
         },
-    };
+    }
 
     // Step 7. Return result.
     Ok(result)
+}
+
+/// Keccak rounds for TurboSHAKE
+const ROUNDS: usize = 12;
+
+/// TurboSHAKE hasher. RATE must be either 168 for TurboSHAKE128 or 136 for TurboSHAKE256.
+struct TurboShake<const RATE: usize> {
+    state: State1600,
+    cursor: SpongeCursor<RATE>,
+    keccak: Keccak,
+    domain_separation: u8,
+}
+
+impl<const RATE: usize> TurboShake<RATE> {
+    fn new(domain_separation: u8) -> Result<TurboShake<RATE>, Error> {
+        if RATE != 168 && RATE != 136 {
+            return Err(Error::NotSupported(Some(
+                "Invalid sponge cursor rate for TurboSHAKE".into(),
+            )));
+        }
+        if domain_separation == 0x00 || domain_separation > 0x7f {
+            return Err(Error::NotSupported(Some(
+                "Invalid TurboSHAKE domain separation".into(),
+            )));
+        }
+        Ok(TurboShake {
+            state: Default::default(),
+            cursor: Default::default(),
+            keccak: Default::default(),
+            domain_separation,
+        })
+    }
+
+    fn hash(mut self, message: &[u8], result: &mut [u8]) {
+        // Digest message
+        //
+        // Reference implementation from RustCrypto:
+        // <https://docs.rs/turboshake/0.7.1/src/turboshake/lib.rs.html#60-64>
+        self.keccak.with_p1600::<ROUNDS>(|p1600| {
+            self.cursor.absorb_u64_le(&mut self.state, p1600, message);
+        });
+
+        // Finalize
+        //
+        // Reference implementation from RustCrypto:
+        // <https://docs.rs/turboshake/0.7.1/src/turboshake/lib.rs.html#67-91>
+        let position = self.cursor.pos();
+        self.state[position / 8] ^= (self.domain_separation as u64) << (8 * (position % 8));
+        self.state[RATE / 8 - 1] ^= 1 << 63;
+
+        // Read result
+        //
+        // Reference implementation from RustCrypto:
+        // <https://docs.rs/turboshake/0.7.1/src/turboshake/lib.rs.html#161-165>
+        self.cursor = Default::default();
+        self.keccak.with_p1600::<ROUNDS>(|p1600| {
+            self.cursor
+                .squeeze_read_u64_le(&mut self.state, p1600, result);
+        });
+    }
 }

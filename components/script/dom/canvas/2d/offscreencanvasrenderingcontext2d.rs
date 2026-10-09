@@ -4,21 +4,23 @@
 
 use dom_struct::dom_struct;
 use euclid::default::Size2D;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use pixels::Snapshot;
 use script_bindings::reflector::reflect_dom_object;
-use servo_canvas_traits::canvas::Canvas2dMsg;
+use servo_canvas_traits::canvas::CanvasCommand;
 
 use crate::canvas_context::{CanvasContext, HTMLCanvasElementOrOffscreenCanvas};
 use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::{
     CanvasDirection, CanvasFillRule, CanvasImageSource, CanvasLineCap, CanvasLineJoin,
-    CanvasRenderingContext2DMethods, CanvasTextAlign, CanvasTextBaseline,
+    CanvasRenderingContext2DMethods, CanvasRenderingContext2DSettings, CanvasTextAlign,
+    CanvasTextBaseline,
 };
 use crate::dom::bindings::codegen::Bindings::DOMMatrixBinding::DOMMatrix2DInit;
 use crate::dom::bindings::codegen::Bindings::OffscreenCanvasRenderingContext2DBinding::OffscreenCanvasRenderingContext2DMethods;
 use crate::dom::bindings::codegen::UnionTypes::{
     HTMLCanvasElementOrOffscreenCanvas as RootedHTMLCanvasElementOrOffscreenCanvas,
     StringOrCanvasGradientOrCanvasPattern,
+    UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
 };
 use crate::dom::bindings::error::{ErrorResult, Fallible};
 use crate::dom::bindings::num::Finite;
@@ -33,9 +35,8 @@ use crate::dom::imagedata::ImageData;
 use crate::dom::offscreencanvas::OffscreenCanvas;
 use crate::dom::path2d::Path2D;
 use crate::dom::textmetrics::TextMetrics;
-use crate::script_runtime::CanGc;
 
-#[dom_struct(associated_memory)]
+#[dom_struct]
 pub(crate) struct OffscreenCanvasRenderingContext2D {
     context: CanvasRenderingContext2D,
 }
@@ -46,28 +47,35 @@ impl OffscreenCanvasRenderingContext2D {
         global: &GlobalScope,
         canvas: HTMLCanvasElementOrOffscreenCanvas,
         size: Size2D<u32>,
+        settings: &CanvasRenderingContext2DSettings,
     ) -> Option<OffscreenCanvasRenderingContext2D> {
         Some(OffscreenCanvasRenderingContext2D {
-            context: CanvasRenderingContext2D::new_inherited(global, canvas, size)?,
+            context: CanvasRenderingContext2D::new_inherited(global, canvas, size, settings)?,
         })
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         canvas: &OffscreenCanvas,
         size: Size2D<u32>,
-        can_gc: CanGc,
+        settings: &CanvasRenderingContext2DSettings,
     ) -> Option<DomRoot<OffscreenCanvasRenderingContext2D>> {
         OffscreenCanvasRenderingContext2D::new_inherited(
             global,
             HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(Dom::from_ref(canvas)),
             size,
+            settings,
         )
-        .map(|context| reflect_dom_object(Box::new(context), global, can_gc))
+        .map(|context| {
+            let context = reflect_dom_object(cx, Box::new(context), global);
+            context.context.update_associated_memory_size();
+            context
+        })
     }
 
-    pub(crate) fn send_canvas_2d_msg(&self, msg: Canvas2dMsg) {
-        self.context.send_canvas_2d_msg(msg)
+    pub(crate) fn send_canvas_command_immediate(&self, msg: CanvasCommand) {
+        self.context.send_canvas_command_immediate(msg)
     }
 }
 
@@ -104,6 +112,14 @@ impl CanvasContext for OffscreenCanvasRenderingContext2D {
 impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     for OffscreenCanvasRenderingContext2D
 {
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-canvas-getcontextattributes>
+    fn GetContextAttributes(&self) -> CanvasRenderingContext2DSettings {
+        // The getContextAttributes() method steps are to return «[ "alpha" → this's alpha,
+        // "desynchronized" → this's desynchronized, "colorSpace" → this's color space,
+        // "colorType" → this's color type, "willReadFrequently" → this's will read frequently ]».
+        self.context.GetContextAttributes()
+    }
+
     /// <https://html.spec.whatwg.org/multipage/offscreencontext2d-canvas>
     fn Canvas(&self) -> DomRoot<OffscreenCanvas> {
         match self.context.canvas() {
@@ -391,7 +407,7 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
         sw: i32,
         sh: i32,
     ) -> Fallible<DomRoot<ImageData>> {
-        self.context.CreateImageData(sw, sh, CanGc::from_cx(cx))
+        self.context.CreateImageData(cx, sw, sh)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-createimagedata>
@@ -400,7 +416,7 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
         cx: &mut JSContext,
         imagedata: &ImageData,
     ) -> Fallible<DomRoot<ImageData>> {
-        self.context.CreateImageData_(imagedata, CanGc::from_cx(cx))
+        self.context.CreateImageData_(cx, imagedata)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-getimagedata>
@@ -412,18 +428,18 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
         sw: i32,
         sh: i32,
     ) -> Fallible<DomRoot<ImageData>> {
-        self.context
-            .GetImageData(sx, sy, sw, sh, CanGc::from_cx(cx))
+        self.context.GetImageData(cx, sx, sy, sw, sh)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata>
-    fn PutImageData(&self, imagedata: &ImageData, dx: i32, dy: i32) {
-        self.context.PutImageData(imagedata, dx, dy)
+    fn PutImageData(&self, no_gc: &NoGC, imagedata: &ImageData, dx: i32, dy: i32) {
+        self.context.PutImageData(no_gc, imagedata, dx, dy)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-putimagedata>
     fn PutImageData_(
         &self,
+        no_gc: &NoGC,
         imagedata: &ImageData,
         dx: i32,
         dy: i32,
@@ -433,6 +449,7 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
         dirty_height: i32,
     ) {
         self.context.PutImageData_(
+            no_gc,
             imagedata,
             dx,
             dy,
@@ -580,6 +597,18 @@ impl OffscreenCanvasRenderingContext2DMethods<crate::DomTypeHolder>
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-rect>
     fn Rect(&self, x: f64, y: f64, width: f64, height: f64) {
         self.context.Rect(x, y, width, height)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-roundrect>
+    fn RoundRect(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        radii: UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
+    ) -> ErrorResult {
+        self.context.RoundRect(x, y, width, height, radii)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-quadraticcurveto>

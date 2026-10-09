@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use app_units::Au;
+use atomic_refcell::AtomicRefCell;
 use layout_api::LayoutNode;
 use malloc_size_of_derive::MallocSizeOf;
 use script::layout_dom::{ServoDangerousStyleElement, ServoLayoutNode};
@@ -18,11 +19,8 @@ use crate::dom_traversal::{Contents, NodeAndStyleInfo, NonReplacedContents};
 use crate::flexbox::FlexContainer;
 use crate::flow::BlockFormattingContext;
 use crate::fragment_tree::{BaseFragmentInfo, FragmentFlags};
-use crate::layout_box_base::{
-    IndependentFormattingContextLayoutResult, IndependentFormattingContextLayoutResultAndInputs,
-    LayoutBoxBase, LayoutResultAndInputs,
-};
-use crate::positioned::PositioningContext;
+use crate::layout_box_base::{IndependentFormattingContextLayoutResult, LayoutBoxBase};
+use crate::positioned::{LayoutRootLayoutInputs, PositioningContext};
 use crate::replaced::ReplacedContents;
 use crate::sizing::{
     self, ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult, LazySize,
@@ -45,6 +43,9 @@ pub(crate) struct IndependentFormattingContext {
     /// Data that was originally propagated down to this [`IndependentFormattingContext`]
     /// during creation. This is used during incremental layout.
     pub propagated_data: PropagatedBoxTreeData,
+    /// If this [`IndependentFormattingContext`] was a layout root, this stores the data
+    /// necessary to lay it out again.
+    pub layout_root_layout_inputs: AtomicRefCell<Option<Box<LayoutRootLayoutInputs>>>,
 }
 
 #[derive(Debug, MallocSizeOf)]
@@ -59,6 +60,26 @@ pub(crate) enum IndependentFormattingContextContents {
     Grid(TaffyContainer),
     Table(Table),
     // Other layout modes go here
+}
+
+impl IndependentFormattingContextContents {
+    fn subtree_size(&self) -> usize {
+        match self {
+            IndependentFormattingContextContents::Replaced(_, widget) => widget
+                .as_ref()
+                .map_or(0, |widget| widget.borrow().subtree_size()),
+            IndependentFormattingContextContents::Flow(block_formatting_context) => {
+                block_formatting_context.contents.subtree_size()
+            },
+            IndependentFormattingContextContents::Flex(flex_container) => {
+                flex_container.subtree_size()
+            },
+            IndependentFormattingContextContents::Grid(taffy_container) => {
+                taffy_container.subtree_size()
+            },
+            IndependentFormattingContextContents::Table(table) => table.subtree_size(),
+        }
+    }
 }
 
 /// The baselines of a layout or a [`crate::fragment_tree::BoxFragment`]. Some layout
@@ -84,10 +105,12 @@ impl IndependentFormattingContext {
         contents: IndependentFormattingContextContents,
         propagated_data: PropagatedBoxTreeData,
     ) -> Self {
+        base.set_subtree_size(contents.subtree_size() + 1);
         Self {
             base,
             contents,
             propagated_data,
+            layout_root_layout_inputs: None.into(),
         }
     }
 
@@ -101,8 +124,15 @@ impl IndependentFormattingContext {
             Display::None | Display::Contents => {
                 unreachable!("Should never try to rebuild IndependentFormattingContext with no box")
             },
-            Display::GeneratingBox(display) => display.used_value_for_contents(&contents),
+            Display::GeneratingBox(display) => {
+                display.used_value_for_contents(&contents, node_and_style_info)
+            },
         };
+
+        // This ensures that the `FragmentFlags` of this `BaseFragmentInfo` reflect the
+        // current layout and not the set that was calculated during previous layouts.
+        self.base.base_fragment_info = node_and_style_info.into();
+
         self.contents = Self::construct_contents(
             layout_context,
             node_and_style_info,
@@ -112,7 +142,7 @@ impl IndependentFormattingContext {
             self.propagated_data,
         );
 
-        self.base.clear_fragments_and_fragment_cache();
+        self.base.clear_fragments_and_dirty_fragment_cache();
         *self.base.cached_inline_content_size.borrow_mut() = None;
         self.base.repair_style(&node_and_style_info.style);
     }
@@ -133,10 +163,15 @@ impl IndependentFormattingContext {
             contents,
             propagated_data,
         );
+
+        let base = LayoutBoxBase::new(base_fragment_info, node_and_style_info.style.clone());
+        base.set_subtree_size(contents.subtree_size() + 1);
+
         Self {
-            base: LayoutBoxBase::new(base_fragment_info, node_and_style_info.style.clone()),
+            base,
             contents,
             propagated_data,
+            layout_root_layout_inputs: None.into(),
         }
     }
 
@@ -154,9 +189,10 @@ impl IndependentFormattingContext {
 
                 // Some replaced elements can have inner widgets, e.g. `<video controls>`.
                 let node = node_and_style_info.node;
-                let widget = (node.pseudo_element_chain().is_empty() &&
-                    node.is_root_of_user_agent_widget())
-                .then(|| {
+                let should_make_widget = node.pseudo_element_chain().is_empty() &&
+                    node.is_root_of_user_agent_widget() &&
+                    !contents.is_content_replacement;
+                let widget = should_make_widget.then(|| {
                     let widget_info = node_and_style_info
                         .with_pseudo_element(context, PseudoElement::ServoAnonymousBox)
                         .expect("Should always be able to construct info for anonymous boxes.");
@@ -340,7 +376,9 @@ impl IndependentFormattingContext {
     ) {
         self.base.repair_style(new_style);
         match &mut self.contents {
-            IndependentFormattingContextContents::Replaced(_, widget) => {
+            IndependentFormattingContextContents::Replaced(replaced, widget) => {
+                *replaced.selected_style.borrow_mut() = node.selected_style(context);
+
                 if let Some(widget) = widget {
                     let node = node
                         .with_pseudo(PseudoElement::ServoAnonymousBox)
@@ -433,6 +471,8 @@ impl IndependentFormattingContext {
                 layout_context,
                 positioning_context,
                 containing_block_for_children,
+                lazy_block_size,
+                Some(&self.base),
             ),
             IndependentFormattingContextContents::Flex(fc) => fc.layout(
                 layout_context,
@@ -464,27 +504,21 @@ impl IndependentFormattingContext {
         preferred_aspect_ratio: Option<AspectRatio>,
         lazy_block_size: &LazySize,
     ) -> (IndependentFormattingContextLayoutResult, bool) {
-        if let Some(LayoutResultAndInputs::IndependentFormattingContext(cache)) =
-            self.base.cached_layout_result.borrow().as_ref()
+        if let Some(cached_layout_result) = self
+            .base
+            .cached_independent_formatting_context_layout_if_applicable(
+                positioning_context,
+                containing_block_for_children,
+            )
         {
-            let cache = &**cache;
-            if cache.containing_block_for_children_size.inline ==
-                containing_block_for_children.size.inline &&
-                (cache.containing_block_for_children_size.block ==
-                    containing_block_for_children.size.block ||
-                    !cache.result.depends_on_block_constraints)
-            {
-                positioning_context.append(cache.positioning_context.clone());
-                return (cache.result.clone(), true);
-            }
-            #[cfg(feature = "tracing")]
-            tracing::debug!(
-                name: "IndependentFormattingContext::layout cache miss",
-                cached = ?cache.containing_block_for_children_size,
-                required = ?containing_block_for_children.size,
-            );
+            return (cached_layout_result, true);
         }
 
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            name: "IndependentFormattingContext::layout cache miss",
+            required = ?containing_block_for_children.size,
+        );
         let mut child_positioning_context = PositioningContext::default();
         let result = self.layout_without_caching(
             layout_context,
@@ -494,17 +528,12 @@ impl IndependentFormattingContext {
             preferred_aspect_ratio,
             lazy_block_size,
         );
-
-        *self.base.cached_layout_result.borrow_mut() =
-            Some(LayoutResultAndInputs::IndependentFormattingContext(
-                Box::new(IndependentFormattingContextLayoutResultAndInputs {
-                    result: result.clone(),
-                    positioning_context: child_positioning_context.clone(),
-                    containing_block_for_children_size: containing_block_for_children.size.clone(),
-                }),
-            ));
+        self.base.cache_independent_formatting_context_layout(
+            containing_block_for_children,
+            &child_positioning_context,
+            &result,
+        );
         positioning_context.append(child_positioning_context);
-
         (result, false)
     }
 
@@ -574,6 +603,21 @@ impl IndependentFormattingContext {
             IndependentFormattingContextContents::Table(contents) => {
                 contents.attached_to_tree(layout_box)
             },
+        }
+    }
+
+    pub(crate) fn subtree_size(&self) -> usize {
+        self.base.subtree_size()
+    }
+
+    /// Set whether this [`IndependentFormattingContext`] is selected. Returns `true` if
+    /// anything changed.
+    pub(crate) fn set_selection(&self, selected: bool) -> bool {
+        match &self.contents {
+            IndependentFormattingContextContents::Replaced(replaced_contents, ..) => {
+                replaced_contents.set_selection(selected)
+            },
+            _ => false,
         }
     }
 }

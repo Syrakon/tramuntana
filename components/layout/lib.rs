@@ -7,7 +7,7 @@
 //! Layout. Performs layout on the DOM, builds display lists and sends them to be
 //! painted.
 
-mod accessibility_tree;
+mod accessibility;
 mod cell;
 mod context;
 mod display_list;
@@ -23,6 +23,7 @@ mod layout_impl;
 mod taffy;
 #[macro_use]
 mod construct_modern;
+mod layout_root;
 mod lists;
 mod positioned;
 mod query;
@@ -133,7 +134,7 @@ pub(crate) struct ContainingBlock<'a> {
 
 struct DefiniteContainingBlock<'a> {
     size: LogicalVec2<Au>,
-    style: &'a ComputedValues,
+    style: &'a ServoArc<ComputedValues>,
 }
 
 impl<'a> From<&'_ DefiniteContainingBlock<'a>> for ContainingBlock<'a> {

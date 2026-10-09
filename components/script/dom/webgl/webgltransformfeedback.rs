@@ -5,6 +5,7 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::reflect_dom_object;
 use script_bindings::weakref::WeakRef;
 use servo_canvas_traits::webgl::{WebGLCommand, webgl_channel};
@@ -14,7 +15,6 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::webgl::webglobject::WebGLObject;
 use crate::dom::webgl::webglrenderingcontext::{Operation, WebGLRenderingContext};
 use crate::dom::webglrenderingcontext::capture_webgl_backtrace;
-use crate::script_runtime::CanGc;
 
 #[derive(JSTraceable, MallocSizeOf)]
 struct DroppableWebGLTransformFeedback {
@@ -58,7 +58,7 @@ impl Drop for DroppableWebGLTransformFeedback {
     }
 }
 
-#[dom_struct(associated_memory)]
+#[dom_struct]
 pub(crate) struct WebGLTransformFeedback {
     webgl_object: WebGLObject,
     has_been_bound: Cell<bool>,
@@ -82,15 +82,15 @@ impl WebGLTransformFeedback {
         }
     }
 
-    pub(crate) fn new(context: &WebGLRenderingContext, can_gc: CanGc) -> DomRoot<Self> {
+    pub(crate) fn new(cx: &mut JSContext, context: &WebGLRenderingContext) -> DomRoot<Self> {
         let (sender, receiver) = webgl_channel().unwrap();
         context.send_command(WebGLCommand::CreateTransformFeedback(sender));
         let id = receiver.recv().unwrap();
 
         reflect_dom_object(
+            cx,
             Box::new(WebGLTransformFeedback::new_inherited(context, id)),
             &*context.global(),
-            can_gc,
         )
     }
 }

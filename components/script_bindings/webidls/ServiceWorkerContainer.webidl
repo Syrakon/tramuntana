@@ -11,7 +11,7 @@ interface ServiceWorkerContainer : EventTarget {
   [NewObject] Promise<ServiceWorkerRegistration> register(USVString scriptURL,
                                                           optional RegistrationOptions options = {});
 
-  //[NewObject] Promise<(ServiceWorkerRegistration or undefined)> getRegistration(optional USVString clientURL = "");
+  [NewObject] Promise<(ServiceWorkerRegistration or undefined)> getRegistration(optional USVString clientURL = "");
   //[NewObject] Promise<FrozenArray<ServiceWorkerRegistration>> getRegistrations();
 
   //void startMessages();
@@ -19,8 +19,8 @@ interface ServiceWorkerContainer : EventTarget {
   // events
   //attribute EventHandler oncontrollerchange;
   //attribute EventHandler onerror;
-  //attribute EventHandler onmessage; // event.source of message events is ServiceWorker object
-  //attribute EventHandler onmessageerror;
+  attribute EventHandler onmessage;
+  attribute EventHandler onmessageerror;
 };
 
 dictionary RegistrationOptions {

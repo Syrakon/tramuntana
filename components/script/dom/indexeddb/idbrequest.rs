@@ -2,18 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::conversions::ToJSValConvertible;
 use js::jsapi::Heap;
-use js::jsval::{DoubleValue, JSVal, ObjectValue, UndefinedValue};
+use js::jsval::{DoubleValue, JSVal, NullValue, ObjectValue, UndefinedValue};
 use js::rust::HandleValue;
 use profile_traits::generic_callback::GenericCallback;
 use script_bindings::reflector::{DomObject, reflect_dom_object};
 use serde::{Deserialize, Serialize};
-use servo_base::generic_channel::GenericSend;
+use servo_base::generic_channel::{GenericSend, SendError};
 use storage_traits::indexeddb::{
     AsyncOperation, AsyncReadOnlyOperation, BackendError, BackendResult, IndexedDBKeyType,
     IndexedDBRecord, IndexedDBThreadMsg, IndexedDBTxnMode, PutItemResult, SyncOperation,
@@ -38,9 +40,8 @@ use crate::dom::indexeddb::idbcursor::{IterationParam, iterate_cursor};
 use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
 use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
 use crate::dom::indexeddb::idbtransaction::IDBTransaction;
-use crate::indexeddb::key_type_to_jsval;
+use crate::dom::indexeddb::key::key_type_to_jsval;
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[derive(Clone)]
 struct RequestListener {
@@ -124,7 +125,7 @@ impl From<u64> for IdbResult {
 }
 
 impl RequestListener {
-    fn send_request_handled(transaction: &IDBTransaction, request_id: u64) {
+    fn send_request_handled(cx: &mut JSContext, transaction: &IDBTransaction, request_id: u64) {
         let global = transaction.global();
         // https://w3c.github.io/IndexedDB/#transaction-lifecycle
         // A transaction is inactive after control returns to the event loop and
@@ -133,7 +134,7 @@ impl RequestListener {
         let send_result = global.storage_threads().send(IndexedDBThreadMsg::Sync(
             SyncOperation::RequestHandled {
                 origin: global.origin().immutable().clone(),
-                db_name: transaction.get_db_name().to_string(),
+                db_name: String::from(transaction.get_db_name()),
                 txn: transaction.get_serial_number(),
                 request_id,
             },
@@ -145,7 +146,7 @@ impl RequestListener {
 
         // This request's result has been handled by script, the
         // transaction might finally be ready to auto-commit.
-        transaction.maybe_commit();
+        transaction.maybe_commit(cx);
     }
 
     // https://www.w3.org/TR/IndexedDB-3/#async-execute-request
@@ -173,18 +174,13 @@ impl RequestListener {
                     for (i, key) in keys.into_iter().enumerate() {
                         key_type_to_jsval(cx, &key, array.handle_mut_at(i));
                     }
-                    array.safe_to_jsval(cx, answer.handle_mut());
+                    array.to_jsval(cx, answer.handle_mut());
                 },
                 IdbResult::Value(serialized_data) => {
                     let result = postcard::from_bytes(&serialized_data)
                         .map_err(|_| Error::Data(None))
                         .and_then(|data| {
-                            structuredclone::read(
-                                &global,
-                                data,
-                                answer.handle_mut(),
-                                CanGc::from_cx(cx),
-                            )
+                            structuredclone::read(cx, &global, data, answer.handle_mut())
                         });
                     if let Err(e) = result {
                         warn!("Error reading structuredclone data");
@@ -198,12 +194,7 @@ impl RequestListener {
                         let result = postcard::from_bytes(&serialized_data)
                             .map_err(|_| Error::Data(None))
                             .and_then(|data| {
-                                structuredclone::read(
-                                    &global,
-                                    data,
-                                    values.handle_mut_at(i),
-                                    CanGc::from_cx(cx),
-                                )
+                                structuredclone::read(cx, &global, data, values.handle_mut_at(i))
                             });
                         if let Err(e) = result {
                             warn!("Error reading structuredclone data");
@@ -217,7 +208,7 @@ impl RequestListener {
                             return;
                         };
                     }
-                    values.safe_to_jsval(cx, answer.handle_mut());
+                    values.to_jsval(cx, answer.handle_mut());
                 },
                 IdbResult::Count(count) => {
                     answer.handle_mut().set(DoubleValue(count as f64));
@@ -253,6 +244,8 @@ impl RequestListener {
                                     .set(ObjectValue(*cursor.reflector().get_jsobject()));
                             },
                         }
+                    } else {
+                        answer.handle_mut().set(NullValue());
                     }
                 },
                 IdbResult::None => {
@@ -269,18 +262,18 @@ impl RequestListener {
             request.set_result(answer.handle());
 
             // Substep 3.2: Set the error of request to undefined
-            request.set_error(None, CanGc::from_cx(cx));
+            request.set_error(cx, None);
 
             // https://w3c.github.io/IndexedDB/#fire-success-event
             // Step 1: Let event be the result of creating an event using Event.
             // Step 2: Set event’s type attribute to "success".
             // Step 3: Set event’s bubbles and cancelable attributes to false.
             let event = Event::new(
+                cx,
                 &global,
                 Atom::from("success"),
                 EventBubbles::DoesNotBubble,
                 EventCancelable::NotCancelable,
-                CanGc::from_cx(cx),
             );
 
             // Step 5: Let legacyOutputDidListenersThrowFlag be initially false.
@@ -304,13 +297,13 @@ impl RequestListener {
                 // Step 8.2: If legacyOutputDidListenersThrowFlag is true, then run abort a
                 // transaction with transaction and a newly created "AbortError" DOMException.
                 if did_listeners_throw.get() {
-                    transaction.initiate_abort(Error::Abort(None), CanGc::from_cx(cx));
+                    transaction.initiate_abort(cx, Error::Abort(None));
                     transaction.request_backend_abort();
                 }
             }
             transaction.request_finished();
 
-            Self::send_request_handled(&transaction, self.request_id);
+            Self::send_request_handled(cx, &transaction, self.request_id);
         } else {
             // FIXME:(arihant2math) dispatch correct error
             // Substep 2
@@ -342,24 +335,24 @@ impl RequestListener {
         request.set_result(undefined.handle());
 
         // Substep 2: Set the error of request to result.
-        request.set_error(Some(error.clone()), CanGc::from_cx(cx));
+        request.set_error(cx, Some(error.clone()));
 
         // https://w3c.github.io/IndexedDB/#fire-error-event
         // Step 1: Let event be the result of creating an event using Event.
         // Step 2: Set event’s type attribute to "error".
         // Step 3: Set event’s bubbles and cancelable attributes to true.
         let event = Event::new(
+            cx,
             global,
             Atom::from("error"),
             EventBubbles::Bubbles,
             EventCancelable::Cancelable,
-            CanGc::from_cx(cx),
         );
 
         // If result is an error and transaction’s state is committing, then run abort a
         // transaction with transaction and result, and terminate these steps.
         if transaction.is_committing() {
-            transaction.initiate_abort(error.clone(), CanGc::from_cx(cx));
+            transaction.initiate_abort(cx, error.clone());
             transaction.request_backend_abort();
         }
         // Step 5: Let legacyOutputDidListenersThrowFlag be initially false.
@@ -387,17 +380,17 @@ impl RequestListener {
             // exception, transaction’s error property is set to an AbortError rather than request’s
             // error, even if preventDefault() is never called.
             if did_listeners_throw.get() {
-                transaction.initiate_abort(Error::Abort(None), CanGc::from_cx(cx));
+                transaction.initiate_abort(cx, Error::Abort(None));
                 transaction.request_backend_abort();
             } else if default_not_prevented {
                 // Step 8.3: If event’s canceled flag is false, then run abort a transaction
                 // using transaction and request’s error, and terminate these steps.
-                transaction.initiate_abort(error, CanGc::from_cx(cx));
+                transaction.initiate_abort(cx, error);
                 transaction.request_backend_abort();
             }
         }
         transaction.request_finished();
-        Self::send_request_handled(&transaction, request_id);
+        Self::send_request_handled(cx, &transaction, request_id);
     }
 }
 
@@ -425,8 +418,8 @@ impl IDBRequest {
         }
     }
 
-    pub fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<IDBRequest> {
-        reflect_dom_object(Box::new(IDBRequest::new_inherited()), global, can_gc)
+    pub fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<IDBRequest> {
+        reflect_dom_object(cx, Box::new(IDBRequest::new_inherited()), global)
     }
 
     pub fn set_source(&self, source: Option<&IDBObjectStore>) {
@@ -441,9 +434,9 @@ impl IDBRequest {
         self.result.set(result.get());
     }
 
-    pub fn set_error(&self, error: Option<Error>, can_gc: CanGc) {
+    pub fn set_error(&self, cx: &mut JSContext, error: Option<Error>) {
         if let Some(error) = error {
-            if let Ok(exception) = create_dom_exception(&self.global(), error, can_gc) {
+            if let Ok(exception) = create_dom_exception(cx, &self.global(), error) {
                 self.error.set(Some(&exception));
             }
         } else {
@@ -459,6 +452,10 @@ impl IDBRequest {
         self.transaction.set(None);
     }
 
+    pub fn unset_done_flag(&self) {
+        self.ready_state.set(IDBRequestReadyState::Pending);
+    }
+
     fn is_done(&self) -> bool {
         self.ready_state.get() == IDBRequestReadyState::Done
     }
@@ -469,11 +466,11 @@ impl IDBRequest {
 
     // https://www.w3.org/TR/IndexedDB-3/#asynchronously-execute-a-request
     pub fn execute_async<T, F>(
+        cx: &mut JSContext,
         source: &IDBObjectStore,
         operation_fn: F,
         request: Option<DomRoot<IDBRequest>>,
         iteration_param: Option<IterationParam>,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<IDBRequest>>
     where
         T: Into<IdbResult> + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
@@ -491,7 +488,7 @@ impl IDBRequest {
 
         // Step 3: If request was not given, let request be a new request with source as source.
         let request = request.unwrap_or_else(|| {
-            let new_request = IDBRequest::new(&global, can_gc);
+            let new_request = IDBRequest::new(cx, &global);
             new_request.set_source(Some(source));
             new_request.set_transaction(&transaction);
             new_request
@@ -519,7 +516,7 @@ impl IDBRequest {
             .database_access_task_source()
             .to_sendable();
 
-        let closure = move |message: Result<BackendResult<T>, ipc_channel::IpcError>| {
+        let closure = move |message: Result<BackendResult<T>, SendError>| {
             let response_listener = response_listener.clone();
             task_source.queue(task!(request_callback: move |cx| {
                 response_listener.handle_async_request_finished(
@@ -532,8 +529,7 @@ impl IDBRequest {
                 );
             }));
         };
-        let callback = GenericCallback::new(global.time_profiler_chan().clone(), closure)
-            .expect("Could not create callback");
+        let callback = GenericCallback::new(closure).expect("Could not create callback");
         let operation = operation_fn(callback);
 
         if matches!(
@@ -558,8 +554,8 @@ impl IDBRequest {
             .storage_threads()
             .send(IndexedDBThreadMsg::Async(
                 global.origin().immutable().clone(),
-                transaction.get_db_name().to_string(),
-                source.get_name().to_string(),
+                String::from(transaction.get_db_name()),
+                String::from(source.get_name()),
                 transaction.get_serial_number(),
                 request_id,
                 transaction_mode,
@@ -576,7 +572,7 @@ impl IDBRequestMethods<crate::DomTypeHolder> for IDBRequest {
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbrequest-result>
     fn GetResult(
         &self,
-        _cx: SafeJSContext,
+        _cx: &mut JSContext,
         mut val: js::rust::MutableHandle<'_, js::jsapi::Value>,
     ) -> Fallible<()> {
         // Step 1. If this's done flag is false, then throw an "InvalidStateError" DOMException.

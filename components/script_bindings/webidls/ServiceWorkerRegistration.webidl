@@ -14,7 +14,7 @@ interface ServiceWorkerRegistration : EventTarget {
   readonly attribute ServiceWorkerUpdateViaCache updateViaCache;
 
   // [NewObject] Promise<void> update();
-  // [NewObject] Promise<boolean> unregister();
+  [NewObject] Promise<boolean> unregister();
 
   // event
   // attribute EventHandler onupdatefound;
@@ -24,4 +24,10 @@ enum ServiceWorkerUpdateViaCache {
   "imports",
   "all",
   "none"
+};
+
+// https://cookiestore.spec.whatwg.org/#dom-serviceworkerregistration-cookies
+partial interface ServiceWorkerRegistration {
+  [SameObject, Exposed=(ServiceWorker,Window), Pref="dom_cookiestore_enabled"]
+  readonly attribute CookieStoreManager cookies;
 };

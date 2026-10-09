@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use accesskit::{TreeId, Uuid};
@@ -21,7 +21,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use webrender_api::{
     ExternalScrollId, FontInstanceKey, FontKey, IdNamespace, ImageKey,
-    PipelineId as WebRenderPipelineId, SpatialTreeItemKey,
+    PipelineId as WebRenderPipelineId,
 };
 
 use crate::generic_channel::{self, GenericReceiver, GenericSender};
@@ -338,14 +338,6 @@ namespace_id! {BrowsingContextId, BrowsingContextIndex, "BrowsingContext"}
 size_of_test!(BrowsingContextId, 8);
 size_of_test!(Option<BrowsingContextId>, 8);
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub struct BrowsingContextGroupId(pub u32);
-impl fmt::Display for BrowsingContextGroupId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BrowsingContextGroup{:?}", self)
-    }
-}
-
 impl BrowsingContextId {
     pub fn from_string(str: &str) -> Option<BrowsingContextId> {
         let re = Regex::new(r"^BrowsingContext\((\d+),(\d+)\)$").ok()?;
@@ -373,12 +365,6 @@ size_of_test!(Option<WebViewId>, 12);
 impl fmt::Display for WebViewId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}, TopLevel{}", self.0, self.1)
-    }
-}
-
-impl From<WebViewId> for SpatialTreeItemKey {
-    fn from(webview_id: WebViewId) -> Self {
-        Self::new(webview_id.1.index.0.get() as u64, 0)
     }
 }
 
@@ -454,6 +440,8 @@ namespace_id! {CookieStoreId, CookieStoreIndex, "CookieStore"}
 
 namespace_id! {ImageDataId, ImageDataIndex, "ImageData"}
 
+namespace_id! {CryptoKeyId, CryptoKeyIndex, "CryptoKey"}
+
 // We provide ids just for unit testing.
 pub const TEST_NAMESPACE: PipelineNamespaceId = PipelineNamespaceId(1234);
 pub const TEST_PIPELINE_INDEX: Index<PipelineIndex> =
@@ -480,6 +468,36 @@ pub const TEST_SCRIPT_EVENT_LOOP_ID: ScriptEventLoopId = ScriptEventLoopId(1234)
 pub struct ScrollTreeNodeId {
     /// The index of this scroll tree node in the tree's array of nodes.
     pub index: usize,
+}
+
+#[derive(MallocSizeOf)]
+pub struct AtomicOptionScrollTreeNodeId(AtomicUsize);
+
+impl AtomicOptionScrollTreeNodeId {
+    pub fn new(option_id: Option<ScrollTreeNodeId>) -> Self {
+        Self(AtomicUsize::new(Self::from_option(option_id)))
+    }
+
+    pub fn set(&self, option_id: Option<ScrollTreeNodeId>) {
+        self.0
+            .store(Self::from_option(option_id), Ordering::Relaxed);
+    }
+
+    fn from_option(option_id: Option<ScrollTreeNodeId>) -> usize {
+        if let Some(ScrollTreeNodeId { index }) = option_id {
+            debug_assert_ne!(index, usize::MAX);
+            index
+        } else {
+            usize::MAX
+        }
+    }
+
+    pub fn get(&self) -> Option<ScrollTreeNodeId> {
+        match self.0.load(Ordering::Relaxed) {
+            usize::MAX => None,
+            index => Some(ScrollTreeNodeId { index }),
+        }
+    }
 }
 
 static PAINTER_ID: AtomicU32 = AtomicU32::new(1);
@@ -561,3 +579,20 @@ impl fmt::Display for ScriptEventLoopId {
         write!(f, "{}", self.0)
     }
 }
+
+/// A unique identifier for a largest-contentful-paint candidate, generated at
+/// layout time.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+pub struct LCPCandidateID(pub u64);
+
+/// A unique identifier for a single container timing report, generated at layout time.
+///
+/// Unlike [`LCPCandidateID`], which identifies a candidate, this identifies one *update*
+/// to a container: a container that grows repeatedly produces a new ID each time, since
+/// each update becomes its own `PerformanceContainerTiming` entry with its own paint
+/// time. Use [`ContainerTimingRecord::root_element`] to correlate updates belonging to
+/// the same container.
+///
+/// [`ContainerTimingRecord::root_element`]: ../../layout_api/struct.ContainerTimingRecord.html
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+pub struct ContainerTimingID(pub u64);

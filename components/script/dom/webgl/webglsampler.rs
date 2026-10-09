@@ -5,6 +5,7 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::reflect_dom_object;
 use script_bindings::weakref::WeakRef;
 use servo_canvas_traits::webgl::WebGLError::*;
@@ -16,7 +17,6 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::webgl::webglobject::WebGLObject;
 use crate::dom::webgl::webglrenderingcontext::{Operation, WebGLRenderingContext};
 use crate::dom::webglrenderingcontext::capture_webgl_backtrace;
-use crate::script_runtime::CanGc;
 
 #[derive(JSTraceable, MallocSizeOf)]
 struct DroppableWebGLSampler {
@@ -53,7 +53,7 @@ impl Drop for DroppableWebGLSampler {
     }
 }
 
-#[dom_struct(associated_memory)]
+#[dom_struct]
 pub(crate) struct WebGLSampler {
     webgl_object: WebGLObject,
     droppable: DroppableWebGLSampler,
@@ -121,15 +121,15 @@ impl WebGLSampler {
         }
     }
 
-    pub(crate) fn new(context: &WebGLRenderingContext, can_gc: CanGc) -> DomRoot<Self> {
+    pub(crate) fn new(cx: &mut JSContext, context: &WebGLRenderingContext) -> DomRoot<Self> {
         let (sender, receiver) = webgl_channel().unwrap();
         context.send_command(WebGLCommand::GenerateSampler(sender));
         let id = receiver.recv().unwrap();
 
         reflect_dom_object(
+            cx,
             Box::new(Self::new_inherited(context, id)),
             &*context.global(),
-            can_gc,
         )
     }
 

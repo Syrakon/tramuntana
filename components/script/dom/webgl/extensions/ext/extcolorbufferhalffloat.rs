@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_canvas_traits::webgl::WebGLVersion;
 
@@ -11,7 +12,6 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::webgl::extensions::oestexturehalffloat::OESTextureHalfFloat;
 use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct EXTColorBufferHalfFloat {
@@ -28,12 +28,8 @@ impl EXTColorBufferHalfFloat {
 
 impl WebGLExtension for EXTColorBufferHalfFloat {
     type Extension = EXTColorBufferHalfFloat;
-    fn new(ctx: &WebGLRenderingContext, can_gc: CanGc) -> DomRoot<EXTColorBufferHalfFloat> {
-        reflect_dom_object(
-            Box::new(EXTColorBufferHalfFloat::new_inherited()),
-            &*ctx.global(),
-            can_gc,
-        )
+    fn new(cx: &mut JSContext, ctx: &WebGLRenderingContext) -> DomRoot<EXTColorBufferHalfFloat> {
+        reflect_dom_object(cx, Box::new(Self::new_inherited()), &*ctx.global())
     }
 
     fn spec() -> WebGLExtensionSpec {

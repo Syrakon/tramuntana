@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::reflect_dom_object;
 
 use crate::dom::audio::audionode::{AudioNode, AudioNodeOptionsHelper, MAX_CHANNEL_COUNT};
@@ -13,7 +14,6 @@ use crate::dom::bindings::codegen::Bindings::AudioNodeBinding::{
 };
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct AudioDestinationNode {
@@ -40,13 +40,13 @@ impl AudioDestinationNode {
 
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         context: &BaseAudioContext,
         options: &AudioNodeOptions,
-        can_gc: CanGc,
     ) -> DomRoot<AudioDestinationNode> {
         let node = AudioDestinationNode::new_inherited(context, options);
-        reflect_dom_object(Box::new(node), global, can_gc)
+        reflect_dom_object(cx, Box::new(node), global)
     }
 }
 

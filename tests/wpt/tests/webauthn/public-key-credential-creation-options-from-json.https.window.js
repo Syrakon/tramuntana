@@ -112,11 +112,6 @@ test(() => {
         write: test_b64,
       },
       credBlob: test_b64,
-      supplementalPubKeys: {
-        scopes: ["spk scope"],
-        attestation: "directest",
-        attestationFormats: ["asn2"],
-      },
       prf: {
         eval: {
           first: test_b64,
@@ -160,11 +155,6 @@ test(() => {
         write: test_bytes,
       },
       credBlob: test_bytes,
-      supplementalPubKeys: {
-        scopes: ["spk scope"],
-        attestation: "directest",
-        attestationFormats: ["asn2"],
-      },
       prf: {
         eval: {
           first: test_bytes,
@@ -219,11 +209,6 @@ test(() => {
     assert_true(
         bytesEqual(actual.extensions.credBlob, expected.extensions.credBlob));
   }
-  if (actual.extensions.hasOwnProperty('supplementalPubKeys')) {
-    assertJsonEquals(
-        actual.extensions.supplementalPubKeys,
-        expected.extensions.supplementalPubKeys);
-  }
   if (actual.extensions.hasOwnProperty('prf')) {
     let prfValuesEquals = (a, b) => {
       return bytesEqual(a.first, b.first) && bytesEqual(a.second, b.second);
@@ -258,7 +243,7 @@ test(() => {
         alg: -7,
       },
     ],
-    hints: ["duplicated-value", "duplicated-value"]
+    hints: ["duplicated-value", "duplicated-value", "hybrid", "hybrid"]
   });
   let expected = {
     rp: {
@@ -278,7 +263,7 @@ test(() => {
       },
     ],
     attestation: "none",
-    hints: ["duplicated-value", "duplicated-value"]
+    hints: ["duplicated-value", "duplicated-value", "hybrid", "hybrid"]
   };
 
   assert_equals(actual.attestation, expected.attestation);

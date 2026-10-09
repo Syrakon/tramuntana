@@ -2,9 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::ptr::NonNull;
-
-use js::jsapi::JSObject;
+use js::context::JSContext;
+use js::rust::MutableHandleObject;
 use malloc_size_of::MallocSizeOf;
 use script_bindings::reflector::DomObject;
 
@@ -12,16 +11,17 @@ use super::{WebGLExtension, WebGLExtensionSpec, WebGLExtensions};
 use crate::dom::bindings::root::MutNullableDom;
 use crate::dom::bindings::trace::JSTraceable;
 use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
-use crate::script_runtime::CanGc;
 
 /// Trait used internally by WebGLExtensions to store and
 /// handle the different WebGL extensions in a common list.
 pub(crate) trait WebGLExtensionWrapper: JSTraceable + MallocSizeOf {
     fn instance_or_init(
         &self,
+        cx: &mut JSContext,
         ctx: &WebGLRenderingContext,
         ext: &WebGLExtensions,
-    ) -> NonNull<JSObject>;
+        rval: MutableHandleObject,
+    );
     fn spec(&self) -> WebGLExtensionSpec;
     fn is_supported(&self, _: &WebGLExtensions) -> bool;
     fn is_enabled(&self) -> bool;
@@ -49,21 +49,22 @@ impl<T> WebGLExtensionWrapper for TypedWebGLExtensionWrapper<T>
 where
     T: WebGLExtension + JSTraceable + MallocSizeOf + 'static,
 {
-    #[expect(unsafe_code)]
     fn instance_or_init(
         &self,
+        cx: &mut JSContext,
         ctx: &WebGLRenderingContext,
         ext: &WebGLExtensions,
-    ) -> NonNull<JSObject> {
+        mut rval: MutableHandleObject,
+    ) {
         let mut enabled = true;
         let extension = self.extension.or_init(|| {
             enabled = false;
-            T::new(ctx, CanGc::deprecated_note())
+            T::new(cx, ctx)
         });
         if !enabled {
             self.enable(ext);
         }
-        unsafe { NonNull::new_unchecked(extension.reflector().get_jsobject().get()) }
+        rval.set(extension.reflector().get_jsobject().get());
     }
 
     fn spec(&self) -> WebGLExtensionSpec {

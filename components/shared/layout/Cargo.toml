@@ -14,6 +14,7 @@ name = "layout_api"
 path = "lib.rs"
 
 [dependencies]
+accesskit = { workspace = true }
 app_units = { workspace = true }
 atomic_refcell = { workspace = true }
 bitflags = { workspace = true }
@@ -31,6 +32,7 @@ pixels = { workspace = true }
 profile_traits = { workspace = true }
 rustc-hash = { workspace = true }
 script_traits = { workspace = true }
+uuid = { workspace = true }
 selectors = { workspace = true }
 serde = { workspace = true }
 servo-background-hang-monitor-api = { workspace = true }
@@ -40,3 +42,6 @@ servo_arc = { workspace = true }
 stylo = { workspace = true }
 stylo_traits = { workspace = true }
 webrender_api = { workspace = true }
+
+[lints]
+workspace = true

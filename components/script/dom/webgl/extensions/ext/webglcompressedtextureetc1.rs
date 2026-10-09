@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_canvas_traits::webgl::{TexFormat, WebGLVersion};
 
@@ -11,7 +12,6 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
 use crate::dom::webgl::webgltexture::{TexCompression, TexCompressionValidation};
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct WEBGLCompressedTextureETC1 {
@@ -28,12 +28,8 @@ impl WEBGLCompressedTextureETC1 {
 
 impl WebGLExtension for WEBGLCompressedTextureETC1 {
     type Extension = WEBGLCompressedTextureETC1;
-    fn new(ctx: &WebGLRenderingContext, can_gc: CanGc) -> DomRoot<WEBGLCompressedTextureETC1> {
-        reflect_dom_object(
-            Box::new(WEBGLCompressedTextureETC1::new_inherited()),
-            &*ctx.global(),
-            can_gc,
-        )
+    fn new(cx: &mut JSContext, ctx: &WebGLRenderingContext) -> DomRoot<WEBGLCompressedTextureETC1> {
+        reflect_dom_object(cx, Box::new(Self::new_inherited()), &*ctx.global())
     }
 
     fn spec() -> WebGLExtensionSpec {

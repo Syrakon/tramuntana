@@ -27,7 +27,7 @@ use crate::blob_url_store::UrlWithBlobClaim;
 use crate::policy_container::{PolicyContainer, RequestPolicyContainer};
 use crate::pub_domains::is_same_site;
 use crate::resource_fetch_timing::ResourceTimingType;
-use crate::response::{HttpsState, RedirectTaint, Response};
+use crate::response::{RedirectTaint, Response};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 /// An id to differentiate one network request from another.
@@ -135,6 +135,14 @@ pub enum ResponseTainting {
     Opaque,
 }
 
+/// Servo-internal to keep track of which requests originate from Servo internal implementation
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum InternalRequest {
+    Yes,
+    #[default]
+    No,
+}
+
 /// <https://html.spec.whatwg.org/multipage/#preload-key>
 #[derive(Clone, Debug, Eq, Hash, Deserialize, MallocSizeOf, Serialize, PartialEq)]
 pub struct PreloadKey {
@@ -208,13 +216,16 @@ pub struct RequestClient {
     /// <https://html.spec.whatwg.org/multipage/#map-of-preloaded-resources>
     pub preloaded_resources: PreloadedResources,
     /// <https://html.spec.whatwg.org/multipage/#concept-settings-object-policy-container>
-    pub policy_container: RequestPolicyContainer,
+    #[conditional_malloc_size_of]
+    pub policy_container: Arc<PolicyContainer>,
     /// <https://html.spec.whatwg.org/multipage/#concept-settings-object-origin>
     pub origin: Origin,
     /// <https://html.spec.whatwg.org/multipage/#nested-browsing-context>
     pub is_nested_browsing_context: bool,
     /// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy>
     pub insecure_requests_policy: InsecureRequestsPolicy,
+    /// <https://w3c.github.io/webappsec-secure-contexts/#potentially-trustworthy-origin>
+    pub has_trustworthy_ancestor_origin: bool,
 }
 
 /// <https://html.spec.whatwg.org/multipage/#system-visibility-state>
@@ -258,10 +269,10 @@ pub enum CorsSettings {
 impl CorsSettings {
     /// <https://html.spec.whatwg.org/multipage/#cors-settings-attribute>
     pub fn from_enumerated_attribute(value: &str) -> CorsSettings {
-        match value.to_ascii_lowercase().as_str() {
-            "anonymous" => CorsSettings::Anonymous,
-            "use-credentials" => CorsSettings::UseCredentials,
-            _ => CorsSettings::Anonymous,
+        if value.eq_ignore_ascii_case("use-credentials") {
+            CorsSettings::UseCredentials
+        } else {
+            CorsSettings::Anonymous
         }
     }
 }
@@ -445,6 +456,12 @@ pub struct RequestBuilder {
 
     /// <https://fetch.spec.whatwg.org/#concept-request-body>
     pub body: Option<RequestBody>,
+    /// <https://fetch.spec.whatwg.org/#concept-request-reload-navigation-flag>
+    /// A request has an associated reload-navigation flag. Unless stated otherwise, it is unset.
+    pub reload_navigation: bool,
+    /// <https://fetch.spec.whatwg.org/#concept-request-history-navigation-flag>
+    /// A request has an associated history-navigation flag. Unless stated otherwise, it is unset.
+    pub history_navigation: bool,
 
     /// <https://fetch.spec.whatwg.org/#request-service-workers-mode>
     pub service_workers_mode: ServiceWorkersMode,
@@ -472,8 +489,6 @@ pub struct RequestBuilder {
 
     /// <https://fetch.spec.whatwg.org/#concept-request-policy-container>
     pub policy_container: RequestPolicyContainer,
-    pub insecure_requests_policy: InsecureRequestsPolicy,
-    pub has_trustworthy_ancestor_origin: bool,
 
     /// <https://fetch.spec.whatwg.org/#concept-request-referrer>
     pub referrer: Referrer,
@@ -500,10 +515,11 @@ pub struct RequestBuilder {
 
     /// <https://fetch.spec.whatwg.org/#concept-request-initiator>
     pub initiator: Initiator,
-    pub https_state: HttpsState,
     pub response_tainting: ResponseTainting,
     /// Servo internal: if crash details are present, trigger a crash error page with these details.
     pub crash: Option<String>,
+    /// Servo internal: whether this request originates from Servo internal implementation
+    pub is_internal_request: InternalRequest,
 }
 
 impl RequestBuilder {
@@ -520,6 +536,8 @@ impl RequestBuilder {
             headers: HeaderMap::new(),
             unsafe_request: false,
             body: None,
+            reload_navigation: false,
+            history_navigation: false,
             service_workers_mode: ServiceWorkersMode::All,
             destination: Destination::None,
             synchronous: false,
@@ -532,20 +550,18 @@ impl RequestBuilder {
             origin: Origin::Client,
             client: None,
             policy_container: RequestPolicyContainer::default(),
-            insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
-            has_trustworthy_ancestor_origin: false,
             referrer,
             referrer_policy: ReferrerPolicy::EmptyString,
             pipeline_id: None,
             target_webview_id: webview_id,
             redirect_mode: RedirectMode::Follow,
-            integrity_metadata: "".to_owned(),
-            cryptographic_nonce_metadata: "".to_owned(),
+            integrity_metadata: String::new(),
+            cryptographic_nonce_metadata: String::new(),
             url_list: vec![],
             parser_metadata: ParserMetadata::Default,
             initiator: Initiator::None,
-            https_state: HttpsState::None,
             response_tainting: ResponseTainting::Basic,
+            is_internal_request: Default::default(),
             crash: None,
         }
     }
@@ -671,11 +687,6 @@ impl RequestBuilder {
         self
     }
 
-    pub fn https_state(mut self, https_state: HttpsState) -> RequestBuilder {
-        self.https_state = https_state;
-        self
-    }
-
     pub fn response_tainting(mut self, response_tainting: ResponseTainting) -> RequestBuilder {
         self.response_tainting = response_tainting;
         self
@@ -687,7 +698,7 @@ impl RequestBuilder {
     }
 
     /// <https://fetch.spec.whatwg.org/#concept-request-policy-container>
-    pub fn policy_container(mut self, policy_container: PolicyContainer) -> RequestBuilder {
+    pub fn policy_container(mut self, policy_container: Arc<PolicyContainer>) -> RequestBuilder {
         self.policy_container = RequestPolicyContainer::PolicyContainer(policy_container);
         self
     }
@@ -695,22 +706,6 @@ impl RequestBuilder {
     /// <https://fetch.spec.whatwg.org/#concept-request-client>
     pub fn client(mut self, client: RequestClient) -> RequestBuilder {
         self.client = Some(client);
-        self
-    }
-
-    pub fn insecure_requests_policy(
-        mut self,
-        insecure_requests_policy: InsecureRequestsPolicy,
-    ) -> RequestBuilder {
-        self.insecure_requests_policy = insecure_requests_policy;
-        self
-    }
-
-    pub fn has_trustworthy_ancestor_origin(
-        mut self,
-        has_trustworthy_ancestor_origin: bool,
-    ) -> RequestBuilder {
-        self.has_trustworthy_ancestor_origin = has_trustworthy_ancestor_origin;
         self
     }
 
@@ -729,6 +724,11 @@ impl RequestBuilder {
         self
     }
 
+    pub fn is_internal_request(mut self, is_internal_request: InternalRequest) -> RequestBuilder {
+        self.is_internal_request = is_internal_request;
+        self
+    }
+
     pub fn build(self) -> Request {
         let mut request = Request::new(
             self.id,
@@ -737,7 +737,6 @@ impl RequestBuilder {
             self.referrer,
             self.pipeline_id,
             self.target_webview_id,
-            self.https_state,
         );
         request.preload_id = self.preload_id;
         request.initiator = self.initiator;
@@ -745,6 +744,8 @@ impl RequestBuilder {
         request.headers = self.headers;
         request.unsafe_request = self.unsafe_request;
         request.body = self.body;
+        request.reload_navigation = self.reload_navigation;
+        request.history_navigation = self.history_navigation;
         request.service_workers_mode = self.service_workers_mode;
         request.destination = self.destination;
         request.synchronous = self.synchronous;
@@ -773,8 +774,7 @@ impl RequestBuilder {
         request.crash = self.crash;
         request.client = self.client;
         request.policy_container = self.policy_container;
-        request.insecure_requests_policy = self.insecure_requests_policy;
-        request.has_trustworthy_ancestor_origin = self.has_trustworthy_ancestor_origin;
+        request.is_internal_request = self.is_internal_request;
         request
     }
 
@@ -804,6 +804,12 @@ pub struct Request {
     pub unsafe_request: bool,
     /// <https://fetch.spec.whatwg.org/#concept-request-body>
     pub body: Option<RequestBody>,
+    /// <https://fetch.spec.whatwg.org/#concept-request-reload-navigation-flag>
+    /// A request has an associated reload-navigation flag. Unless stated otherwise, it is unset.
+    pub reload_navigation: bool,
+    /// <https://fetch.spec.whatwg.org/#concept-request-history-navigation-flag>
+    /// A request has an associated history-navigation flag. Unless stated otherwise, it is unset.
+    pub history_navigation: bool,
     /// <https://fetch.spec.whatwg.org/#concept-request-client>
     pub client: Option<RequestClient>,
     /// <https://fetch.spec.whatwg.org/#concept-request-window>
@@ -853,12 +859,10 @@ pub struct Request {
     pub parser_metadata: ParserMetadata,
     /// <https://fetch.spec.whatwg.org/#concept-request-policy-container>
     pub policy_container: RequestPolicyContainer,
-    /// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy>
-    pub insecure_requests_policy: InsecureRequestsPolicy,
-    pub has_trustworthy_ancestor_origin: bool,
-    pub https_state: HttpsState,
     /// Servo internal: if crash details are present, trigger a crash error page with these details.
     pub crash: Option<String>,
+    /// Servo internal: whether this request originates from Servo internal implementation
+    pub is_internal_request: InternalRequest,
 }
 
 impl Request {
@@ -869,7 +873,6 @@ impl Request {
         referrer: Referrer,
         pipeline_id: Option<PipelineId>,
         webview_id: Option<WebViewId>,
-        https_state: HttpsState,
     ) -> Request {
         Request {
             id,
@@ -879,6 +882,8 @@ impl Request {
             headers: HeaderMap::new(),
             unsafe_request: false,
             body: None,
+            reload_navigation: false,
+            history_navigation: false,
             client: None,
             traversable_for_user_prompts: TraversableForUserPrompts::Client,
             keep_alive: false,
@@ -904,9 +909,7 @@ impl Request {
             redirect_count: 0,
             response_tainting: ResponseTainting::Basic,
             policy_container: RequestPolicyContainer::Client,
-            insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
-            has_trustworthy_ancestor_origin: false,
-            https_state,
+            is_internal_request: Default::default(),
             crash: None,
         }
     }
@@ -962,11 +965,15 @@ impl Request {
         matches!(
             self.destination,
             Destination::Audio |
+                Destination::AudioWorklet |
                 Destination::Font |
                 Destination::Image |
+                Destination::Json |
                 Destination::Manifest |
+                Destination::PaintWorklet |
                 Destination::Script |
                 Destination::Style |
+                Destination::Text |
                 Destination::Track |
                 Destination::Video |
                 Destination::Xslt |
@@ -1012,11 +1019,12 @@ impl Request {
             // Step 3.1. If request’s client is non-null, then set request’s
             // policy container to a clone of request’s client’s policy container. [HTML]
             if let Some(client) = self.client.as_ref() {
-                self.policy_container = client.policy_container.clone();
+                self.policy_container =
+                    RequestPolicyContainer::PolicyContainer(client.policy_container.clone());
             } else {
                 // Step 3.2. Otherwise, set request’s policy container to a new policy container.
                 self.policy_container =
-                    RequestPolicyContainer::PolicyContainer(PolicyContainer::default());
+                    RequestPolicyContainer::PolicyContainer(Arc::new(PolicyContainer::default()));
             }
         }
     }
@@ -1277,8 +1285,8 @@ pub fn convert_header_names_to_sorted_lowercase_set(
     ordered_set.into_iter().cloned().collect()
 }
 
-pub fn create_request_body_with_content(content: &str) -> RequestBody {
-    let content_bytes = GenericSharedMemory::from_bytes(content.as_bytes());
+pub fn create_request_body_with_content(content: String) -> RequestBody {
+    let content_bytes = GenericSharedMemory::from_vec(content.into_bytes());
     let content_len = content_bytes.len();
 
     let (chunk_request_sender, chunk_request_receiver) = ipc::channel().unwrap();

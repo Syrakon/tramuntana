@@ -8,6 +8,9 @@ jobs:
   parse-comment:
     name: Trigger Try
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     concurrency:
       group: try-${{ github.event.number }}
     outputs:
@@ -66,7 +69,7 @@ jobs:
             }
 
             return try_string;
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           sparse-checkout: |
             python/servo/try_parser.py
@@ -115,6 +118,17 @@ jobs:
     if: ${{ needs.parse-comment.outputs.try_string }}
     needs: ["parse-comment"]
     name: ${{ matrix.name }}
+    permissions:
+      contents: read
+      attestations: read
+      # TODO: This is used by our runner-selection job to delete temporary artifacts.
+      # We should find a nother way to handle that to avoid needing to hand-out this
+      # permission.
+      actions: write
+      # The following two are used by the code that uploads a comment and check run
+      # when processing WPT results.
+      checks: write
+      pull-requests: write
     strategy:
       fail-fast: ${{ fromJson(needs.parse-comment.outputs.configuration).fail_fast }}
       matrix:
@@ -127,17 +141,21 @@ jobs:
       wpt: ${{ matrix.wpt }}
       profile: ${{ matrix.profile }}
       unit-tests: ${{ matrix.unit_tests }}
+      devtools-tests: ${{ matrix.devtools_tests }}
       build-libservo: ${{ matrix.build_libservo }}
       wpt-args: ${{ matrix.wpt_args }}
       build-args: ${{ matrix.build_args }}
       number-of-wpt-chunks: ${{ matrix.number_of_wpt_chunks }}
       bencher: ${{ matrix.bencher }}
       coverage: ${{ matrix.coverage }}
+      capi: ${{ matrix.capi }}
 
   results:
     name: Results
     needs: ["parse-comment", "run-try"]
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     if: ${{ always() && needs.parse-comment.outputs.try_string }}
     steps:
       - name: Post PR Comment with results

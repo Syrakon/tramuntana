@@ -23,8 +23,7 @@ pub use surfman::Error;
 use surfman::chains::{PreserveBuffer, SwapChain};
 use surfman::{
     Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device, GLApi,
-    GLVersion, NativeContext, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture,
-    SurfaceType,
+    GLVersion, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture, SurfaceType,
 };
 use webrender_api::units::{DeviceIntRect, DevicePixel};
 
@@ -131,11 +130,18 @@ impl SurfmanRenderingContext {
         let context_descriptor =
             device.create_context_descriptor(&ContextAttributes { flags, version })?;
 
-        let context = device
+        let mut context = device
             .create_context(&context_descriptor, None)
             .inspect_err(|_| {
                 print_diagnostics_information_on_context_creation_failure(&device, gl_api, version)
             })?;
+
+        // `glow::Context::from_loader_function` immediately queries `GL_VERSION`, so the
+        // context must be current.
+        if let Err(error) = device.make_context_current(&context) {
+            let _ = device.destroy_context(&mut context);
+            return Err(error);
+        }
 
         #[expect(unsafe_code)]
         let gleam_gl = {
@@ -189,49 +195,22 @@ impl SurfmanRenderingContext {
         SwapChain::create_attached(device, context, SurfaceAccess::GPUOnly)
     }
 
-    fn resize_surface(&self, size: PhysicalSize<u32>) -> Result<(), Error> {
+    fn resize_bound_surface(&self, size: PhysicalSize<u32>) -> Result<(), Error> {
         if size.width == 0 || size.height == 0 {
             log::error!("Unable to resize to size under 1x1 ({size:?} provided)");
             return Err(Error::Failed);
         }
 
         let size = Size2D::new(size.width as i32, size.height as i32);
-        let device = &mut self.device.borrow_mut();
-        let context = &mut self.context.borrow_mut();
-
-        let mut surface = device.unbind_surface_from_context(context)?.unwrap();
-        device.resize_surface(context, &mut surface, size)?;
-        device
-            .bind_surface_to_context(context, surface)
-            .map_err(|(err, mut surface)| {
-                let _ = device.destroy_surface(context, &mut surface);
-                err
-            })
+        self.device
+            .borrow()
+            .resize_bound_surface(&mut self.context.borrow_mut(), size)
     }
 
     fn present_bound_surface(&self) -> Result<(), Error> {
-        let device = &self.device.borrow();
-        let context = &mut self.context.borrow_mut();
-
-        let mut surface = device
-            .unbind_surface_from_context(context)?
-            // todo: proper error type. This probably should be done in surfman.
-            .ok_or(Error::Failed)
-            .inspect_err(|_| log::error!("Unable to present bound surface: no surface bound"))?;
-        device.present_surface(context, &mut surface)?;
-        device
-            .bind_surface_to_context(context, surface)
-            .map_err(|(err, mut surface)| {
-                let _ = device.destroy_surface(context, &mut surface);
-                err
-            })
-    }
-
-    #[expect(dead_code)]
-    fn native_context(&self) -> NativeContext {
-        let device = &self.device.borrow();
-        let context = &self.context.borrow();
-        device.native_context(context)
+        self.device
+            .borrow()
+            .present_bound_surface(&mut self.context.borrow_mut())
     }
 
     fn framebuffer(&self) -> Option<NativeFramebuffer> {
@@ -380,6 +359,7 @@ impl RenderingContext for SoftwareRenderingContext {
         let _ = self.swap_chain.resize(device, context, size);
     }
 
+    #[servo_tracing::instrument(skip_all, name = "SoftwareRenderingContext::present")]
     fn present(&self) {
         let device = &mut self.surfman_rendering_info.device.borrow_mut();
         let context = &mut self.surfman_rendering_info.context.borrow_mut();
@@ -743,12 +723,13 @@ impl RenderingContext for WindowRenderingContext {
     }
 
     fn resize(&self, size: PhysicalSize<u32>) {
-        match self.surfman_context.resize_surface(size) {
+        match self.surfman_context.resize_bound_surface(size) {
             Ok(..) => self.size.set(size),
             Err(error) => warn!("Error resizing surface: {error:?}"),
         }
     }
 
+    #[servo_tracing::instrument(skip_all, name = "WindowRenderingContext::present")]
     fn present(&self) {
         if let Err(error) = self.surfman_context.present_bound_surface() {
             warn!("Error presenting surface: {error:?}");

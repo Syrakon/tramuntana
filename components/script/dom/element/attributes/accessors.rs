@@ -2,28 +2,140 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use html5ever::{LocalName, local_name, ns};
+use std::sync::LazyLock;
+
+use html5ever::{LocalName, Namespace, local_name, ns};
 use js::context::JSContext;
 use servo_arc::Arc as ServoArc;
 use style::attr::AttrValue;
 use stylo_atoms::Atom;
 
-use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::UnionTypes::{TrustedHTMLOrString, TrustedScriptURLOrUSVString};
 use crate::dom::bindings::str::{DOMString, USVString};
+use crate::dom::element::Element;
 use crate::dom::element::attributes::storage::AttrRef;
-use crate::dom::element::{AttributeMutationReason, Element};
+use crate::dom::element::storage::{AttrName, AttributesBorrow, ContentAttributeData};
 use crate::dom::node::NodeTraits;
 
-impl Element {
-    pub(crate) fn get_int_attribute(&self, local_name: &LocalName, default: i32) -> i32 {
-        match self.get_attribute(local_name) {
-            Some(ref attribute) => match *attribute.value() {
-                AttrValue::Int(_, value) => value,
-                _ => unreachable!("Expected an AttrValue::Int: implement parse_plain_attribute"),
-            },
-            None => default,
+static EMPTY_CONTENTATTRIBUTE_DATA: LazyLock<ContentAttributeData> =
+    LazyLock::new(|| ContentAttributeData {
+        identifier: AttrName::new(local_name!(""), local_name!(""), ns!(), None),
+        value: AttrValue::Atom(atom!("")),
+    });
+
+pub(crate) struct AttrStrRefInner<'a> {
+    attributes_borrow: AttributesBorrow<'a>,
+    position: usize,
+}
+
+/// A reference to an attribute value as `&str`. Keeps the borrow alive.
+// We need to support `get_attribute_string_ref().unwrap_or_default()` and return an empty `&str` for this.
+// To support this, we always return `Some(AttrStrRef(Some(AttrStrRefInner)))` if we find an attribute and `None` otherwise.
+// We only create a `AttrStrRef(None)` with the default constructor. For `as_attr_ref`, we can then return a special empty `ContentAttribute`
+// packages in a `AttrRef`.
+#[derive(Default)]
+pub(crate) struct AttrStrRef<'a>(Option<AttrStrRefInner<'a>>);
+
+impl<'a> AttrStrRef<'a> {
+    /// Create a new [`AttrStrRef`] from localname. Returns None if the attribute was not found.
+    pub(in crate::dom::element) fn maybe_new(
+        attrs: AttributesBorrow<'a>,
+        namespace: &Namespace,
+        local_name: &LocalName,
+    ) -> Option<AttrStrRef<'a>> {
+        let position = attrs.iter().position(|attribute| {
+            attribute.local_name() == local_name && attribute.namespace() == namespace
+        });
+        position.map(|position| {
+            AttrStrRef(Some(AttrStrRefInner {
+                attributes_borrow: attrs,
+                position,
+            }))
+        })
+    }
+
+    /// Return the `AttrRef` from the `AttrStrRef`.
+    pub(crate) fn as_attr_ref<'b>(&'b self) -> AttrRef<'b> {
+        if let Some(inner) = &self.0 {
+            inner.attributes_borrow.get(inner.position).unwrap()
+        } else {
+            AttrRef::Raw(&EMPTY_CONTENTATTRIBUTE_DATA)
         }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        if let Some(inner) = self.0.as_ref() {
+            inner
+                .attributes_borrow
+                .get(inner.position)
+                .unwrap()
+                .value()
+                .is_empty()
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn eq_ignore_ascii_case(&self, other: &str) -> bool {
+        if let Some(inner) = self.0.as_ref() {
+            let attr_ref = inner.attributes_borrow.get(inner.position).unwrap();
+            let value = attr_ref.value();
+            value.eq_ignore_ascii_case(other)
+        } else {
+            other.is_empty()
+        }
+    }
+}
+
+impl Element {
+    /// Callers should convert the `LocalName` to ASCII lowercase before calling.
+    /// Consider using `get_attribute_string_ref`.
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name>
+    pub(crate) fn get_attribute_string_value(&self, local_name: &LocalName) -> Option<String> {
+        // Step 1. If element is in the HTML namespace and its node document is an HTML document,
+        // then set qualifiedName to qualifiedName in ASCII lowercase.
+        debug_assert_eq!(
+            *local_name,
+            local_name.to_ascii_lowercase(),
+            "All namespace-less attribute accesses should use a lowercase ASCII name"
+        );
+
+        self.get_attribute_string_value_with_namespace(&ns!(), local_name)
+    }
+
+    /// This returns an attribute reference that can be seen as a `&str`. This keeps the borrow on attributes alive.
+    /// Callers should convert the `LocalName` to ASCII lowercase before calling.
+    pub(crate) fn get_attribute_string_ref<'a>(
+        &'a self,
+        local_name: &LocalName,
+    ) -> Option<AttrStrRef<'a>> {
+        debug_assert_eq!(
+            *local_name,
+            local_name.to_ascii_lowercase(),
+            "All namespace-less attribute accesses should use a lowercase ASCII name"
+        );
+        self.attribute_str_ref(&ns!(), local_name)
+    }
+
+    pub(crate) fn get_attribute_string_value_with_namespace(
+        &self,
+        namespace: &Namespace,
+        local_name: &LocalName,
+    ) -> Option<String> {
+        self.with_attribute(namespace, local_name, |attribute| {
+            String::from(&**attribute.value())
+        })
+    }
+
+    pub(crate) fn get_int_attribute(&self, local_name: &LocalName, default: i32) -> i32 {
+        self.with_attribute(&ns!(), local_name, |attribute| {
+            if let AttrValue::Int(_, value) = *attribute.value() {
+                value
+            } else {
+                unreachable!("Expected an AttrValue::Int: implement parse_plain_attribute")
+            }
+        })
+        .unwrap_or(default)
     }
 
     pub(crate) fn set_atomic_attribute(
@@ -52,14 +164,13 @@ impl Element {
     }
 
     pub(crate) fn get_url_attribute(&self, local_name: &LocalName) -> USVString {
-        let Some(attribute) = self.get_attribute(local_name) else {
+        let Some(value) = self.get_attribute_string_ref(local_name) else {
             return Default::default();
         };
-        let value = &**attribute.value();
         self.owner_document()
-            .encoding_parse_a_url(value)
+            .encoding_parse_a_url(&value.as_attr_ref().value())
             .map(|parsed| USVString(parsed.into_string()))
-            .unwrap_or_else(|_| USVString(value.to_owned()))
+            .unwrap_or_else(|_| USVString(value.as_attr_ref().value().to_string()))
     }
 
     pub(crate) fn set_url_attribute(
@@ -68,21 +179,23 @@ impl Element {
         local_name: &LocalName,
         value: USVString,
     ) {
-        self.set_attribute(cx, local_name, AttrValue::String(value.to_string()));
+        self.set_attribute(cx, local_name, AttrValue::String(value.into()));
     }
 
     pub(crate) fn get_trusted_type_url_attribute(
         &self,
         local_name: &LocalName,
     ) -> TrustedScriptURLOrUSVString {
-        let Some(attribute) = self.get_attribute(local_name) else {
+        let Some(value) = self.get_attribute_string_ref(local_name) else {
             return TrustedScriptURLOrUSVString::USVString(USVString::default());
         };
-        let value = &**attribute.value();
+        let value_ref = value.as_attr_ref();
         self.owner_document()
-            .encoding_parse_a_url(value)
+            .encoding_parse_a_url(&value_ref.value())
             .map(|parsed| TrustedScriptURLOrUSVString::USVString(USVString(parsed.into_string())))
-            .unwrap_or_else(|_| TrustedScriptURLOrUSVString::USVString(USVString(value.to_owned())))
+            .unwrap_or_else(|_| {
+                TrustedScriptURLOrUSVString::USVString(USVString(value_ref.value().to_string()))
+            })
     }
 
     pub(crate) fn get_trusted_html_attribute(&self, local_name: &LocalName) -> TrustedHTMLOrString {
@@ -90,8 +203,8 @@ impl Element {
     }
 
     pub(crate) fn get_string_attribute(&self, local_name: &LocalName) -> DOMString {
-        self.get_attribute(local_name)
-            .map(|attribute| attribute.Value())
+        self.get_attribute_string_value(local_name)
+            .map(|value| value.into())
             .unwrap_or_default()
     }
 
@@ -101,7 +214,7 @@ impl Element {
         local_name: &LocalName,
         value: DOMString,
     ) {
-        self.set_attribute(cx, local_name, AttrValue::String(value.into()));
+        self.set_attribute(cx, local_name, value.str().to_string().into());
     }
 
     /// Used for string attribute reflections where absence of the attribute returns `null`,
@@ -135,10 +248,40 @@ impl Element {
         }
     }
 
+    pub(crate) fn set_nullable_tokenlist_attribute(
+        &self,
+        cx: &mut JSContext,
+        local_name: &LocalName,
+        value: Option<DOMString>,
+    ) {
+        match value {
+            Some(string_value) => {
+                self.set_tokenlist_attribute(cx, local_name, string_value);
+            },
+            None => {
+                self.remove_attribute(cx, &ns!(), local_name);
+            },
+        }
+    }
+
+    /// Returns true if any attribute in the tokenlist fulfill `f`. Equivalent to
+    /// `get_tokenlist_attribute(name).iter().any(f)`.
+    pub(crate) fn any_tokenlist_attribute(
+        &self,
+        local_name: &LocalName,
+        f: impl Fn(&Atom) -> bool,
+    ) -> bool {
+        self.with_attribute(&ns!(), local_name, |attribute| {
+            attribute.value().as_tokens().iter().any(f)
+        })
+        .unwrap_or(false)
+    }
+
     pub(crate) fn get_tokenlist_attribute(&self, local_name: &LocalName) -> Vec<Atom> {
-        self.get_attribute(local_name)
-            .map(|attribute| attribute.value().as_tokens().to_vec())
-            .unwrap_or_default()
+        self.with_attribute(&ns!(), local_name, |attribute| {
+            attribute.value().as_tokens().to_vec()
+        })
+        .unwrap_or_default()
     }
 
     pub(crate) fn set_tokenlist_attribute(
@@ -154,36 +297,15 @@ impl Element {
         );
     }
 
-    pub(crate) fn set_atomic_tokenlist_attribute(
-        &self,
-        cx: &mut JSContext,
-        local_name: &LocalName,
-        tokens: Vec<Atom>,
-    ) {
-        self.set_attribute(cx, local_name, AttrValue::from_atomic_tokens(tokens));
-    }
-
-    pub(crate) fn set_int_attribute(&self, cx: &mut JSContext, local_name: &LocalName, value: i32) {
-        self.set_attribute(cx, local_name, AttrValue::Int(value.to_string(), value));
-    }
-
     pub(crate) fn get_uint_attribute(&self, local_name: &LocalName, default: u32) -> u32 {
-        match self.get_attribute(local_name) {
-            Some(ref attribute) => match *attribute.value() {
-                AttrValue::UInt(_, value) => value,
-                _ => unreachable!("Expected an AttrValue::UInt: implement parse_plain_attribute"),
-            },
-            None => default,
-        }
-    }
-
-    pub(crate) fn set_uint_attribute(
-        &self,
-        cx: &mut JSContext,
-        local_name: &LocalName,
-        value: u32,
-    ) {
-        self.set_attribute(cx, local_name, AttrValue::UInt(value.to_string(), value));
+        self.with_attribute(&ns!(), local_name, |attribute| {
+            if let AttrValue::UInt(_, value) = *attribute.value() {
+                value
+            } else {
+                unreachable!("Expected an AttrValue::Int: implement parse_plain_attribute")
+            }
+        })
+        .unwrap_or(default)
     }
 
     /// Ensure that for styles, we clone the already-parsed property declaration block.
@@ -192,16 +314,38 @@ impl Element {
     /// 2. It also avoids the CSP checks when cloning (it shouldn't run any when cloning
     ///    existing valid attributes)
     fn compute_attribute_value_with_style_fast_path(&self, attr: AttrRef<'_>) -> AttrValue {
-        if *attr.local_name() == local_name!("style") &&
-            let Some(ref pdb) = *self.style_attribute().borrow()
-        {
+        if *attr.local_name() == local_name!("style") {
             let document = self.owner_document();
-            let shared_lock = document.style_shared_lock();
-            let new_pdb = pdb.read_with(&shared_lock.read()).clone();
-            return AttrValue::Declaration(
-                (**attr.value()).to_owned(),
-                ServoArc::new(shared_lock.wrap(new_pdb)),
-            );
+
+            if let AttrValue::Declaration {
+                block,
+                lock,
+                serialization,
+            } = &*attr.value()
+            {
+                // Even though the property declaration block inside this AttrValue will
+                // be replaced, the serialization will be exactly the same, so preserve
+                // that instead of re-serializing.
+                let cloned_block = block.read_with(&lock.read()).clone();
+                return AttrValue::Declaration {
+                    block: ServoArc::new(lock.wrap(cloned_block)),
+                    lock: lock.clone(),
+                    serialization: serialization.clone(),
+                };
+            }
+
+            if let Some(ref pdb) = *self.style_attribute().borrow() {
+                let shared_lock = document.style_shared_author_lock();
+                let new_pdb = pdb.read_with(&shared_lock.read()).clone();
+                return AttrValue::Declaration {
+                    block: ServoArc::new(shared_lock.wrap(new_pdb)),
+                    lock: shared_lock.clone(),
+                    // The style attribute was not set via a declaration, so try to
+                    // preserve any serialization that existed before instead of
+                    // re-serializing.
+                    serialization: (**attr.value()).to_owned().into(),
+                };
+            }
         }
 
         attr.value().clone()
@@ -214,6 +358,8 @@ impl Element {
         target_element: &Element,
     ) {
         // Step 2.5. For each attribute of node’s attribute list:
+        let attribute_count = self.attrs().borrow().len();
+        target_element.attrs().reserve_exact(attribute_count);
         for attr in self.attrs().borrow().iter() {
             // Step 2.5.1. Let copyAttribute be the result of cloning a single node given attribute, document, and null.
             let new_value = self.compute_attribute_value_with_style_fast_path(attr);
@@ -225,7 +371,6 @@ impl Element {
                 attr.name().clone(),
                 attr.namespace().clone(),
                 attr.prefix().cloned(),
-                AttributeMutationReason::ByCloning,
             );
         }
     }

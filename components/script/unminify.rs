@@ -2,26 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::Cow;
 use std::env;
 use std::fs::{File, create_dir_all};
-use std::io::{Error, Read, Seek, Write};
+use std::io::{Error, ErrorKind, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
 
-use script_bindings::domstring::BytesView;
 use servo_url::ServoUrl;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-use crate::dom::bindings::str::DOMString;
-
-pub(crate) trait ScriptSource {
-    fn unminified_dir(&self) -> Option<String>;
-    fn extract_bytes(&self) -> BytesView<'_>;
-    fn rewrite_source(&mut self, source: Rc<DOMString>);
-    fn url(&self) -> ServoUrl;
-    fn is_external(&self) -> bool;
+pub(crate) struct ScriptSource<'a> {
+    pub source: Cow<'a, str>,
+    pub url: &'a ServoUrl,
+    pub external: bool,
 }
 
 pub(crate) fn create_temp_files() -> Option<(NamedTempFile, File)> {
@@ -65,34 +60,35 @@ pub(crate) fn execute_js_beautify(input: &Path, output: File, file_type: Beautif
     }
 }
 
-pub(crate) fn create_output_file(
+pub fn create_output_file(
     unminified_dir: String,
     url: &ServoUrl,
     external: Option<bool>,
 ) -> Result<File, Error> {
     let path = PathBuf::from(unminified_dir);
 
+    if url.scheme() == "data" {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "data URLs cannot be written as unminified files",
+        ));
+    }
+
+    // Strip the query string from the URL before using it as a file path.
+    // '?' is a reserved character on Windows and causes file creation to fail
+    // silently. BeforeHost..AfterPath stops the slice before the '?' separator.
+    let url_path = &url[url::Position::BeforeHost..url::Position::AfterPath];
+
     let (base, has_name) = match url.as_str().ends_with('/') {
-        true => (
-            path.join(&url[url::Position::BeforeHost..])
-                .as_path()
-                .to_owned(),
-            false,
-        ),
-        false => (
-            path.join(&url[url::Position::BeforeHost..])
-                .parent()
-                .unwrap()
-                .to_owned(),
-            true,
-        ),
+        true => (path.join(url_path).as_path().to_owned(), false),
+        false => (path.join(url_path).parent().unwrap().to_owned(), true),
     };
 
     create_dir_all(&base)?;
 
     let path = if external.unwrap_or(true) && has_name {
         // External.
-        path.join(&url[url::Position::BeforeHost..])
+        path.join(url_path)
     } else {
         // Inline file or url ends with '/'
         base.join(Uuid::new_v4().to_string())
@@ -103,13 +99,9 @@ pub(crate) fn create_output_file(
     File::create(path)
 }
 
-pub(crate) fn unminify_js(script: &mut dyn ScriptSource) {
-    let Some(unminified_dir) = script.unminified_dir() else {
-        return;
-    };
-
+pub(crate) fn unminify_js(script: &mut ScriptSource, unminified_js_dir: String) {
     if let Some((mut input, mut output)) = create_temp_files() {
-        input.write_all(&script.extract_bytes()).unwrap();
+        input.write_all(script.source.as_bytes()).unwrap();
 
         if execute_js_beautify(
             input.path(),
@@ -119,12 +111,12 @@ pub(crate) fn unminify_js(script: &mut dyn ScriptSource) {
             let mut script_content = String::new();
             output.seek(std::io::SeekFrom::Start(0)).unwrap();
             output.read_to_string(&mut script_content).unwrap();
-            script.rewrite_source(Rc::new(DOMString::from(script_content)));
+            script.source = script_content.into();
         }
     }
 
-    match create_output_file(unminified_dir, &script.url(), Some(script.is_external())) {
-        Ok(mut file) => file.write_all(&script.extract_bytes()).unwrap(),
+    match create_output_file(unminified_js_dir, script.url, Some(script.external)) {
+        Ok(mut file) => file.write_all(script.source.as_bytes()).unwrap(),
         Err(why) => warn!("Could not store script {:?}", why),
     }
 }

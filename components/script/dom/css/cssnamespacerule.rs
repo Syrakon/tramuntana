@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use servo_arc::Arc;
 use style::shared_lock::ToCssWithGuard;
 use style::stylesheets::{CssRuleType, NamespaceRule};
@@ -16,6 +16,7 @@ use super::cssstylesheet::CSSStyleSheet;
 use crate::dom::bindings::codegen::Bindings::CSSNamespaceRuleBinding::CSSNamespaceRuleMethods;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
+use crate::dom::cssgroupingrule::CSSGroupingRule;
 use crate::dom::window::Window;
 
 #[dom_struct]
@@ -28,11 +29,12 @@ pub(crate) struct CSSNamespaceRule {
 
 impl CSSNamespaceRule {
     fn new_inherited(
+        parent_rule: Option<&CSSGroupingRule>,
         parent_stylesheet: &CSSStyleSheet,
         namespacerule: Arc<NamespaceRule>,
     ) -> CSSNamespaceRule {
         CSSNamespaceRule {
-            css_rule: CSSRule::new_inherited(parent_stylesheet),
+            css_rule: CSSRule::new_inherited(parent_rule, parent_stylesheet),
             namespace_rule: RefCell::new(namespacerule),
         }
     }
@@ -40,16 +42,18 @@ impl CSSNamespaceRule {
     pub(crate) fn new(
         cx: &mut JSContext,
         window: &Window,
+        parent_rule: Option<&CSSGroupingRule>,
         parent_stylesheet: &CSSStyleSheet,
         namespacerule: Arc<NamespaceRule>,
     ) -> DomRoot<CSSNamespaceRule> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(CSSNamespaceRule::new_inherited(
+                parent_rule,
                 parent_stylesheet,
                 namespacerule,
             )),
             window,
-            cx,
         )
     }
 

@@ -2,10 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use aes::cipher::crypto_common::Key;
+use aes::cipher::common::{Generate, Key};
 use aes::{Aes128, Aes192, Aes256};
 use js::context::JSContext;
-use pkcs8::rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
 
 use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{
@@ -15,11 +14,11 @@ use crate::dom::bindings::codegen::Bindings::SubtleCryptoBinding::{JsonWebKey, K
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::cryptokey::{CryptoKey, Handle};
+use crate::dom::cryptokey::{CryptoKey, Handle, KeyUsageSliceHelper};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::subtlecrypto::{
-    CryptoAlgorithm, ExportedKey, JsonWebKeyExt, JwkStringField, KeyAlgorithmAndDerivatives,
-    SubtleAesDerivedKeyParams, SubtleAesKeyAlgorithm, SubtleAesKeyGenParams,
+    AesDerivedKeyParams, AesKeyAlgorithm, AesKeyGenParams, CryptoAlgorithm, ExportedKey,
+    JsonWebKeyExt, JwkStringField, KeyAlgorithmAndDerivatives,
 };
 
 #[expect(clippy::enum_variant_names)]
@@ -40,10 +39,10 @@ pub(crate) enum AesAlgorithm {
 /// The step order in the specification of AES-OCB is slightly different, but it is equivalent to
 /// this implementation.
 pub(crate) fn generate_key(
-    aes_algorithm: AesAlgorithm,
     cx: &mut JSContext,
     global: &GlobalScope,
-    normalized_algorithm: &SubtleAesKeyGenParams,
+    aes_algorithm: AesAlgorithm,
+    normalized_algorithm: &AesKeyGenParams,
     extractable: bool,
     usages: Vec<KeyUsage>,
 ) -> Result<DomRoot<CryptoKey>, Error> {
@@ -54,31 +53,17 @@ pub(crate) fn generate_key(
         AesAlgorithm::AesOcb => {
             // Step 1. If usages contains any entry which is not one of "encrypt", "decrypt",
             // "wrapKey" or "unwrapKey", then throw a SyntaxError.
-            if usages.iter().any(|usage| {
-                !matches!(
-                    usage,
-                    KeyUsage::Encrypt | KeyUsage::Decrypt | KeyUsage::WrapKey | KeyUsage::UnwrapKey
-                )
-            }) {
-                return Err(Error::Syntax(Some(
-                    "Usages contains an entry which is not one of \"encrypt\", \"decrypt\", \
-                    \"wrapKey\" or \"unwrapKey\""
-                        .to_string(),
-                )));
-            }
+            usages.ensure_only_contain_entries_from(&[
+                KeyUsage::Encrypt,
+                KeyUsage::Decrypt,
+                KeyUsage::WrapKey,
+                KeyUsage::UnwrapKey,
+            ])?;
         },
         AesAlgorithm::AesKw => {
             // Step 1. If usages contains any entry which is not one of "wrapKey" or "unwrapKey",
             // then throw a SyntaxError.
-            if usages
-                .iter()
-                .any(|usage| !matches!(usage, KeyUsage::WrapKey | KeyUsage::UnwrapKey))
-            {
-                return Err(Error::Syntax(Some(
-                    "Usages contains an entry which is not one of \"wrapKey\" or \"unwrapKey\""
-                        .to_string(),
-                )));
-            }
+            usages.ensure_only_contain_entries_from(&[KeyUsage::WrapKey, KeyUsage::UnwrapKey])?;
         },
     }
 
@@ -88,21 +73,21 @@ pub(crate) fn generate_key(
     // Step 4. If the key generation step fails, then throw an OperationError.
     let handle =
         match normalized_algorithm.length {
-            128 => {
-                let mut key_bytes = vec![0; 16];
-                OsRng.fill_bytes(&mut key_bytes);
-                Handle::Aes128Key(Key::<Aes128>::clone_from_slice(&key_bytes))
-            },
-            192 => {
-                let mut key_bytes = vec![0; 24];
-                OsRng.fill_bytes(&mut key_bytes);
-                Handle::Aes192Key(Key::<Aes192>::clone_from_slice(&key_bytes))
-            },
-            256 => {
-                let mut key_bytes = vec![0; 32];
-                OsRng.fill_bytes(&mut key_bytes);
-                Handle::Aes256Key(Key::<Aes256>::clone_from_slice(&key_bytes))
-            },
+            128 => Handle::Aes128Key(Key::<Aes128>::try_generate().map_err(|_| {
+                Error::Operation(Some(
+                    "Failed to generate AES key with length 128 bits".into(),
+                ))
+            })?),
+            192 => Handle::Aes192Key(Key::<Aes192>::try_generate().map_err(|_| {
+                Error::Operation(Some(
+                    "Failed to generate AES key with length 192 bits".into(),
+                ))
+            })?),
+            256 => Handle::Aes256Key(Key::<Aes256>::try_generate().map_err(|_| {
+                Error::Operation(Some(
+                    "Failed to generate AES key with length 256 bits".into(),
+                ))
+            })?),
             _ => return Err(Error::Operation(Some(
                 "The length member of normalizedAlgorithm is not equal to one of 128, 192 or 256"
                     .to_string(),
@@ -116,7 +101,7 @@ pub(crate) fn generate_key(
     // Step 9. Set the [[type]] internal slot of key to "secret".
     // Step 10. Set the [[algorithm]] internal slot of key to algorithm.
     // Step 11. Set the [[extractable]] internal slot of key to be extractable.
-    // Step 12. Set the [[usages]] internal slot of key to be usages.
+    // Step 12. Set the [[usages]] internal slot of key to be the normalized value of usages.
     let algorithm_name = match aes_algorithm {
         AesAlgorithm::AesCtr => {
             // Step 7. Set the name attribute of algorithm to "AES-CTR".
@@ -139,7 +124,7 @@ pub(crate) fn generate_key(
             CryptoAlgorithm::AesOcb
         },
     };
-    let algorithm = SubtleAesKeyAlgorithm {
+    let algorithm = AesKeyAlgorithm {
         name: algorithm_name,
         length: normalized_algorithm.length,
     };
@@ -149,7 +134,7 @@ pub(crate) fn generate_key(
         KeyType::Secret,
         extractable,
         KeyAlgorithmAndDerivatives::AesKeyAlgorithm(algorithm),
-        usages,
+        usages.normalized_value(),
         handle,
     );
 
@@ -170,9 +155,9 @@ pub(crate) fn generate_key(
 /// As it is simply used to name the variable, it is safe to omit it in the implementation below to
 /// align with the specification of other AES algorithms.
 pub(crate) fn import_key(
-    aes_algorithm: AesAlgorithm,
     cx: &mut JSContext,
     global: &GlobalScope,
+    aes_algorithm: AesAlgorithm,
     format: KeyFormat,
     key_data: &[u8],
     extractable: bool,
@@ -185,31 +170,17 @@ pub(crate) fn import_key(
         AesAlgorithm::AesOcb => {
             // Step 1. If usages contains an entry which is not one of "encrypt", "decrypt",
             // "wrapKey" or "unwrapKey", then throw a SyntaxError.
-            if usages.iter().any(|usage| {
-                !matches!(
-                    usage,
-                    KeyUsage::Encrypt | KeyUsage::Decrypt | KeyUsage::WrapKey | KeyUsage::UnwrapKey
-                )
-            }) {
-                return Err(Error::Syntax(Some(
-                    "Usages contains an entry which is not one of \"encrypt\", \"decrypt\", \
-                    \"wrapKey\"  or \"unwrapKey\""
-                        .to_string(),
-                )));
-            }
+            usages.ensure_only_contain_entries_from(&[
+                KeyUsage::Encrypt,
+                KeyUsage::Decrypt,
+                KeyUsage::WrapKey,
+                KeyUsage::UnwrapKey,
+            ])?;
         },
         AesAlgorithm::AesKw => {
             // Step 1. If usages contains an entry which is not one of "wrapKey" or "unwrapKey",
             // then throw a SyntaxError.
-            if usages
-                .iter()
-                .any(|usage| !matches!(usage, KeyUsage::WrapKey | KeyUsage::UnwrapKey))
-            {
-                return Err(Error::Syntax(Some(
-                    "Usages contains an entry which is not one of \"wrapKey\"  or \"unwrapKey\""
-                        .to_string(),
-                )));
-            }
+            usages.ensure_only_contain_entries_from(&[KeyUsage::WrapKey, KeyUsage::UnwrapKey])?;
         },
     }
 
@@ -463,16 +434,25 @@ pub(crate) fn import_key(
     // Step 7. Set the length attribute of algorithm to the length, in bits, of data.
     // Step 8. Set the [[algorithm]] internal slot of key to algorithm.
     let handle = match data.len() {
-        16 => Handle::Aes128Key(Key::<Aes128>::clone_from_slice(&data)),
-        24 => Handle::Aes192Key(Key::<Aes192>::clone_from_slice(&data)),
-        32 => Handle::Aes256Key(Key::<Aes256>::clone_from_slice(&data)),
+        16 => Handle::Aes128Key(
+            Key::<Aes128>::try_from(data.as_slice())
+                .map_err(|_| Error::Operation(Some("Invalid AES-128 key".into())))?,
+        ),
+        24 => Handle::Aes192Key(
+            Key::<Aes192>::try_from(data.as_slice())
+                .map_err(|_| Error::Operation(Some("Invalid AES-192 key".into())))?,
+        ),
+        32 => Handle::Aes256Key(
+            Key::<Aes256>::try_from(data.as_slice())
+                .map_err(|_| Error::Operation(Some("Invalid AES-256 key".into())))?,
+        ),
         _ => {
             return Err(Error::Data(Some(
                 "The length in bits of data is not 128, 192 or 256".to_string(),
             )));
         },
     };
-    let algorithm = SubtleAesKeyAlgorithm {
+    let algorithm = AesKeyAlgorithm {
         name: match &aes_algorithm {
             AesAlgorithm::AesCtr => {
                 // Step 6. Set the name attribute of algorithm to "AES-CTR".
@@ -503,7 +483,7 @@ pub(crate) fn import_key(
         KeyType::Secret,
         extractable,
         KeyAlgorithmAndDerivatives::AesKeyAlgorithm(algorithm),
-        usages,
+        usages.normalized_value(),
         handle,
     );
 
@@ -576,7 +556,7 @@ pub(crate) fn export_key(
             let mut jwk = JsonWebKey::default();
 
             // Step 2.2. Set the kty attribute of jwk to the string "oct".
-            jwk.kty = Some(DOMString::from("oct"));
+            jwk.kty = Some(DOMString::from_static("oct"));
 
             // Step 2.3. Set the k attribute of jwk to be a string containing the raw octets of the
             // key represented by [[handle]] internal slot of key, encoded according to Section 6.4
@@ -749,7 +729,7 @@ pub(crate) fn export_key(
 /// <https://w3c.github.io/webcrypto/#aes-kw-operations-get-key-length>
 /// <https://wicg.github.io/webcrypto-modern-algos/#aes-ocb-operations-get-key-length>
 pub(crate) fn get_key_length(
-    normalized_derived_key_algorithm: &SubtleAesDerivedKeyParams,
+    normalized_derived_key_algorithm: &AesDerivedKeyParams,
 ) -> Result<Option<u32>, Error> {
     // Step 1. If the length member of normalizedDerivedKeyAlgorithm is not 128, 192 or 256, then
     // throw an OperationError.

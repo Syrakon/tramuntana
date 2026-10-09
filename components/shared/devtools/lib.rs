@@ -27,10 +27,11 @@ pub use embedder_traits::ConsoleLogLevel;
 use embedder_traits::Theme;
 use http::{HeaderMap, Method};
 use malloc_size_of_derive::MallocSizeOf;
+use net_traits::TlsSecurityInfo;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::Destination;
-use net_traits::{DebugVec, TlsSecurityInfo};
 use profile_traits::mem::ReportsChan;
+use serde::de::{Error, Visitor};
 use serde::{Deserialize, Serialize};
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::GenericSender;
@@ -40,7 +41,7 @@ use uuid::Uuid;
 
 // Information would be attached to NewGlobal to be received and show in devtools.
 // Extend these fields if we need more information.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct DevtoolsPageInfo {
     pub title: String,
     pub url: ServoUrl,
@@ -139,6 +140,9 @@ pub enum ScriptToDevtoolsControlMsg {
     /// Get frame information from script
     CreateFrameActor(GenericSender<String>, PipelineId, FrameInfo),
 
+    /// Get object information from script
+    CreateObjectActor(GenericSender<String>, DebuggerValue),
+
     /// Get environment information from script
     CreateEnvironmentActor(
         GenericSender<String>,
@@ -158,8 +162,11 @@ pub enum DomMutation {
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ObjectPreview {
     pub kind: String,
+    pub size: Option<u32>,
+    pub entries: Option<Vec<(DebuggerValue, DebuggerValue)>>,
     pub own_properties: Option<Vec<PropertyDescriptor>>,
     pub own_properties_length: Option<u32>,
     pub function: Option<FunctionPreview>,
@@ -168,6 +175,7 @@ pub struct ObjectPreview {
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FunctionPreview {
     pub name: Option<String>,
     pub display_name: Option<String>,
@@ -176,22 +184,68 @@ pub struct FunctionPreview {
     pub is_generator: Option<bool>,
 }
 
+struct DebuggerNumberVisitor;
+
+impl Visitor<'_> for DebuggerNumberVisitor {
+    type Value = f64;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a debugger value number")
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(value)
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(value as f64)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(value as f64)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: Error,
+    {
+        value.parse().map_err(E::custom)
+    }
+}
+
+fn deserialize_debugger_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // `DebuggerValue` is also sent over Servo IPC, not only through debugger.js.
+    if !deserializer.is_human_readable() {
+        return f64::deserialize(deserializer);
+    }
+
+    deserializer.deserialize_any(DebuggerNumberVisitor)
+}
+
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[serde(rename_all_fields = "camelCase")]
 pub enum DebuggerValue {
     VoidValue,
-    NullValue,
+    NullValue(bool),
     BooleanValue(bool),
-    NumberValue(f64),
+    NumberValue(#[serde(deserialize_with = "deserialize_debugger_number")] f64),
     StringValue(String),
     ObjectValue {
-        uuid: String,
+        actor: Option<String>,
         class: String,
-        preview: Option<ObjectPreview>,
+        own_property_length: Option<u32>,
+        preview: Option<Box<ObjectPreview>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prototype: Option<Box<DebuggerValue>>,
     },
 }
 
 /// <https://searchfox.org/mozilla-central/source/devtools/server/actors/object/property-iterator.js#51>
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PropertyDescriptor {
     pub name: String,
     pub value: DebuggerValue,
@@ -202,19 +256,21 @@ pub struct PropertyDescriptor {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EvaluateJSReply {
     pub value: DebuggerValue,
+    pub exception_message: Option<String>,
     pub has_exception: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct AttrInfo {
     pub namespace: String,
     pub name: String,
     pub value: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
     pub unique_id: String,
@@ -331,6 +387,12 @@ pub struct AutoMargins {
     pub left: bool,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub enum GetHTMLType {
+    OuterHTML,
+    InnerHTML,
+}
+
 /// Messages to process in a particular script thread, as instructed by a devtools client.
 /// TODO: better error handling, e.g. if pipeline id lookup fails?
 #[derive(Debug, Deserialize, Serialize)]
@@ -369,6 +431,13 @@ pub enum DevtoolScriptControlMsg {
     ),
     /// Get a unique XPath selector for the node.
     GetXPath(PipelineId, String, GenericSender<String>),
+    /// Get inner/outer HTML on a node.
+    GetInnerOrOuterHTML(
+        PipelineId,
+        String,
+        GenericSender<Option<String>>,
+        GetHTMLType,
+    ),
     /// Update a given node's attributes with a list of modifications.
     ModifyAttribute(PipelineId, String, Vec<AttrModification>),
     /// Update a given node's style rules with a list of modifications.
@@ -400,7 +469,7 @@ pub enum DevtoolScriptControlMsg {
     /// Gets the list of all allowed CSS rules and possible values.
     GetCssDatabase(GenericSender<HashMap<String, CssDatabaseProperty>>),
     /// Simulates a light or dark color scheme for the given pipeline
-    SimulateColorScheme(PipelineId, Theme),
+    SimulateColorScheme(PipelineId, Option<Theme>),
     /// Highlight the given DOM node
     HighlightDomNode(PipelineId, Option<String>),
 
@@ -408,6 +477,7 @@ pub enum DevtoolScriptControlMsg {
         String,
         PipelineId,
         Option<String>,
+        bool,
         GenericSender<EvaluateJSReply>,
     ),
     GetPossibleBreakpoints(u32, GenericSender<Vec<RecommendedBreakpointLocation>>),
@@ -416,7 +486,21 @@ pub enum DevtoolScriptControlMsg {
     Interrupt,
     Resume(Option<String>, Option<String>),
     ListFrames(PipelineId, u32, u32, GenericSender<Vec<String>>),
-    GetEnvironment(String, GenericSender<String>),
+    GetEnvironment(GetEnvironmentRequest, GenericSender<String>),
+    Blackbox(u32, BlackboxCoverage),
+    Unblackbox(u32, BlackboxCoverage),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum GetEnvironmentRequest {
+    Global(PipelineId),
+    Frame(String),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum BlackboxCoverage {
+    Full,
+    Partial((u32, u32), (u32, u32)),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
@@ -487,7 +571,7 @@ pub struct HttpRequest {
     pub url: ServoUrl,
     pub method: Method,
     pub headers: HeaderMap,
-    pub body: Option<DebugVec>,
+    pub body: Option<bytes::Bytes>,
     pub pipeline_id: PipelineId,
     pub started_date_time: SystemTime,
     pub time_stamp: i64,
@@ -503,7 +587,7 @@ pub struct HttpResponse {
     #[ignore_malloc_size_of = "Http type"]
     pub headers: Option<HeaderMap>,
     pub status: HttpStatus,
-    pub body: Option<DebugVec>,
+    pub body: Option<bytes::Bytes>,
     pub from_cache: bool,
     pub pipeline_id: PipelineId,
     pub browsing_context_id: BrowsingContextId,
@@ -579,7 +663,7 @@ pub struct CssDatabaseProperty {
     pub subproperties: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, MallocSizeOf, Serialize)]
 pub enum ShadowRootMode {
     Open,
     Closed,
@@ -617,9 +701,10 @@ pub struct RecommendedBreakpointLocation {
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct FrameInfo {
-    pub display_name: String,
+    pub display_name: Option<String>,
     pub on_stack: bool,
     pub oldest: bool,
+    pub this_value: DebuggerValue,
     pub terminated: bool,
     pub type_: String,
     pub url: String,
@@ -630,6 +715,7 @@ pub struct EnvironmentInfo {
     pub type_: Option<String>,
     pub scope_kind: Option<String>,
     pub function_display_name: Option<String>,
+    pub object: Option<DebuggerValue>,
     pub binding_variables: Vec<PropertyDescriptor>,
 }
 

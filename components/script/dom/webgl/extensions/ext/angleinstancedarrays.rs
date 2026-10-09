@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_canvas_traits::webgl::WebGLVersion;
 
@@ -13,7 +14,6 @@ use crate::dom::bindings::codegen::Bindings::ANGLEInstancedArraysBinding::{
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct ANGLEInstancedArrays {
@@ -33,11 +33,11 @@ impl ANGLEInstancedArrays {
 impl WebGLExtension for ANGLEInstancedArrays {
     type Extension = Self;
 
-    fn new(ctx: &WebGLRenderingContext, can_gc: CanGc) -> DomRoot<Self> {
+    fn new(cx: &mut JSContext, ctx: &WebGLRenderingContext) -> DomRoot<Self> {
         reflect_dom_object(
+            cx,
             Box::new(ANGLEInstancedArrays::new_inherited(ctx)),
             &*ctx.global(),
-            can_gc,
         )
     }
 
@@ -67,17 +67,25 @@ impl WebGLExtension for ANGLEInstancedArrays {
 
 impl ANGLEInstancedArraysMethods<crate::DomTypeHolder> for ANGLEInstancedArrays {
     /// <https://www.khronos.org/registry/webgl/extensions/ANGLE_instanced_arrays/>
-    fn DrawArraysInstancedANGLE(&self, mode: u32, first: i32, count: i32, primcount: i32) {
+    fn DrawArraysInstancedANGLE(
+        &self,
+        cx: &mut JSContext,
+        mode: u32,
+        first: i32,
+        count: i32,
+        primcount: i32,
+    ) {
         handle_potential_webgl_error!(
             self.ctx,
             self.ctx
-                .draw_arrays_instanced(mode, first, count, primcount)
+                .draw_arrays_instanced(cx, mode, first, count, primcount)
         )
     }
 
     /// <https://www.khronos.org/registry/webgl/extensions/ANGLE_instanced_arrays/>
     fn DrawElementsInstancedANGLE(
         &self,
+        cx: &mut JSContext,
         mode: u32,
         count: i32,
         type_: u32,
@@ -87,11 +95,11 @@ impl ANGLEInstancedArraysMethods<crate::DomTypeHolder> for ANGLEInstancedArrays 
         handle_potential_webgl_error!(
             self.ctx,
             self.ctx
-                .draw_elements_instanced(mode, count, type_, offset, primcount)
+                .draw_elements_instanced(cx, mode, count, type_, offset, primcount)
         )
     }
 
-    fn VertexAttribDivisorANGLE(&self, index: u32, divisor: u32) {
-        self.ctx.vertex_attrib_divisor(index, divisor);
+    fn VertexAttribDivisorANGLE(&self, cx: &mut JSContext, index: u32, divisor: u32) {
+        self.ctx.vertex_attrib_divisor(cx, index, divisor);
     }
 }

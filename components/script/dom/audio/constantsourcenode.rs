@@ -2,13 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::f32;
-
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::rust::HandleObject;
 use script_bindings::reflector::reflect_dom_object_with_proto;
+use servo_media::audio::audio_node::{AudioNodeInit, AudioNodeType};
 use servo_media::audio::constant_source_node::ConstantSourceNodeOptions as ServoMediaConstantSourceOptions;
-use servo_media::audio::node::{AudioNodeInit, AudioNodeType};
 use servo_media::audio::param::ParamType;
 
 use crate::conversions::Convert;
@@ -22,7 +21,6 @@ use crate::dom::bindings::codegen::Bindings::ConstantSourceNodeBinding::{
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct ConstantSourceNode {
@@ -33,14 +31,15 @@ pub(crate) struct ConstantSourceNode {
 impl ConstantSourceNode {
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_inherited(
+        cx: &mut JSContext,
         window: &Window,
         context: &BaseAudioContext,
         options: &ConstantSourceOptions,
-        can_gc: CanGc,
     ) -> Fallible<ConstantSourceNode> {
         let node_options = Default::default();
         let offset = *options.offset;
         let source_node = AudioScheduledSourceNode::new_inherited(
+            cx,
             AudioNodeInit::ConstantSourceNode(options.convert()),
             context,
             node_options, /* 2, MAX, Speakers */
@@ -48,7 +47,9 @@ impl ConstantSourceNode {
             1,            /* outputs */
         )?;
         let node_id = source_node.node().node_id();
+        // <https://webaudio.github.io/web-audio-api/#dom-constantsourcenode-offset>
         let offset = AudioParam::new(
+            cx,
             window,
             context,
             node_id,
@@ -58,7 +59,6 @@ impl ConstantSourceNode {
             offset,
             f32::MIN,
             f32::MAX,
-            can_gc,
         );
 
         Ok(ConstantSourceNode {
@@ -68,28 +68,28 @@ impl ConstantSourceNode {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         context: &BaseAudioContext,
         options: &ConstantSourceOptions,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<ConstantSourceNode>> {
-        Self::new_with_proto(window, None, context, options, can_gc)
+        Self::new_with_proto(cx, window, None, context, options)
     }
 
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     fn new_with_proto(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
         context: &BaseAudioContext,
         options: &ConstantSourceOptions,
-        can_gc: CanGc,
     ) -> Fallible<DomRoot<ConstantSourceNode>> {
-        let node = ConstantSourceNode::new_inherited(window, context, options, can_gc)?;
+        let node = ConstantSourceNode::new_inherited(cx, window, context, options)?;
         Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(node),
             window,
             proto,
-            can_gc,
         ))
     }
 }
@@ -97,13 +97,13 @@ impl ConstantSourceNode {
 impl ConstantSourceNodeMethods<crate::DomTypeHolder> for ConstantSourceNode {
     /// <https://webaudio.github.io/web-audio-api/#dom-constantsourcenode-constantsourcenode>
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         context: &BaseAudioContext,
         options: &ConstantSourceOptions,
     ) -> Fallible<DomRoot<ConstantSourceNode>> {
-        ConstantSourceNode::new_with_proto(window, proto, context, options, can_gc)
+        ConstantSourceNode::new_with_proto(cx, window, proto, context, options)
     }
 
     /// <https://webaudio.github.io/web-audio-api/#dom-constantsourcenode-offset>

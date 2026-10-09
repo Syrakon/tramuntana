@@ -15,15 +15,17 @@ use servo::{
     KeyboardEvent, LoadStatus, MediaSessionActionType, MediaSessionEvent, MouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences, RefreshDriver,
     RenderingContext, ScreenGeometry, Scroll, Servo, ServoBuilder, SimpleDialog, TouchEvent,
-    TouchEventType, TouchId, UserContentManager, WebView, WebViewId, WindowRenderingContext,
-    convert_rect_to_css_pixel,
+    TouchEventType, TouchId, TouchPointerType, UserContentManager, WebView, WebViewId,
+    WindowRenderingContext, convert_rect_to_css_pixel,
 };
 use url::Url;
 
 use crate::egl::host_trait::HostTrait;
 use crate::prefs::ServoShellPreferences;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
-use crate::window::{PlatformWindow, ServoShellWindow, ServoShellWindowId};
+use crate::window::{
+    PlatformWindow, ServoShellWindow, ServoShellWindowId, TopLevelWebViewCreationRequest,
+};
 
 pub(crate) struct EmbeddedPlatformWindow {
     host: Rc<dyn HostTrait>,
@@ -78,8 +80,6 @@ impl PlatformWindow for EmbeddedPlatformWindow {
         false
     }
 
-    fn rebuild_user_interface(&self, _: &RunningAppState, _: &ServoShellWindow) {}
-
     #[cfg_attr(
         not(all(feature = "tracing", feature = "tracing-hitrace")),
         expect(unused_variables)
@@ -130,31 +130,33 @@ impl PlatformWindow for EmbeddedPlatformWindow {
         let load_status_changed = Some(new_load_status) != self.current_load_status.get();
         if load_status_changed {
             self.host.notify_load_status_changed(new_load_status);
-
-            #[cfg(all(feature = "tracing", feature = "tracing-hitrace"))]
-            if new_load_status == LoadStatus::Complete {
-                let (callback, receiver) =
-                    servo_base::generic_channel::GenericCallback::new_blocking()
-                        .expect("Could not create channel");
-                state.servo().create_memory_report(callback);
-                std::thread::spawn(move || {
-                    let result = receiver.recv().expect("Could not get memory report");
-                    let reports = result
-                        .results
-                        .first()
-                        .expect("We should have some memory report");
-                    let search_string = String::from("resident-according-to-smaps");
-                    let sum = reports
-                        .reports
-                        .iter()
-                        .filter(|report| report.path.contains(&search_string))
-                        .map(|report| report.size)
-                        .sum::<usize>();
-                    hitrace::trace_metric_str(
-                        "servo_memory_profiling:resident-according-to-smaps/sum",
-                        sum as i64,
-                    );
-                });
+            if state.servoshell_preferences.memory_output && new_load_status == LoadStatus::Complete
+            {
+                #[cfg(all(feature = "tracing", feature = "tracing-hitrace"))]
+                {
+                    let (callback, receiver) =
+                        servo_base::generic_channel::GenericCallback::new_blocking()
+                            .expect("Could not create channel");
+                    state.servo().create_memory_report(callback);
+                    std::thread::spawn(move || {
+                        let result = receiver.recv().expect("Could not get memory report");
+                        let reports = result
+                            .results
+                            .first()
+                            .expect("We should have some memory report");
+                        let search_string = String::from("resident-according-to-smaps");
+                        let sum = reports
+                            .reports
+                            .iter()
+                            .filter(|report| report.path.contains(&search_string))
+                            .map(|report| report.size)
+                            .sum::<usize>();
+                        hitrace::trace_metric_str(
+                            "servo_memory_profiling:resident-according-to-smaps/sum",
+                            sum as i64,
+                        );
+                    });
+                }
             }
         }
 
@@ -180,23 +182,23 @@ impl PlatformWindow for EmbeddedPlatformWindow {
         )
     }
 
-    fn show_embedder_control(&self, _: WebViewId, embedder_control: EmbedderControl) {
+    fn show_embedder_control(&self, webview_id: WebViewId, embedder_control: EmbedderControl) {
         let control_id = embedder_control.id();
         match embedder_control {
-            EmbedderControl::InputMethod(input_method_control) => {
-                if input_method_control.allow_virtual_keyboard() {
-                    self.visible_input_methods.borrow_mut().push(control_id);
-                    self.host.on_ime_show(input_method_control);
-                }
+            EmbedderControl::InputMethod(input_method_control)
+                if input_method_control.allow_virtual_keyboard() =>
+            {
+                self.visible_input_methods.borrow_mut().push(control_id);
+                self.host.on_ime_show(input_method_control);
             },
-            EmbedderControl::SimpleDialog(simple_dialog) => match simple_dialog {
-                SimpleDialog::Alert(alert_dialog) => {
-                    self.host.show_alert(alert_dialog.message().into());
-                    alert_dialog.confirm();
-                },
-                _ => {}, // The drop implementation will send the default response.
+            EmbedderControl::SelectElement(prompt) => {
+                self.host.on_show_select_element(webview_id, prompt);
             },
-            _ => {},
+            EmbedderControl::SimpleDialog(SimpleDialog::Alert(alert_dialog)) => {
+                self.host.show_alert(alert_dialog.message().into());
+                alert_dialog.confirm();
+            },
+            _ => {}, // The drop implementation will send the default response.
         }
     }
 
@@ -239,12 +241,24 @@ impl PlatformWindow for EmbeddedPlatformWindow {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct VsyncRefreshDriver {
     start_frame_callbacks: RefCell<Vec<Box<dyn Fn() + Send>>>,
+    /// On OHOS we own the `OH_NativeVSync` handle and request a single callback
+    /// only when an observer asks for one.
+    #[cfg(target_env = "ohos")]
+    native_vsync: ohos_vsync::NativeVsync,
 }
 
 impl VsyncRefreshDriver {
+    pub(crate) fn new() -> Self {
+        Self {
+            start_frame_callbacks: Default::default(),
+            #[cfg(target_env = "ohos")]
+            native_vsync: ohos_vsync::NativeVsync::new("ServoVsync")
+                .expect("Failed to create NativeVsync"),
+        }
+    }
+
     fn notify_vsync(&self) {
         let start_frame_callbacks: Vec<_> =
             self.start_frame_callbacks.borrow_mut().drain(..).collect();
@@ -256,9 +270,19 @@ impl VsyncRefreshDriver {
 
 impl RefreshDriver for VsyncRefreshDriver {
     fn observe_next_frame(&self, new_start_frame_callback: Box<dyn Fn() + Send + 'static>) {
-        self.start_frame_callbacks
-            .borrow_mut()
-            .push(new_start_frame_callback);
+        // We only need to request a vsync callback if the queue is empty,
+        // otherwise we will already have a pending callback.
+        #[cfg_attr(not(target_env = "ohos"), allow(unused_variables))]
+        let was_empty = {
+            let mut callbacks = self.start_frame_callbacks.borrow_mut();
+            let was_empty = callbacks.is_empty();
+            callbacks.push(new_start_frame_callback);
+            was_empty
+        };
+        #[cfg(target_env = "ohos")]
+        if was_empty {
+            super::ohos::request_vsync_callback(&self.native_vsync);
+        }
     }
 }
 
@@ -290,10 +314,9 @@ impl App {
             .opts(init.opts)
             .preferences(init.preferences.clone())
             .event_loop_waker(init.event_loop_waker.clone());
-        #[cfg(feature = "webxr")]
-        let servo_builder = servo_builder
-            .webxr_registry(Box::new(XrDiscoveryWebXrRegistry::new(init.xr_discovery)));
         let servo = servo_builder.build();
+        #[cfg(feature = "webxr")]
+        servo.register_webxr_registry(Box::new(XrDiscoveryWebXrRegistry::new(init.xr_discovery)));
 
         let initial_url = init.initial_url.and_then(|string| Url::parse(&string).ok());
         let initial_url = initial_url
@@ -326,7 +349,7 @@ impl App {
         window_id: Option<ServoShellWindowId>,
     ) {
         let viewport_size = viewport_rect.size;
-        let refresh_driver = Rc::new(VsyncRefreshDriver::default());
+        let refresh_driver = Rc::new(VsyncRefreshDriver::new());
         let rendering_context = Rc::new(
             WindowRenderingContext::new_with_refresh_driver(
                 display_handle,
@@ -351,8 +374,10 @@ impl App {
             current_can_go_forward: Default::default(),
             current_load_status: Default::default(),
         });
-        self.state
-            .open_window(platform_window.clone(), self.initial_url.clone());
+        self.state.open_window(
+            platform_window,
+            TopLevelWebViewCreationRequest::WithUrl(self.initial_url.clone()),
+        );
     }
 
     pub(crate) fn servo(&self) -> &Servo {
@@ -367,7 +392,6 @@ impl App {
         self.state
             .focused_window()
             .expect("There is always an active window")
-            .clone()
     }
 
     pub(crate) fn active_or_newest_webview(&self) -> Option<WebView> {
@@ -379,13 +403,18 @@ impl App {
     }
 
     pub(crate) fn create_and_activate_toplevel_webview(self: &Rc<Self>, url: Url) -> WebView {
-        self.window()
-            .create_and_activate_toplevel_webview(self.state.clone(), url)
+        self.window().create_and_activate_toplevel_webview(
+            self.state.clone(),
+            TopLevelWebViewCreationRequest::WithUrl(url),
+        )
     }
 
     /// The active webview will be immediately valid via `active_or_newest_webview()`
     pub(crate) fn activate_webview(&self, id: WebViewId) {
-        self.state.window_for_webview_id(id).activate_webview(id);
+        let Some(webview) = self.state.webview_by_id(id) else {
+            return;
+        };
+        self.state.window_for_webview(&webview).activate_webview(id);
     }
 
     /// This is the Servo heartbeat. This needs to be called
@@ -466,6 +495,7 @@ impl App {
                 TouchEventType::Down,
                 TouchId(pointer_id),
                 DevicePoint::new(x, y).into(),
+                TouchPointerType::Touch,
             )));
             self.spin_event_loop();
         }
@@ -478,6 +508,7 @@ impl App {
                 TouchEventType::Move,
                 TouchId(pointer_id),
                 DevicePoint::new(x, y).into(),
+                TouchPointerType::Touch,
             )));
             self.spin_event_loop();
         }
@@ -490,6 +521,7 @@ impl App {
                 TouchEventType::Up,
                 TouchId(pointer_id),
                 DevicePoint::new(x, y).into(),
+                TouchPointerType::Touch,
             )));
             self.spin_event_loop();
         }
@@ -502,6 +534,7 @@ impl App {
                 TouchEventType::Cancel,
                 TouchId(pointer_id),
                 DevicePoint::new(x, y).into(),
+                TouchPointerType::Touch,
             )));
             self.spin_event_loop();
         }
@@ -588,6 +621,13 @@ impl App {
         }
     }
 
+    pub fn key_event(&self, event: keyboard_types::KeyboardEvent) {
+        if let Some(webview) = self.active_or_newest_webview() {
+            webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::new(event)));
+            self.spin_event_loop();
+        }
+    }
+
     pub fn ime_insert_text(&self, text: String) {
         // In OHOS, we get empty text after the intended text.
         if text.is_empty() {
@@ -620,22 +660,14 @@ impl App {
         }
     }
 
-    pub fn set_throttled(&self, throttled: bool) {
-        if let Some(webview) = self.active_or_newest_webview() {
-            webview.set_throttled(throttled);
-            self.spin_event_loop();
-        }
-    }
-
     pub fn ime_dismissed(&self) {
         if let Some(webview) = self.active_or_newest_webview() {
             webview.notify_input_event(InputEvent::Ime(ImeEvent::Dismissed));
-            self.spin_event_loop();
         }
+        self.host.on_ime_hide();
+        self.spin_event_loop();
     }
 
-    // TODO: Instead of letting the embedder drive the RefreshDriver we should move the vsync
-    // notification directly into the VsyncRefreshDriver.
     pub fn notify_vsync(&self) {
         let platform_window = self.window().platform_window();
         let embedded_platform_window = platform_window

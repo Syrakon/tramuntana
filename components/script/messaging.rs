@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::option::Option;
 use std::result::Result;
 
-use crossbeam_channel::{Receiver, SendError, Sender, select};
+use crossbeam_channel::{Receiver, Select, SelectedOperation, SendError, Sender};
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg};
 use embedder_traits::{EmbedderControlId, EmbedderControlResponse, ScriptToEmbedderChan};
 use net_traits::FetchResponseMsg;
@@ -34,17 +34,19 @@ use crate::dom::dedicatedworkerglobalscope::DedicatedWorkerScriptMsg;
 use crate::dom::serviceworkerglobalscope::ServiceWorkerScriptMsg;
 use crate::dom::sharedworkerglobalscope::SharedWorkerScriptMsg;
 use crate::dom::worker::TrustedWorkerAddress;
-use crate::script_runtime::ScriptThreadEventCategory;
-use crate::task::TaskBox;
-use crate::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
-use crate::task_source::TaskSourceName;
+use crate::dom::{WorkletControl, WorkletExecutor};
+use crate::runtime::script_runtime::ScriptThreadEventCategory;
+use crate::tasks::task::TaskBox;
+use crate::tasks::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
+use crate::tasks::task_source::TaskSourceName;
 
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
+// We box only the devtools message because it is the largest and least used message.
 pub(crate) enum MixedMessage {
     FromConstellation(ScriptThreadMessage),
     FromScript(MainThreadScriptMsg),
-    FromDevtools(DevtoolScriptControlMsg),
+    FromDevtools(Box<DevtoolScriptControlMsg>),
     FromImageCache(ImageCacheResponseMessage),
     #[cfg(feature = "webgpu")]
     FromWebGPUServer(WebGPUMsg),
@@ -60,7 +62,7 @@ impl MixedMessage {
                     .parent_info
                     .or(Some(new_pipeline_info.new_pipeline_id)),
                 ScriptThreadMessage::Resize(id, ..) => Some(*id),
-                ScriptThreadMessage::ThemeChange(id, ..) => Some(*id),
+                ScriptThreadMessage::UpdateWebViewState(..) => None,
                 ScriptThreadMessage::ResizeInactive(id, ..) => Some(*id),
                 ScriptThreadMessage::UnloadDocument(id) => Some(*id),
                 ScriptThreadMessage::ExitPipeline(_webview_id, id, ..) => Some(*id),
@@ -69,9 +71,9 @@ impl MixedMessage {
                 ScriptThreadMessage::RefreshCursor(id, ..) => Some(*id),
                 ScriptThreadMessage::GetTitle(id) => Some(*id),
                 ScriptThreadMessage::GetDocumentOrigin(id, _) => Some(*id),
+                ScriptThreadMessage::GetDocumentOriginDetails(id, _) => Some(*id),
                 ScriptThreadMessage::SetDocumentActivity(id, ..) => Some(*id),
-                ScriptThreadMessage::SetThrottled(_, id, ..) => Some(*id),
-                ScriptThreadMessage::SetThrottledInContainingIframe(_, id, ..) => Some(*id),
+                ScriptThreadMessage::SetThrottled(id, ..) => Some(*id),
                 ScriptThreadMessage::NavigateIframe(id, ..) => Some(*id),
                 ScriptThreadMessage::PostMessage { target: id, .. } => Some(*id),
                 ScriptThreadMessage::UpdatePipelineId(_, _, _, id, _) => Some(*id),
@@ -83,7 +85,7 @@ impl MixedMessage {
                 ScriptThreadMessage::FocusDocument(id, ..) => Some(*id),
                 ScriptThreadMessage::WebDriverScriptCommand(id, ..) => Some(*id),
                 ScriptThreadMessage::TickAllAnimations(..) => None,
-                ScriptThreadMessage::WebFontLoaded(id) => Some(*id),
+                ScriptThreadMessage::WebFontLoadFinished(id, ..) => Some(*id),
                 ScriptThreadMessage::DispatchIFrameLoadEvent {
                     target: _,
                     parent: id,
@@ -109,6 +111,7 @@ impl MixedMessage {
                 ScriptThreadMessage::DestroyUserContentManager(..) => None,
                 ScriptThreadMessage::UpdatePinchZoomInfos(id, _) => Some(*id),
                 ScriptThreadMessage::SetAccessibilityActive(..) => None,
+                ScriptThreadMessage::ForwardAccessibilityAction(id, _) => Some(*id),
                 ScriptThreadMessage::TriggerGarbageCollection => None,
             },
             MixedMessage::FromScript(inner_msg) => match inner_msg {
@@ -173,7 +176,8 @@ pub(crate) enum MainThreadScriptMsg {
     ForwardEmbedderControlResponseFromFileManager(EmbedderControlId, EmbedderControlResponse),
 }
 
-/// Common messages used to control the event loops in both the script and the worker
+/// Common messages used to control the event loops in both the script, the worker, and the
+/// worklet
 pub(crate) enum CommonScriptMsg {
     /// Requests that the script thread measure its memory usage. The results are sent back via the
     /// supplied channel.
@@ -212,6 +216,8 @@ pub(crate) enum ScriptEventLoopSender {
     SharedWorker(Sender<SharedWorkerScriptMsg>),
     /// A sender that sends to a `ServiceWorker` event loop.
     ServiceWorker(Sender<ServiceWorkerScriptMsg>),
+    /// A wrapper that sends to the event loops of all threads belonging to a `Worklet`
+    Worklet(WorkletExecutor),
     /// A sender that sends to a dedicated worker (such as a generic Web Worker) event loop.
     /// Note that this sender keeps the main thread Worker DOM object alive as long as it or
     /// or any message it sends is not dropped.
@@ -249,6 +255,9 @@ impl ScriptEventLoopSender {
                         common_message,
                     ))
                     .map_err(|_| SendError(()))
+            },
+            Self::Worklet(executor) => {
+                executor.send_control_message(WorkletControl::Common(message))
             },
         }
     }
@@ -362,7 +371,9 @@ impl QueuedTaskConversion for MainThreadScriptMsg {
 
 impl OpaqueSender<CommonScriptMsg> for ScriptEventLoopSender {
     fn send(&self, message: CommonScriptMsg) {
-        self.send(message).unwrap()
+        if self.send(message).is_err() {
+            log::warn!("Error communicating with the target thread from the profiler");
+        }
     }
 }
 
@@ -443,37 +454,64 @@ impl ScriptThreadReceivers {
         timer_scheduler: &TimerScheduler,
         fully_active: &FxHashSet<PipelineId>,
     ) -> MixedMessage {
-        select! {
-            recv(task_queue.select()) -> msg => {
-                task_queue.take_tasks(msg.unwrap(), fully_active);
-                let event = task_queue
-                    .recv()
-                    .expect("Spurious wake-up of the event-loop, task-queue has no tasks available");
+        let mut select = Select::new();
+
+        let task_recv = task_queue.select();
+        let task_index = select.recv(task_recv);
+        let constellation_index = select.recv(&self.constellation_receiver);
+        let devtools_index = select.recv(&self.devtools_server_receiver);
+        let image_cache_index = select.recv(&self.image_cache_receiver);
+
+        #[cfg(feature = "webgpu")]
+        let webgpu_receiver = self.webgpu_receiver.borrow();
+        #[cfg(feature = "webgpu")]
+        let webgpu_index = select.recv(&*webgpu_receiver);
+
+        let message_from_operation = |operation: SelectedOperation| {
+            let index = operation.index();
+            if index == task_index {
+                let msg = operation.recv(task_recv).unwrap();
+                task_queue.take_tasks(msg, fully_active);
+                let event = task_queue.recv().expect(
+                    "Spurious wake-up of the event-loop, task-queue has no tasks available",
+                );
                 MixedMessage::FromScript(event)
-            },
-            recv(self.constellation_receiver) -> msg => MixedMessage::FromConstellation(msg.unwrap().unwrap()),
-            recv(self.devtools_server_receiver) -> msg => MixedMessage::FromDevtools(msg.unwrap().unwrap()),
-            recv(self.image_cache_receiver) -> msg => MixedMessage::FromImageCache(msg.unwrap()),
-            recv(timer_scheduler.wait_channel()) -> _ => MixedMessage::TimerFired,
-            recv({
+            } else if index == constellation_index {
+                MixedMessage::FromConstellation(
+                    operation
+                        .recv(&self.constellation_receiver)
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else if index == devtools_index {
+                MixedMessage::FromDevtools(Box::new(
+                    operation
+                        .recv(&self.devtools_server_receiver)
+                        .unwrap()
+                        .unwrap(),
+                ))
+            } else if index == image_cache_index {
+                MixedMessage::FromImageCache(operation.recv(&self.image_cache_receiver).unwrap())
+            } else {
                 #[cfg(feature = "webgpu")]
                 {
-                    self.webgpu_receiver.borrow()
+                    debug_assert_eq!(index, webgpu_index);
+                    MixedMessage::FromWebGPUServer(
+                        operation.recv(&*webgpu_receiver).unwrap().unwrap(),
+                    )
                 }
                 #[cfg(not(feature = "webgpu"))]
-                {
-                    crossbeam_channel::never::<()>()
-                }
-            }) -> msg => {
-                #[cfg(feature = "webgpu")]
-                {
-                    MixedMessage::FromWebGPUServer(msg.unwrap().unwrap())
-                }
-                #[cfg(not(feature = "webgpu"))]
-                {
-                    unreachable!("This should never be hit when webgpu is disabled ({msg:?})");
-                }
+                unreachable!("select returned an unknown index {index}")
             }
+        };
+
+        if let Some(deadline) = timer_scheduler.next_deadline() {
+            select
+                .select_deadline(deadline)
+                .map(message_from_operation)
+                .unwrap_or(MixedMessage::TimerFired)
+        } else {
+            message_from_operation(select.select())
         }
     }
 
@@ -499,7 +537,7 @@ impl ScriptThreadReceivers {
             return MixedMessage::FromScript(message).into();
         }
         if let Ok(message) = self.devtools_server_receiver.try_recv() {
-            return MixedMessage::FromDevtools(message.unwrap()).into();
+            return MixedMessage::FromDevtools(Box::new(message.unwrap())).into();
         }
         if let Ok(message) = self.image_cache_receiver.try_recv() {
             return MixedMessage::FromImageCache(message).into();

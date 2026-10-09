@@ -8,19 +8,20 @@ use malloc_size_of_derive::MallocSizeOf;
 use servo_media_streams::{MediaSocket, MediaStreamId};
 
 use crate::analyser_node::AnalyserNode;
+use crate::audio_node::{AudioNodeEngine, AudioNodeInit, AudioNodeMessage, BlockInfo, ChannelInfo};
 use crate::biquad_filter_node::BiquadFilterNode;
 use crate::block::{Chunk, FRAMES_PER_BLOCK, Tick};
 use crate::buffer_source_node::AudioBufferSourceNode;
 use crate::channel_node::{ChannelMergerNode, ChannelSplitterNode};
 use crate::constant_source_node::ConstantSourceNode;
 use crate::context::{AudioContextOptions, ProcessingState, StateChangeResult};
+use crate::delay_node::DelayNode;
 use crate::gain_node::GainNode;
 use crate::graph::{AudioGraph, InputPort, NodeId, OutputPort, PortId};
 use crate::iir_filter_node::IIRFilterNode;
 use crate::media_element_source_node::MediaElementSourceNode;
 use crate::media_stream_destination_node::MediaStreamDestinationNode;
 use crate::media_stream_source_node::MediaStreamSourceNode;
-use crate::node::{AudioNodeEngine, AudioNodeInit, AudioNodeMessage, BlockInfo, ChannelInfo};
 use crate::offline_sink::OfflineAudioSink;
 use crate::oscillator_node::OscillatorNode;
 use crate::panner_node::PannerNode;
@@ -215,6 +216,7 @@ impl AudioRenderThread {
             AudioNodeInit::BiquadFilterNode(options) => {
                 Box::new(BiquadFilterNode::new(options, ch, self.sample_rate))
             },
+            AudioNodeInit::DelayNode(options) => Box::new(DelayNode::new(options, ch)),
             AudioNodeInit::GainNode(options) => Box::new(GainNode::new(options, ch)),
             AudioNodeInit::StereoPannerNode(options) => {
                 Box::new(StereoPannerNode::new(options, ch))

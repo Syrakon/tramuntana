@@ -20,7 +20,7 @@ use js::jsapi::{GCTraceKindToAscii, Heap, JSObject, JSTracer, TraceKind};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use parking_lot::RwLock;
 use servo_arc::Arc as ServoArc;
-use servo_base::text::{Utf8CodeUnitLength, Utf16CodeUnitLength};
+use servo_base::text::{Utf8CodeUnits, Utf16CodeUnits};
 use smallvec::SmallVec;
 use style::author_styles::AuthorStyles;
 use style::stylesheet_set::{AuthorStylesheetSet, DocumentStylesheetSet};
@@ -37,6 +37,7 @@ use crate::JSTraceable;
 use crate::error::Error;
 use crate::reflector::Reflector;
 use crate::str::USVString;
+use crate::tasks::TaskBox;
 
 /// Trace the `JSObject` held by `reflector`.
 ///
@@ -88,6 +89,7 @@ macro_rules! unsafe_no_jsmanaged_fields(
 
 unsafe_no_jsmanaged_fields!(USVString);
 unsafe_no_jsmanaged_fields!(Error);
+unsafe_no_jsmanaged_fields!(Box<dyn TaskBox>);
 
 /// A trait to allow tracing only DOM sub-objects.
 ///
@@ -148,7 +150,7 @@ unsafe impl<T: JSTraceable + Eq + Hash> CustomTraceable for indexmap::IndexSet<T
 
 // XXXManishearth Check if the following three are optimized to no-ops
 // if e.trace() is a no-op (e.g it is an unsafe_no_jsmanaged_fields type)
-unsafe impl<T: JSTraceable + 'static> CustomTraceable for SmallVec<[T; 1]> {
+unsafe impl<T: JSTraceable + 'static, const N: usize> CustomTraceable for SmallVec<[T; N]> {
     #[inline]
     unsafe fn trace(&self, trc: *mut JSTracer) {
         for e in self.iter() {
@@ -425,12 +427,12 @@ impl<T: MallocSizeOf> MallocSizeOf for NoTrace<T> {
     }
 }
 
-unsafe impl CustomTraceable for Utf8CodeUnitLength {
+unsafe impl CustomTraceable for Utf8CodeUnits {
     #[inline]
     unsafe fn trace(&self, _: *mut JSTracer) {}
 }
 
-unsafe impl CustomTraceable for Utf16CodeUnitLength {
+unsafe impl CustomTraceable for Utf16CodeUnits {
     #[inline]
     unsafe fn trace(&self, _: *mut JSTracer) {}
 }

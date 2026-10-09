@@ -6,6 +6,7 @@ use std::cell::{Ref, RefCell};
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::rust::{HandleObject, MutableHandleValue};
 use net_traits::image_cache::Image;
 use script_bindings::cell::DomRefCell;
@@ -22,8 +23,7 @@ use crate::dom::element::Element;
 use crate::dom::filelist::FileList;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::window::Window;
-use crate::drag_data_store::{DragDataStore, Mode};
-use crate::script_runtime::CanGc;
+use crate::drag::drag_data_store::{DragDataStore, Mode};
 
 const VALID_DROP_EFFECTS: [&str; 4] = ["none", "copy", "link", "move"];
 const VALID_EFFECTS_ALLOWED: [&str; 9] = [
@@ -56,35 +56,35 @@ impl DataTransfer {
     ) -> DataTransfer {
         DataTransfer {
             reflector_: Reflector::new(),
-            drop_effect: DomRefCell::new(DOMString::from("none")),
-            effect_allowed: DomRefCell::new(DOMString::from("none")),
+            drop_effect: DomRefCell::new(DOMString::from_static("none")),
+            effect_allowed: DomRefCell::new(DOMString::from_static("none")),
             items: Dom::from_ref(item_list),
             data_store,
         }
     }
 
     pub(crate) fn new_with_proto(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         data_store: Rc<RefCell<Option<DragDataStore>>>,
     ) -> DomRoot<DataTransfer> {
-        let item_list = DataTransferItemList::new(window, Rc::clone(&data_store), can_gc);
+        let item_list = DataTransferItemList::new(cx, window, Rc::clone(&data_store));
 
         reflect_dom_object_with_proto(
+            cx,
             Box::new(DataTransfer::new_inherited(data_store, &item_list)),
             window,
             proto,
-            can_gc,
         )
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         data_store: Rc<RefCell<Option<DragDataStore>>>,
-        can_gc: CanGc,
     ) -> DomRoot<DataTransfer> {
-        Self::new_with_proto(window, None, can_gc, data_store)
+        Self::new_with_proto(cx, window, None, data_store)
     }
 
     pub(crate) fn data_store(&self) -> Option<Ref<'_, DragDataStore>> {
@@ -95,16 +95,16 @@ impl DataTransfer {
 impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
     /// <https://html.spec.whatwg.org/multipage/#dom-datatransfer>
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<DataTransfer> {
         let mut drag_data_store = DragDataStore::new();
         drag_data_store.set_mode(Mode::ReadWrite);
 
         let data_store = Rc::new(RefCell::new(Some(drag_data_store)));
 
-        DataTransfer::new_with_proto(window, proto, can_gc, data_store)
+        DataTransfer::new_with_proto(cx, window, proto, data_store)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-datatransfer-dropeffect>
@@ -191,11 +191,11 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
 
         let type_override = match_domstring_ascii!(format,
             // Step 5 If format equals "text", change it to "text/plain".
-            "text" => Some(DOMString::from("text/plain")),
+            "text" => Some(DOMString::from_static("text/plain")),
             // Step 6 If format equals "url", change it to "text/uri-list" and set convert-to-URL to true.
             "url" => {
                 convert_to_url = true;
-                Some(DOMString::from("text/uri-list"))
+                Some(DOMString::from_static("text/uri-list"))
             },
             _ => None,
         );
@@ -269,6 +269,6 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
         }
 
         // Step 5
-        FileList::new(self.global().as_window(), files, CanGc::from_cx(cx))
+        FileList::new(cx, self.global().as_window(), files)
     }
 }

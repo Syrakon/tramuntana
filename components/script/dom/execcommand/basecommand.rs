@@ -28,7 +28,14 @@ use crate::dom::execcommand::commands::fontsize::{
     execute_fontsize_command, font_size_loosely_equivalent, value_for_fontsize_command,
 };
 use crate::dom::execcommand::commands::forecolor::execute_forecolor_command;
+use crate::dom::execcommand::commands::forwarddelete::execute_forward_delete_command;
 use crate::dom::execcommand::commands::hilitecolor::execute_hilitecolor_command;
+use crate::dom::execcommand::commands::indent::execute_indent_command;
+use crate::dom::execcommand::commands::inserthorizontalrule::execute_insert_horizontal_rule_command;
+use crate::dom::execcommand::commands::insertimage::execute_insert_image_command;
+use crate::dom::execcommand::commands::insertlinebreak::execute_insert_line_break_command;
+use crate::dom::execcommand::commands::insertparagraph::execute_insert_paragraph_command;
+use crate::dom::execcommand::commands::inserttext::execute_insert_text_command;
 use crate::dom::execcommand::commands::italic::execute_italic_command;
 use crate::dom::execcommand::commands::removeformat::execute_removeformat_command;
 use crate::dom::execcommand::commands::strikethrough::execute_strikethrough_command;
@@ -39,9 +46,10 @@ use crate::dom::execcommand::commands::underline::execute_underline_command;
 use crate::dom::execcommand::commands::unlink::execute_unlink_command;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlfontelement::HTMLFontElement;
-use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
+use crate::dom::iterators::ShadowIncluding;
+use crate::dom::node::{Node, NodeTraits};
+use crate::dom::range::Range;
 use crate::dom::selection::Selection;
-use crate::script_runtime::CanGc;
 
 #[derive(Default, Clone, Copy, MallocSizeOf)]
 pub(crate) enum DefaultSingleLineContainerName {
@@ -50,12 +58,85 @@ pub(crate) enum DefaultSingleLineContainerName {
     Paragraph,
 }
 
+impl DefaultSingleLineContainerName {
+    pub(crate) fn str(&self) -> &str {
+        match self {
+            DefaultSingleLineContainerName::Div => "div",
+            DefaultSingleLineContainerName::Paragraph => "p",
+        }
+    }
+}
+
 impl From<DefaultSingleLineContainerName> for DOMString {
     fn from(default_single_line_container_name: DefaultSingleLineContainerName) -> Self {
         match default_single_line_container_name {
-            DefaultSingleLineContainerName::Div => DOMString::from("div"),
-            DefaultSingleLineContainerName::Paragraph => DOMString::from("p"),
+            DefaultSingleLineContainerName::Div => DOMString::from_static("div"),
+            DefaultSingleLineContainerName::Paragraph => DOMString::from_static("p"),
         }
+    }
+}
+
+pub(crate) enum BoolOrOptionalString {
+    Bool(bool),
+    OptionalString(Option<DOMString>),
+}
+
+impl From<Option<DOMString>> for BoolOrOptionalString {
+    fn from(optional_string: Option<DOMString>) -> Self {
+        Self::OptionalString(optional_string)
+    }
+}
+
+impl From<bool> for BoolOrOptionalString {
+    fn from(bool_: bool) -> Self {
+        Self::Bool(bool_)
+    }
+}
+
+pub(crate) struct RecordedStateOfCommand {
+    pub(crate) command: CommandName,
+    pub(crate) value: BoolOrOptionalString,
+}
+
+impl RecordedStateOfCommand {
+    pub(crate) fn for_command_node(command: CommandName, node: &Node) -> Self {
+        let value = node.effective_command_value(&command).into();
+        Self { command, value }
+    }
+
+    pub(crate) fn for_command_node_with_inline_activated_values(
+        command: CommandName,
+        node: &Node,
+    ) -> Self {
+        let effective_command_value = node.effective_command_value(&command);
+        let value = effective_command_value
+            .is_some_and(|effective_command_value| {
+                command
+                    .inline_command_activated_values()
+                    .contains(&effective_command_value.str().as_ref())
+            })
+            .into();
+        Self { command, value }
+    }
+
+    pub(crate) fn for_command_node_with_value(
+        cx: &mut JSContext,
+        command: CommandName,
+        document: &Document,
+    ) -> Self {
+        let value = command.current_value(cx, document).into();
+        Self { command, value }
+    }
+
+    fn for_command_state_override(command: CommandName, document: &Document) -> Option<Self> {
+        let value = document.state_override(&command)?.into();
+        Some(Self { command, value })
+    }
+
+    fn for_command_value_override(command: CommandName, document: &Document) -> Option<Self> {
+        let value_override = document.value_override(&command)?;
+        let value = Some(value_override).into();
+        Some(Self { command, value })
     }
 }
 
@@ -79,7 +160,7 @@ impl CssPropertyName {
         Some(
             match self {
                 CssPropertyName::BackgroundColor => {
-                    let background_color = style.clone_background_color();
+                    let background_color = style.get_background_color();
                     if let Some(absolute_color) = background_color.as_absolute() {
                         // Used as an early-exit when figuring out on which element to resolve
                         // the style in `effective_command_value`
@@ -108,7 +189,7 @@ impl CssPropertyName {
                             return Some(color);
                         }
                     }
-                    style.clone_color().to_css_string()
+                    style.get_color().to_css_string()
                 },
                 CssPropertyName::FontFamily => {
                     // Detached font elements (e.g. does created with `document.createElement`
@@ -123,7 +204,7 @@ impl CssPropertyName {
                             return Some(face);
                         }
                     }
-                    style.clone_font_family().to_css_string()
+                    style.get_font_family().to_css_string()
                 },
                 CssPropertyName::FontSize => {
                     // Font size is special, in that it can't use the resolved styles to compute
@@ -154,8 +235,8 @@ impl CssPropertyName {
                             Some(format!("{}px", pixels).into())
                         });
                 },
-                CssPropertyName::FontWeight => style.clone_font_weight().to_css_string(),
-                CssPropertyName::FontStyle => style.clone_font_style().to_css_string(),
+                CssPropertyName::FontWeight => style.get_font_weight().to_css_string(),
+                CssPropertyName::FontStyle => style.get_font_style().to_css_string(),
                 CssPropertyName::TextDecoration => unreachable!("Should use longhands instead"),
                 CssPropertyName::TextDecorationLine => {
                     let text_decoration_line = style.get_text().text_decoration_line;
@@ -176,7 +257,7 @@ impl CssPropertyName {
         let style_attribute = element.style_attribute().borrow();
         let declarations = style_attribute.as_ref()?;
         let document = element.owner_document();
-        let shared_lock = document.style_shared_lock();
+        let shared_lock = document.style_shared_author_lock();
         let read_lock = shared_lock.read();
         let style = declarations.read_with(&read_lock);
 
@@ -225,15 +306,13 @@ impl CssPropertyName {
         element: &HTMLElement,
         new_value: DOMString,
     ) {
-        let style = element.Style(CanGc::from_cx(cx));
+        let style = element.Style(cx);
 
-        let _ = style.SetProperty(cx, self.property_name(), new_value, "".into());
+        let _ = style.SetProperty(cx, self.property_name(), new_value, DOMString::new());
     }
 
     pub(crate) fn remove_from_element(&self, cx: &mut JSContext, element: &HTMLElement) {
-        let _ = element
-            .Style(CanGc::from_cx(cx))
-            .RemoveProperty(cx, self.property_name());
+        let _ = element.Style(cx).RemoveProperty(cx, self.property_name());
     }
 }
 
@@ -256,6 +335,7 @@ pub(crate) enum CommandName {
     Indent,
     InsertHorizontalRule,
     InsertHtml,
+    InsertImage,
     InsertLineBreak,
     InsertOrderedList,
     InsertParagraph,
@@ -293,13 +373,13 @@ impl CommandName {
         let Some(selection) = document.GetSelection(cx) else {
             return false;
         };
-        let Some(active_range) = selection.active_range() else {
+        let Some(active_range) = selection.active_range(cx) else {
             return false;
         };
         let mut at_least_two_different_effective_values = false;
         let mut previous_effective_value: Option<DOMString> = None;
-        active_range.for_each_effectively_contained_child(|node| {
-            if at_least_two_different_effective_values || !node.is_formattable() {
+        active_range.for_each_effectively_contained_child(cx, |cx, node| {
+            if at_least_two_different_effective_values || !node.is_formattable(cx.no_gc()) {
                 return;
             }
             if let Some(effective_command_value) = node.effective_command_value(self) {
@@ -344,11 +424,11 @@ impl CommandName {
                     return None;
                 }
                 let selection = document.GetSelection(cx)?;
-                let active_range = selection.active_range()?;
+                let active_range = selection.active_range(cx)?;
                 let mut at_least_one_child_is_formattable = false;
                 let mut all_children_have_matching_command_values = true;
-                active_range.for_each_effectively_contained_child(|node| {
-                    if !node.is_formattable() {
+                active_range.for_each_effectively_contained_child(cx, |cx, node| {
+                    if !node.is_formattable(cx.no_gc()) {
                         return;
                     }
                     at_least_one_child_is_formattable = true;
@@ -392,10 +472,10 @@ impl CommandName {
                 // > the effective command value of the active range's start node;
                 // > or if that is null, the empty string.
                 let selection = document.GetSelection(cx)?;
-                let active_range = selection.active_range()?;
+                let active_range = selection.active_range(cx)?;
 
                 active_range
-                    .first_formattable_contained_node()
+                    .first_formattable_contained_node(cx.no_gc())
                     .unwrap_or_else(|| active_range.start_container())
                     .effective_command_value(self)
                     .unwrap_or_default()
@@ -475,6 +555,53 @@ impl CommandName {
         }
     }
 
+    /// <https://w3c.github.io/editing/docs/execCommand/#record-current-overrides>
+    pub(crate) fn record_current_overrides(document: &Document) -> Vec<RecordedStateOfCommand> {
+        // Step 1. Let overrides be a list of (string, string or boolean) ordered pairs, initially empty.
+        let mut overrides = vec![];
+        // Step 2. If there is a value override for "createLink",
+        // add ("createLink", value override for "createLink") to overrides.
+        if let Some(value_override) =
+            RecordedStateOfCommand::for_command_value_override(CommandName::CreateLink, document)
+        {
+            overrides.push(value_override);
+        }
+        // Step 3. For each command in the list "bold", "italic", "strikethrough",
+        // "subscript", "superscript", "underline", in order:
+        // if there is a state override for command, add (command, command's state override) to overrides.
+        for command in [
+            CommandName::Bold,
+            CommandName::Italic,
+            CommandName::Strikethrough,
+            CommandName::Subscript,
+            CommandName::Superscript,
+            CommandName::Underline,
+        ] {
+            if let Some(state_override) =
+                RecordedStateOfCommand::for_command_state_override(command, document)
+            {
+                overrides.push(state_override);
+            }
+        }
+        // Step 4. For each command in the list "fontName", "fontSize", "foreColor", "hiliteColor",
+        // in order: if there is a value override for command,
+        // add (command, command's value override) to overrides.
+        for command in [
+            CommandName::FontName,
+            CommandName::FontSize,
+            CommandName::ForeColor,
+            CommandName::HiliteColor,
+        ] {
+            if let Some(value_override) =
+                RecordedStateOfCommand::for_command_value_override(command, document)
+            {
+                overrides.push(value_override);
+            }
+        }
+        // Step 5. Return overrides.
+        overrides
+    }
+
     /// <https://w3c.github.io/editing/docs/execCommand/#relevant-css-property>
     pub(crate) fn relevant_css_property(&self) -> Option<CssPropertyName> {
         // > This is defined for certain inline formatting commands, and is used in algorithms specific to those commands.
@@ -508,6 +635,46 @@ impl CommandName {
         )
     }
 
+    pub(crate) fn is_enabled(&self, cx: &JSContext, range: &Range, editing_host: &Node) -> bool {
+        match self {
+            // The delete command is not enabled in the situation that the cursor is inside the
+            // editing host at the start, where a backspace would do nothing. However, if the
+            // editing host itself is selected then it is enabled.
+            //
+            // Therefore, start at the start_container and traverse its ancestors up to editing
+            // host. If the index remains 0, then there is no effective character to delete and
+            // the command is disabled.
+            CommandName::Delete => {
+                if !range.collapsed() {
+                    return true;
+                }
+                let start_container = range.start_container();
+                if *start_container == *editing_host {
+                    // TODO: This should return true. However, that crashes deletes at the start
+                    // of the editing host. There currently is no way to distinguish between a
+                    // range that is collapsed to a full node and set to before a node. Chromium
+                    // tracks this with a concept of "anchor position before/after node":
+                    // https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/core/editing/position.h;l=39;drc=a5c6d7b223bfc6028ecae4b1f17d711374238c0d
+                    return false;
+                }
+                let mut current_offset = range.start_offset();
+                for current_ancestor in
+                    start_container.inclusive_ancestors_unrooted(cx, ShadowIncluding::Yes)
+                {
+                    if current_offset != 0 {
+                        return true;
+                    }
+                    if *current_ancestor == editing_host {
+                        return false;
+                    }
+                    current_offset = current_ancestor.index();
+                }
+                false
+            },
+            _ => true,
+        }
+    }
+
     pub(crate) fn is_enabled_in_plaintext_only_state(&self) -> bool {
         matches!(
             self,
@@ -529,6 +696,29 @@ impl CommandName {
         )
     }
 
+    /// <https://w3c.github.io/editing/docs/execCommand/#preserves-overrides>
+    fn preserves_overrides(&self) -> bool {
+        matches!(
+            self,
+            CommandName::Delete |
+                CommandName::FormatBlock |
+                CommandName::ForwardDelete |
+                CommandName::Indent |
+                CommandName::InsertHorizontalRule |
+                CommandName::InsertHtml |
+                CommandName::InsertImage |
+                CommandName::InsertLineBreak |
+                CommandName::InsertOrderedList |
+                CommandName::InsertParagraph |
+                CommandName::InsertUnorderedList |
+                CommandName::JustifyCenter |
+                CommandName::JustifyFull |
+                CommandName::JustifyLeft |
+                CommandName::JustifyRight |
+                CommandName::Outdent
+        )
+    }
+
     /// <https://w3c.github.io/editing/docs/execCommand/#action>
     pub(crate) fn execute(
         &self,
@@ -537,7 +727,15 @@ impl CommandName {
         selection: &Selection,
         value: DOMString,
     ) -> bool {
-        match self {
+        // https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
+        // > If a command preserves overrides, then before taking its action,
+        // > the user agent must record current overrides.
+        let overrides = if self.preserves_overrides() {
+            Self::record_current_overrides(document)
+        } else {
+            vec![]
+        };
+        let result = match self {
             CommandName::BackColor => execute_backcolor_command(cx, document, selection, value),
             CommandName::Bold => execute_bold_command(cx, document, selection),
             CommandName::CreateLink => execute_createlink_command(cx, document, selection, value),
@@ -548,7 +746,22 @@ impl CommandName {
             CommandName::FontName => execute_fontname_command(cx, document, selection, value),
             CommandName::FontSize => execute_fontsize_command(cx, document, selection, value),
             CommandName::ForeColor => execute_forecolor_command(cx, document, selection, value),
+            CommandName::ForwardDelete => execute_forward_delete_command(cx, document, selection),
             CommandName::HiliteColor => execute_hilitecolor_command(cx, document, selection, value),
+            CommandName::Indent => execute_indent_command(cx, document, selection),
+            CommandName::InsertHorizontalRule => {
+                execute_insert_horizontal_rule_command(cx, document, selection)
+            },
+            CommandName::InsertImage => {
+                execute_insert_image_command(cx, document, selection, value)
+            },
+            CommandName::InsertLineBreak => {
+                execute_insert_line_break_command(cx, document, selection)
+            },
+            CommandName::InsertParagraph => {
+                execute_insert_paragraph_command(cx, document, selection)
+            },
+            CommandName::InsertText => execute_insert_text_command(cx, document, selection, value),
             CommandName::Italic => execute_italic_command(cx, document, selection),
             CommandName::RemoveFormat => execute_removeformat_command(cx, document, selection),
             CommandName::Strikethrough => execute_strikethrough_command(cx, document, selection),
@@ -558,7 +771,19 @@ impl CommandName {
             CommandName::Underline => execute_underline_command(cx, document, selection),
             CommandName::Unlink => execute_unlink_command(cx, selection),
             _ => false,
+        };
+
+        // https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
+        // > After taking the action, if the active range is collapsed,
+        // > it must restore states and values from the recorded list.
+        if let Some(active_range) = selection
+            .active_range(cx)
+            .filter(|active_range| active_range.collapsed())
+        {
+            active_range.restore_states_and_values(cx, selection, document, overrides);
         }
+
+        result
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#inline-command-activated-values>

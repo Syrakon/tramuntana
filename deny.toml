@@ -11,6 +11,11 @@ feature-depth = 1
 # More documentation for the advisories section can be found here:
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
+# Our `mach` integration currently errors on warnings. We should add support
+# for warnings without failing tidy to mach and then change this to `warn`.
+# We don't want to deny yanked crates, since it creates incentives to update
+# quickly, which could be abused by supply-chain attacks that yank old versions.
+yanked = "allow"
 ignore = [
     # The crate `paste` is no longer maintained.
     "RUSTSEC-2024-0436",
@@ -31,10 +36,10 @@ ignore = [
     # The crate `bincode` is unmaintained. This crate is now pinned in Servo.
     # See the comment above `bincode` entry in Cargo.toml.
     "RUSTSEC-2025-0141",
-    # The crate `ml-dsa 0.0.4` is the latest stable release.
-    # The attack complexity of this vulnerability is high,
-    # and no exploit is known yet.
-    "RUSTSEC-2025-0144",
+    # The crate `ttf-parser` is unmaintained.
+    # This is a dependency of `usvg`, `rustybuzz`, `fontdb`.
+    # We will need to wait for upstream actions.
+    "RUSTSEC-2026-0192",
 ]
 
 # This section is considered when running `cargo deny check licenses`
@@ -67,11 +72,7 @@ allow = [
 confidence-threshold = 0.8
 # Allow 1 or more licenses on a per-crate basis, so that particular licenses
 # aren't accepted for every possible crate as with the normal allow list
-exceptions = [
-    # rav1e depends on libfuzzer-sys when cfg(fuzzing) is true, which it isn't for servo builds.
-    # cargo-deny is being run with --all-features, so we need to explicitly make an exception here.
-    { allow = ["NCSA"], crate = "libfuzzer-sys" },
-]
+exceptions = []
 
 
 # This section is considered when running `cargo deny check bans`.
@@ -94,42 +95,22 @@ deny = [
 
 # List of crates to skip for the duplicate check:
 skip = [
+    "base64",
     "bitflags",
     "cookie",
     "redox_syscall",
-    # Duplicated by getrandom 0.1 and getrandom 0.2
-    "wasi",
 
     # New versions of these dependencies is pulled in by GStreamer / GLib.
     "itertools",
 
-    # Duplicated by btleplug
-    "jni",
+    # Duplicated by ndk and ndk-sys that are still on 0.3.1
     "jni-sys",
 
     # Duplicated by egui
     "foldhash",
-    "windows-collections",
-    "windows-future",
-    "windows-numerics",
-    "windows-strings",
-    "windows-threading",
-
-    # Duplicated by egui-file-dialog
-    "windows",
-    "windows-implement",
-    "windows-interface",
-    "windows-link",
-    "windows-result",
 
     # Duplicated by winit.
     "windows-sys",
-
-    # wgpu has the latest and greatest.
-    "windows-core",
-
-    # rust-content-security-policy uses newest base64.
-    "base64",
 
     # Duplicated by gilrs.
     "core-foundation",
@@ -141,9 +122,6 @@ skip = [
     "thiserror",
     "thiserror-impl",
 
-    # duplicated by webdriver
-    "http",
-
     # duplicated by winit
     "block2",
     "objc2-app-kit",
@@ -153,8 +131,8 @@ skip = [
     # duplicated by tungstenite
     "getrandom",
     "rand",
-    "rand_chacha",
     "rand_core",
+    "sha1",
 
     # duplicated by blurz/blurmock
     "hex",
@@ -173,31 +151,8 @@ skip = [
     # and bindgen updates the cexpr version
     "nom",
 
-    # duplicated by core-graphics
-    "core-graphics-types",
-
-    # duplicated by winresource and proc-macro-crate. Once everything
-    # switches to the latest version of toml we can remove this. It's
-    # really just a build dep, so not a large problem.
-    "toml_datetime",
-    "toml_edit",
-
-    # duplicated by vello
-    "kurbo",
-    "peniko",
-    "png",
-
     # Dependency by quick_cache and other
     "hashbrown",
-
-    # Duplicated by ml-kem 0.2.1 and ml-dsa 0.0.4. They use different
-    # version of hybrid-array. Once ml-kem releases the next version
-    # 0.3.0 and ml-dsa releases the next version 0.1.0, we can remove
-    # this.
-    "hybrid-array",
-
-    # duplicated by zbus
-    "winnow",
 
     # The following 5 duplicates were introduced when Servo's CI was failing to
     # detect duplicates introduced in automatic dependabot PRs (#38945). They
@@ -207,17 +162,54 @@ skip = [
     "libloading",
 
     # Duplicated by wgpu/egui+dependencies
-    "font-types",
-    "glow",
     "objc2-ui-kit",
     "read-fonts",
+    "font-types",
     "skrifa",
+    "vello_common",
+    "vello_cpu",
+    "fearless_simd",
 
     # Duplicated by resvg/image
-    "pastey",
     "roxmltree",
     "tiny-skia",
     "tiny-skia-path",
+
+    # Duplicated by content-security-policy
+    "sha2",
+
+    # Duplicated by sha1 and sha2, which are duplicated by tungstenite
+    # and content-security-policy.
+    "cpufeatures",
+    "crypto-common",
+    "digest",
+    "block-buffer",
+
+    # Duplicated by ml-kem. This should be gone in next version (>0.3.2)
+    # of ml-kem.
+    "sha3",
+
+    # Duplicated by bindgen
+    "shlex",
+
+    # duplicated by mozjs which brings in new versions
+    "anstream",
+    "anstyle-parse",
+    "syn",
+    "toml",
+    "toml_datetime",
+    "winnow",
+
+    # Duplicated by cssparser which brings in new versions
+    "phf",
+    "phf_generator",
+    "phf_macros",
+    "phf_shared",
+
+    # Duplicated by serde_with crate (proc macro helpers, so no binary size increase)
+    "darling",
+    "darling_core",
+    "darling_macro",
 ]
 
 # github.com organizations to allow git sources for

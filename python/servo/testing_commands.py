@@ -15,7 +15,10 @@ import os.path as path
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
+import threading
+import time
 from argparse import ArgumentParser
 from contextlib import chdir
 from pathlib import Path
@@ -35,7 +38,8 @@ from mach.decorators import (
 import servo.devtools_tests
 import servo.try_parser
 from servo.command_base import BuildType, CommandBase, call, check_call
-from servo.post_build_commands import PostBuildCommands
+from servo.platform.build_target import AndroidTarget, is_android, is_openharmony
+from servo.post_build_commands import ANDROID_APP_NAME, PostBuildCommands, shell_quote
 from servo.util import delete
 
 SCRIPT_PATH = os.path.split(__file__)[0]
@@ -215,10 +219,18 @@ class MachCommands(CommandBase):
             "servo-storage-traits",
             "servo-xpath",
             "servo-deny-public-fields",
+            "servo-dom-struct",
+            "servo-webvtt",
         ]
         if not packages:
             packages = set(os.listdir(path.join(self.context.topdir, "tests", "unit"))) - set([".DS_Store"])
             packages |= set(self_contained_tests)
+
+        # Servoshell is meant as an app library and links in NAPI, which
+        # is not available when running unit-tests.
+        if is_openharmony(self.target) and "servoshell" in packages:
+            print("Skipping servoshell unit tests on OpenHarmony.")
+            packages.remove("servoshell")
 
         in_crate_packages = []
         for crate in self_contained_tests:
@@ -233,15 +245,17 @@ class MachCommands(CommandBase):
             return 0
 
         args: list[str] = params or []
+        use_nextest = "--doc" not in args
 
         if build_type.is_release():
             args += ["--release"]
         elif build_type.is_dev():
             pass  # there is no argument for debug
         else:
-            args += ["--cargo-profile", build_type.profile]
+            cargo_profile_arg = "--cargo-profile" if use_nextest else "--profile"
+            args += [cargo_profile_arg, build_type.profile]
 
-        if nextest_profile is not None:
+        if use_nextest and nextest_profile is not None:
             args += ["--profile", nextest_profile]
 
         for crate in packages:
@@ -257,6 +271,7 @@ class MachCommands(CommandBase):
 
         crown_cargo_command: List[str] = ["cargo"]
         cargo_command: str
+        cargo_subcommand: str | None = None
         if bench:
             cargo_command = "bench"
             if code_coverage:
@@ -266,20 +281,30 @@ class MachCommands(CommandBase):
                 )
                 exit(1)
         elif code_coverage:
+            if not use_nextest:
+                print(
+                    "Error: Invalid argument combination for `./mach test-unit`. "
+                    "`--doc` and `--code-coverage` are mutually exclusive."
+                )
+                exit(1)
             cargo_llvm_cov_options: List[str] = llvm_cov_option or []
             crown_cargo_command.extend(["llvm-cov", "nextest"])
             crown_cargo_command.extend(cargo_llvm_cov_options)
             cargo_command = "llvm-cov"
-            args.insert(0, "nextest")
+            cargo_subcommand = "nextest"
             args.extend(cargo_llvm_cov_options)
-        else:
+        elif use_nextest:
             crown_cargo_command.extend(["nextest", "run"])
             cargo_command = "nextest"
-            args.insert(0, "run")
-        result = call(crown_cargo_command, cwd="support/crown")
-        if result != 0:
-            return result
-        result = self.run_cargo_build_like_command(cargo_command, args, env=env, **kwargs)
+            cargo_subcommand = "run"
+        else:
+            crown_cargo_command.extend(["test"])
+            cargo_command = "test"
+        if not self.target.is_cross_build():
+            result = call(crown_cargo_command, cwd="support/crown")
+            if result != 0:
+                return result
+        result = self.run_cargo_build_like_command(cargo_command, args, subcommand=cargo_subcommand, env=env, **kwargs)
         assert isinstance(result, int)
         return result
 
@@ -300,6 +325,7 @@ class MachCommands(CommandBase):
     )
     def test_tidy(self, all_files: bool, no_progress: bool, github_annotations: bool) -> int:
         tidy_failed = tidy.scan(not all_files, not no_progress, github_annotations)
+        coauthors_failed = tidy.run_coauthors_check()
 
         print("\r ➤  Checking formatting of Rust files...")
         rustfmt_failed = format_with_rustfmt(check_only=True)
@@ -311,7 +337,7 @@ class MachCommands(CommandBase):
         taplo_failed = format_toml_files_with_taplo()
 
         format_failed = rustfmt_failed or ruff_format_failed or taplo_failed
-        tidy_failed = format_failed or tidy_failed
+        tidy_failed = format_failed or tidy_failed or coauthors_failed
         print()
         if tidy_failed:
             print("\r ❌ test-tidy reported errors.")
@@ -373,26 +399,60 @@ class MachCommands(CommandBase):
         else:
             print("SKIP: Install tshark manually")
 
+        print("Verifying integrity of WebIDL parser...")
+        try:
+            result = subprocess.run(
+                ["components/script_bindings/third_party/WebIDL/manage.py", "verify"], check=True, capture_output=True
+            )
+            print("OK")
+        except subprocess.CalledProcessError as e:
+            print(f"Process failed with exit status {e.returncode}: {e.cmd}", file=sys.stderr)
+            print(f"stdout: {repr(e.stdout)}", file=sys.stderr)
+            print(f"stderr: {repr(e.stderr)}", file=sys.stderr)
+            raise e
+
         if all or tests:
             print("Running WebIDL tests...")
 
-            test_file_dir = path.abspath(path.join(PROJECT_TOPLEVEL_PATH, "third_party", "WebIDL"))
+            test_file_dir = path.abspath(
+                path.join(PROJECT_TOPLEVEL_PATH, "components", "script_bindings", "third_party", "WebIDL", "parser")
+            )
             # For the `import WebIDL` in runtests.py
             sys.path.insert(0, test_file_dir)
             run_file = path.abspath(path.join(test_file_dir, "runtests.py"))
             run_globals: dict[str, Any] = {"__file__": run_file}
             exec(compile(open(run_file).read(), run_file, "exec"), run_globals)
-            passed = run_globals["run_tests"](tests, verbose or very_verbose) and passed
+            passed = not run_globals["run_tests"](tests, verbose or very_verbose) and passed
 
         return 0 if passed else 1
 
     @Command("test-devtools", description="Run tests for devtools.", category="testing")
     @CommandArgument("test_names", nargs=argparse.REMAINDER, help="Only run tests that match these patterns")
+    @CommandArgument(
+        "-N",
+        "--num-threads",
+        default="auto",
+        help="Number of parallel workers: auto, logical, or a number; 0 to disable",
+    )
     @CommandBase.common_command_arguments(binary_selection=True)
-    def test_devtools(self, servo_binary: str, test_names: list[str], **kwargs: Any) -> int:
+    def test_devtools(self, servo_binary: str, test_names: list[str], num_threads: str, **kwargs: Any) -> int:
+        import pytest
+
+        args = [
+            os.path.join(SCRIPT_PATH, "devtools_tests"),
+            "--servo-binary",
+            servo_binary,
+            "--script-path",
+            SCRIPT_PATH,
+            "-n",
+            num_threads,
+            "-v",
+        ]
+        if test_names:
+            args.extend(["-k", " or ".join(test_names)])
+
         print("Running devtools tests...")
-        passed = servo.devtools_tests.run_tests(SCRIPT_PATH, servo_binary, test_names)
-        return 0 if passed else 1
+        return pytest.main(args)
 
     @Command(
         "test-wpt-failure",
@@ -410,13 +470,46 @@ class MachCommands(CommandBase):
         "test-wpt", description="Run the regular web platform test suite", category="testing", parser=wpt.create_parser
     )
     @CommandArgument("--multiprocess", "-M", default=False, action="store_true", help="Run in multiprocess mode")
+    @CommandArgument(
+        "--update-expectations",
+        "-u",
+        default=False,
+        action="store_true",
+        help="Update test expectations after test run",
+    )
+    # Keep `allow_target_configuration` above `common_command_arguments`: binary_selection requires the
+    # target to be configured already.
+    @CommandBase.allow_target_configuration
     @CommandBase.common_command_arguments(binary_selection=True)
-    def test_wpt(self, servo_binary: str, multiprocess: bool, **kwargs: Any) -> int:
-        return self._test_wpt(servo_binary, multiprocess, **kwargs)
+    def test_wpt(
+        self, servo_binary: Optional[str], multiprocess: bool, update_expectations: bool, **kwargs: Any
+    ) -> int:
+        if update_expectations:
+            if kwargs["log_raw"]:
+                print("Do not specify --log-raw when updating tests directly")
+                return 1
+            with tempfile.TemporaryDirectory() as temp_dir:
+                kwargs["log_raw"] = [os.path.join(temp_dir, "wpt.log")]
+
+        if self.target.is_cross_build():
+            print("test-wpt doesn't support any cross build targets (yet).")
+            return 1
+        else:
+            assert servo_binary is not None, "servo_binary should only be none on Android / OpenHarmony"
+            test_return_value = self._test_wpt(servo_binary, multiprocess, **kwargs)
+
+        # We should only update when the tests actually failed. In any other case
+        # such as incorrect command parameters, we shouldn't run the update command.
+        # Confusingly, the test command has an exit command of 0 when its command
+        # parameters are invalid (for example a non-existent test file).
+        if update_expectations and test_return_value == 1:
+            update_arguments = wpt.update.parse_args_update(kwargs["log_raw"])
+            return self.update_wpt(**vars(update_arguments))
+
+        return test_return_value
 
     @CommandBase.allow_target_configuration
     def _test_wpt(self, servo_binary: str, multiprocess: bool, **kwargs: Any) -> int:
-        # TODO(mrobinson): Why do we pass the wrong binary path in when running WPT on Android?
         return_value = wpt.run.run_tests(servo_binary, multiprocess, **kwargs)
         return return_value if not kwargs["always_succeed"] else 0
 
@@ -756,6 +849,8 @@ class MachCommands(CommandBase):
             return res
         # https://github.com/gpuweb/cts/pull/2770
         delete(path.join(clone_dir, "out-wpt", "cts-chunked2sec.https.html"))
+        # we have incomplete workers implementation and webgpu does not work there
+        delete(path.join(clone_dir, "out-wpt", "cts-withsomeworkers.https.html"))
         cts_html = path.join(clone_dir, "out-wpt", "cts.https.html")
         # patch
         with open(cts_html, "r") as file:
@@ -793,8 +888,33 @@ class MachCommands(CommandBase):
     )
     @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Servo")
     @CommandArgument("--multiprocess", "-M", default=False, action="store_true", help="Run in multiprocess mode")
-    @CommandBase.common_command_arguments(binary_selection=True)
-    def smoketest(self, servo_binary: str, multiprocess: bool, params: list[str], **kwargs: Any) -> int | None:
+    @CommandArgument(
+        "--android",
+        default=None,
+        action="store_true",
+        help="Run the smoketest on a connected Android device or emulator "
+        f"(defaults to the `{AndroidTarget.DEFAULT_TRIPLE}` target).",
+    )
+    @CommandArgument(
+        "--target",
+        "-t",
+        default=None,
+        help="Run the smoketest for the given cross-compilation target (e.g. `x86_64-linux-android`).",
+    )
+    # Keep `allow_target_configuration` above `common_command_arguments`: binary_selection requires the
+    # target to be configured already.
+    @CommandBase.allow_target_configuration
+    @CommandBase.common_command_arguments(binary_selection=True, build_type=True)
+    def smoketest(
+        self, servo_binary: Optional[str], build_type: BuildType, multiprocess: bool, params: list[str], **kwargs: Any
+    ) -> int | None:
+        if is_android(self.target):
+            return self.android_smoketest(self.target, build_type)
+        elif is_openharmony(self.target):
+            print(f"mach smoketest is not implemented yet for OpenHarmony targets ({self.target.triple()})")
+            return 1
+
+        assert servo_binary is not None, "servo_binary may only be None on cross-builds (Android / OpenHarmony)"
         # We pass `-f` here so that any thread panic will cause Servo to exit,
         # preventing a panic from hanging execution. This means that these kind
         # of panics won't cause timeouts on CI.
@@ -803,10 +923,129 @@ class MachCommands(CommandBase):
             args.append("-M")
         return PostBuildCommands(self.context)._run(servo_binary, params + args)
 
-    @Command("try", description="Runs try jobs by force pushing to try branch", category="testing")
+    def android_smoketest(self, target: AndroidTarget, build_type: BuildType) -> int:
+        adb = self.android_adb_path(dict(os.environ))
+        apk_path = target.get_package_path(build_type.directory_name())
+        if not path.exists(apk_path):
+            print(f"APK not found at {apk_path}. Did you forget to run `./mach build --target {target.triple()}`?")
+            return 1
+
+        # `adb wait-for-device` blocks forever if nothing ever connects
+        device_wait_secs = 5
+        try:
+            subprocess.run([adb, "wait-for-device"], timeout=device_wait_secs, check=True)
+        except subprocess.TimeoutExpired:
+            print(f"No Android device or emulator found within {device_wait_secs}s.")
+            return 1
+        check_call([adb, "install", "-r", apk_path])
+
+        marker = "SERVO_ANDROID_SMOKETEST_OK"
+        url = f"data:text/html,<script>console.log('{marker}')</script>"
+
+        call([adb, "shell", "am", "force-stop", ANDROID_APP_NAME])
+        check_call([adb, "logcat", "-c"])
+
+        component = f"{ANDROID_APP_NAME}/{ANDROID_APP_NAME}.MainActivity"
+        check_call([adb, "shell", f"am start -a android.intent.action.VIEW -d {shell_quote(url)} {component}"])
+
+        # The timeout should be long enough for CI. 30s is a bit arbitrary,
+        # but we can adjust that in the future.
+        timeout_secs = 30
+        # Besides `servoshell` we also log error / fatal levels of things potentially
+        # relevant for a crash. `*:S` silences everything else.
+        logcat = subprocess.Popen(
+            [adb, "logcat", "--format=raw", "servoshell:D", "AndroidRuntime:E", "libc:F", "DEBUG:F", "*:S"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        watchdog = threading.Timer(timeout_secs, logcat.terminate)
+        watchdog.start()
+
+        crash_markers = ("Panic in Rust code", "FATAL EXCEPTION", "Fatal signal")
+        passed = False
+        crashed = False
+        try:
+            assert logcat.stdout is not None
+            for line in logcat.stdout:
+                sys.stdout.write(line)
+                if marker in line:
+                    passed = True
+                    break
+                if any(crash_marker in line for crash_marker in crash_markers):
+                    crashed = True
+                    # Wait a moment for relevant logs to appear in logcat.
+                    time.sleep(1)
+                    logcat.terminate()
+                    sys.stdout.write(logcat.stdout.read())
+                    break
+        finally:
+            watchdog.cancel()
+            if logcat.poll() is None:
+                logcat.terminate()
+            call([adb, "shell", "am", "force-stop", ANDROID_APP_NAME])
+
+        if passed:
+            print("Android smoketest passed.")
+            return 0
+        if crashed:
+            print("Android smoketest failed: Servo crashed during startup (see logcat output above).")
+        else:
+            print(f"Android smoketest failed: did not observe '{marker}' in logcat output within {timeout_secs}s.")
+        return 1
+
+    @Command(
+        "try",
+        description="""
+        Runs try jobs by force pushing to try branch.
+
+        Try strings:
+
+          Platforms (combine with modifiers, e.g. linux-wpt):
+            linux
+            mac/macos
+            mac-arm/macos-arm64
+            win/windows
+            android
+            ohos/openharmony
+            lint/tidy
+
+          Modifiers (runs on linux by default if no platform given):
+            unit-tests          Run unit tests
+            build-libservo      Build libservo library
+            wpt                 Run web-platform-tests
+            bencher             Run benchmarking
+            coverage            Run code coverage
+            capi                Run C API build
+            production          Use production build profile
+            release             Use release build profile
+            debug               Use dev build profile
+          e.g. linux-unit-tests
+
+          Special presets:
+            webgpu              WebGPU CTS (linux, production)
+            webdriver/wd        WebDriver classic tests (linux)
+            vello               Vello canvas WPT subsuite (linux)
+
+          Meta keywords:
+            full                Run all jobs (default)
+            fail-fast           Cancel remaining jobs on first failure
+            bencher             All platform bencher jobs
+            production-bencher  All platform production-profile bencher jobs
+
+          Examples:
+            ./mach try full
+            ./mach try coverage
+            ./mach try linux-bencher-capi-production
+            ./mach try webgpu
+        """,
+        category="testing",
+    )
     @CommandArgument("--remote", "-r", default="origin", help="A git remote to run the try job on")
     @CommandArgument(
-        "try_strings", default=["full"], nargs="...", help="A list of try strings specifying what kind of job to run."
+        "try_strings",
+        default=["full"],
+        nargs="...",
+        help="Try strings specifying which CI jobs to run. See above for full list of options.",
     )
     def try_command(self, remote: str, try_strings: list[str]) -> int:
         if subprocess.check_output(["git", "diff", "--cached", "--name-only"]).strip():

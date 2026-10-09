@@ -2,20 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use embedder_traits::{
     MediaMetadata as EmbedderMediaMetadata, MediaPositionState as EmbedderMediaPositionState,
     MediaSessionActionType, MediaSessionEvent,
 };
+use js::context::JSContext;
 use rustc_hash::FxBuildHasher;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_constellation_traits::ScriptToConstellationMessage;
 
 use crate::conversions::Convert;
-use crate::dom::bindings::callback::ExceptionHandling;
+use crate::dom::bindings::callback::{ExceptionHandling, RootedCallback, TracedCallback};
 use crate::dom::bindings::codegen::Bindings::HTMLMediaElementBinding::HTMLMediaElementMethods;
 use crate::dom::bindings::codegen::Bindings::MediaMetadataBinding::{
     MediaMetadataInit, MediaMetadataMethods,
@@ -28,30 +27,30 @@ use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::trace::HashMapTracedValues;
-use crate::dom::bindings::weakref::MutableWeakRef;
-use crate::dom::html::htmlmediaelement::HTMLMediaElement;
+use crate::dom::html::htmlmediaelement::{HTMLMediaElement, MediaElementWeakRef};
 use crate::dom::media::mediametadata::MediaMetadata;
 use crate::dom::window::Window;
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct MediaSession {
     reflector_: Reflector,
     /// <https://w3c.github.io/mediasession/#dom-mediasession-metadata>
-    #[ignore_malloc_size_of = "defined in embedder_traits"]
     #[no_trace]
     metadata: DomRefCell<Option<EmbedderMediaMetadata>>,
     /// <https://w3c.github.io/mediasession/#dom-mediasession-playbackstate>
     playback_state: DomRefCell<MediaSessionPlaybackState>,
     /// <https://w3c.github.io/mediasession/#supported-media-session-actions>
-    #[conditional_malloc_size_of]
     action_handlers: DomRefCell<
-        HashMapTracedValues<MediaSessionActionType, Rc<MediaSessionActionHandler>, FxBuildHasher>,
+        HashMapTracedValues<
+            MediaSessionActionType,
+            TracedCallback<MediaSessionActionHandler>,
+            FxBuildHasher,
+        >,
     >,
     /// The media instance controlled by this media session.
     /// For now only HTMLMediaElements are controlled by media sessions.
-    media_instance: MutableWeakRef<HTMLMediaElement>,
+    media_instance: DomRefCell<Option<MediaElementWeakRef>>,
 }
 
 impl MediaSession {
@@ -61,16 +60,16 @@ impl MediaSession {
             metadata: DomRefCell::new(None),
             playback_state: DomRefCell::new(MediaSessionPlaybackState::None),
             action_handlers: DomRefCell::new(HashMapTracedValues::new_fx()),
-            media_instance: MutableWeakRef::new(None),
+            media_instance: DomRefCell::new(None),
         }
     }
 
-    pub(crate) fn new(window: &Window, can_gc: CanGc) -> DomRoot<MediaSession> {
-        reflect_dom_object(Box::new(MediaSession::new_inherited()), window, can_gc)
+    pub(crate) fn new(cx: &mut JSContext, window: &Window) -> DomRoot<MediaSession> {
+        reflect_dom_object(cx, Box::new(MediaSession::new_inherited()), window)
     }
 
     pub(crate) fn register_media_instance(&self, media_instance: &HTMLMediaElement) {
-        self.media_instance.set(Some(media_instance));
+        *self.media_instance.borrow_mut() = Some(MediaElementWeakRef::new(media_instance));
     }
 
     pub(crate) fn handle_action(
@@ -87,8 +86,13 @@ impl MediaSession {
             return;
         }
 
-        // Default action.
-        if let Some(media) = self.media_instance.root() {
+        // Default action. The borrow of the media instance is released before the
+        // element is used, since calling into it can run script.
+        let media_instance = {
+            let media_instance = self.media_instance.borrow();
+            media_instance.as_ref().and_then(|media| media.root())
+        };
+        if let Some(media) = media_instance {
             match action {
                 MediaSessionActionType::Play => {
                     let mut realm = enter_auto_realm(cx, self);
@@ -139,14 +143,14 @@ impl MediaSession {
 
 impl MediaSessionMethods<crate::DomTypeHolder> for MediaSession {
     /// <https://w3c.github.io/mediasession/#dom-mediasession-metadata>
-    fn GetMetadata(&self, can_gc: CanGc) -> Option<DomRoot<MediaMetadata>> {
+    fn GetMetadata(&self, cx: &mut JSContext) -> Option<DomRoot<MediaMetadata>> {
         if let Some(ref metadata) = *self.metadata.borrow() {
             let mut init = MediaMetadataInit::empty();
             init.title = metadata.title.clone().into();
             init.artist = metadata.artist.clone().into();
             init.album = metadata.album.clone().into();
             let global = self.global();
-            Some(MediaMetadata::new(global.as_window(), &init, can_gc))
+            Some(MediaMetadata::new(cx, global.as_window(), &init))
         } else {
             None
         }
@@ -195,13 +199,13 @@ impl MediaSessionMethods<crate::DomTypeHolder> for MediaSession {
     fn SetActionHandler(
         &self,
         action: MediaSessionAction,
-        handler: Option<Rc<MediaSessionActionHandler>>,
+        handler: Option<RootedCallback<MediaSessionActionHandler>>,
     ) {
         match handler {
             Some(handler) => self
                 .action_handlers
                 .borrow_mut()
-                .insert(action.convert(), handler),
+                .insert(action.convert(), handler.to_traced()),
             None => self.action_handlers.borrow_mut().remove(&action.convert()),
         };
     }

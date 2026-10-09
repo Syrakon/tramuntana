@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use super::{WebGLExtension, WebGLExtensionSpec, WebGLExtensions};
@@ -10,7 +11,6 @@ use crate::dom::bindings::codegen::Bindings::OESTextureHalfFloatBinding::OESText
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct OESTextureHalfFloatLinear {
@@ -27,12 +27,8 @@ impl OESTextureHalfFloatLinear {
 
 impl WebGLExtension for OESTextureHalfFloatLinear {
     type Extension = OESTextureHalfFloatLinear;
-    fn new(ctx: &WebGLRenderingContext, can_gc: CanGc) -> DomRoot<OESTextureHalfFloatLinear> {
-        reflect_dom_object(
-            Box::new(OESTextureHalfFloatLinear::new_inherited()),
-            &*ctx.global(),
-            can_gc,
-        )
+    fn new(cx: &mut JSContext, ctx: &WebGLRenderingContext) -> DomRoot<OESTextureHalfFloatLinear> {
+        reflect_dom_object(cx, Box::new(Self::new_inherited()), &*ctx.global())
     }
 
     fn spec() -> WebGLExtensionSpec {

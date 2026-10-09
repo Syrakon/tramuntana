@@ -2,16 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use servo::{InputMethodControl, LoadStatus, MediaSessionPlaybackState};
+use servo::{InputMethodControl, LoadStatus, MediaSessionPlaybackState, SelectElement, WebViewId};
 
 /// Callbacks implemented by embedder. Called by our RunningAppState, generally on behalf of Servo.
 pub trait HostTrait {
     fn show_alert(&self, message: String);
     /// Notify that the load status of the page has changed.
+    ///
     /// Started:
     ///  - "Reload button" should be disabled.
     ///  - "Stop button" should be enabled.
     ///  - Throbber starts spinning.
+    ///
     /// Complete:
     ///  - "Reload button" should be enabled.
     ///  - "Stop button" should be disabled.
@@ -36,6 +38,8 @@ pub trait HostTrait {
     fn on_media_session_playback_state_change(&self, state: MediaSessionPlaybackState);
     /// Called when the media session position state is set.
     fn on_media_session_set_position_state(&self, duration: f64, position: f64, playback_rate: f64);
+    /// Called when a `<select>` element is clicked.
+    fn on_show_select_element(&self, webview_id: WebViewId, prompt: SelectElement);
     /// Called when we get a panic message from constellation
     fn on_panic(&self, reason: String, backtrace: Option<String>);
 }

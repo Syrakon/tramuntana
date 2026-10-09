@@ -4,22 +4,25 @@
 
 use std::cell::Cell;
 use std::mem;
+use std::rc::Rc;
 use std::str::{Chars, FromStr};
 use std::time::Duration;
 
+use bytes::Bytes;
 use dom_struct::dom_struct;
 use encoding_rs::{Decoder, UTF_8};
 use headers::ContentType;
 use http::StatusCode;
 use http::header::{self, HeaderName, HeaderValue};
+use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
 use js::jsval::UndefinedValue;
 use js::rust::HandleObject;
 use mime::{self, Mime};
 use net_traits::request::{CacheMode, CorsSettings, Destination, RequestBuilder, RequestId};
-use net_traits::{FetchMetadata, FilteredMetadata, NetworkError, ResourceFetchTiming};
+use net_traits::{FetchMetadata, Metadata, NetworkError, ResourceFetchTiming};
 use script_bindings::cell::DomRefCell;
-use script_bindings::conversions::SafeToJSValConvertible;
-use script_bindings::reflector::reflect_dom_object_with_proto;
+use script_bindings::reflector::reflect_weak_referenceable_dom_object_with_proto;
 use servo_url::ServoUrl;
 use stylo_atoms::Atom;
 
@@ -38,11 +41,12 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
-use crate::fetch::{FetchCanceller, RequestWithGlobalScope, create_a_potential_cors_request};
-use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
-use crate::realms::enter_realm;
-use crate::script_runtime::CanGc;
-use crate::timers::OneshotTimerCallback;
+use crate::event_loop::timers::OneshotTimerCallback;
+use crate::fetch::fetch::{
+    FetchCanceller, RequestWithGlobalScope, create_a_potential_cors_request,
+};
+use crate::fetch::network_listener::{self, FetchResponseListener, ResourceTimingListener};
+use crate::realms::enter_auto_realm;
 
 const DEFAULT_RECONNECTION_TIME: Duration = Duration::from_millis(5000);
 
@@ -251,10 +255,11 @@ impl EventSourceContext {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dispatchMessage>
-    fn dispatch_event(&mut self, cx: &mut js::context::JSContext) {
+    fn dispatch_event(&mut self, cx: &mut JSContext) {
         let event_source = self.event_source.root();
         // Step 1
-        *event_source.last_event_id.borrow_mut() = DOMString::from(self.last_event_id.clone());
+        *event_source.last_event_id.safe_borrow_mut(cx.no_gc()) =
+            DOMString::from(self.last_event_id.clone());
         // Step 2
         if self.data.is_empty() {
             self.data.clear();
@@ -275,11 +280,12 @@ impl EventSourceContext {
         };
         // Steps 4-5
         let event = {
-            let _ac = enter_realm(&*event_source);
+            let mut realm = enter_auto_realm(cx, &*event_source);
+            let cx = &mut realm.current_realm();
             rooted!(&in(cx) let mut data = UndefinedValue());
-            self.data
-                .safe_to_jsval(cx.into(), data.handle_mut(), CanGc::from_cx(cx));
+            self.data.to_jsval(cx, data.handle_mut());
             MessageEvent::new(
+                cx,
                 &event_source.global(),
                 type_,
                 false,
@@ -289,7 +295,6 @@ impl EventSourceContext {
                 None,
                 event_source.last_event_id.borrow().clone(),
                 Vec::with_capacity(0),
-                CanGc::from_cx(cx),
             )
         };
         // Step 7
@@ -304,14 +309,14 @@ impl EventSourceContext {
             task!(dispatch_the_event_source_event: move |cx| {
                 let event_source = event_source.root();
                 if event_source.ready_state.get() != ReadyState::Closed {
-                    event.root().upcast::<Event>().fire(event_source.upcast(), CanGc::from_cx(cx));
+                    event.root().upcast::<Event>().fire(cx, event_source.upcast());
                 }
             }),
         );
     }
 
     /// <https://html.spec.whatwg.org/multipage/#event-stream-interpretation>
-    fn parse(&mut self, cx: &mut js::context::JSContext, stream: Chars) {
+    fn parse(&mut self, cx: &mut JSContext, stream: Chars) {
         let mut stream = stream.peekable();
 
         while let Some(ch) = stream.next() {
@@ -387,34 +392,33 @@ impl FetchResponseListener for EventSourceContext {
 
     fn process_response(
         &mut self,
-        _: &mut js::context::JSContext,
+        _: &mut JSContext,
         _: RequestId,
         metadata: Result<FetchMetadata, NetworkError>,
     ) {
         match metadata {
-            Ok(fm) => {
-                let meta = match fm {
-                    FetchMetadata::Unfiltered(m) => m,
-                    FetchMetadata::Filtered { unsafe_, filtered } => match filtered {
-                        FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => {
-                            return self.fail_the_connection();
-                        },
-                        _ => unsafe_,
-                    },
-                };
-                // Step 15.3 if res's status is not 200, or if res's `Content-Type` is not
-                // `text/event-stream`, then fail the connection.
-                if meta.status.code() != StatusCode::OK {
+            Ok(fetch_metadata) => {
+                if fetch_metadata.is_cors_cross_origin() {
                     return self.fail_the_connection();
                 }
-                let mime = match meta.content_type {
+                let metadata: Metadata = fetch_metadata.into();
+                // Step 15.3 if res's status is not 200, or if res's `Content-Type` is not
+                // `text/event-stream`, then fail the connection.
+                if metadata.status.code() != StatusCode::OK {
+                    return self.fail_the_connection();
+                }
+                let mime = match metadata.content_type {
                     None => return self.fail_the_connection(),
                     Some(ct) => <ContentType as Into<Mime>>::into(ct.into_inner()),
                 };
                 if (mime.type_(), mime.subtype()) != (mime::TEXT, mime::EVENT_STREAM) {
                     return self.fail_the_connection();
                 }
-                self.origin = meta.final_url.origin().ascii_serialization();
+                self.origin = metadata
+                    .final_url
+                    .origin()
+                    .ascii_serialization()
+                    .into_owned();
                 // Step 15.4 announce the connection and interpret res's body line by line.
                 self.announce_the_connection();
             },
@@ -431,12 +435,7 @@ impl FetchResponseListener for EventSourceContext {
         }
     }
 
-    fn process_response_chunk(
-        &mut self,
-        cx: &mut js::context::JSContext,
-        _: RequestId,
-        chunk: Vec<u8>,
-    ) {
+    fn process_response_chunk(&mut self, cx: &mut JSContext, _: RequestId, chunk: Bytes) {
         let mut output = String::with_capacity(chunk.len());
         let mut input = &chunk[..];
 
@@ -469,7 +468,7 @@ impl FetchResponseListener for EventSourceContext {
 
     fn process_response_eof(
         mut self,
-        cx: &mut js::context::JSContext,
+        cx: &mut JSContext,
         _: RequestId,
         response: Result<(), NetworkError>,
         timing: ResourceFetchTiming,
@@ -491,9 +490,14 @@ impl FetchResponseListener for EventSourceContext {
         network_listener::submit_timing(cx, &self, &response, &timing);
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
+    fn process_csp_violations(
+        &mut self,
+        cx: &mut JSContext,
+        _request_id: RequestId,
+        violations: Vec<Violation>,
+    ) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations, None, None);
+        global.report_csp_violations(cx, violations, None, None);
     }
 }
 
@@ -513,7 +517,7 @@ impl EventSource {
             eventtarget: EventTarget::new_inherited(),
             url,
             request: DomRefCell::new(None),
-            last_event_id: DomRefCell::new(DOMString::from("")),
+            last_event_id: DomRefCell::new(DOMString::new()),
             reconnection_time: Cell::new(DEFAULT_RECONNECTION_TIME),
             generation_id: Cell::new(GenerationId(0)),
 
@@ -524,21 +528,21 @@ impl EventSource {
     }
 
     fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         url: ServoUrl,
         with_credentials: bool,
-        can_gc: CanGc,
     ) -> DomRoot<EventSource> {
-        reflect_dom_object_with_proto(
-            Box::new(EventSource::new_inherited(url, with_credentials)),
+        reflect_weak_referenceable_dom_object_with_proto(
+            cx,
+            Rc::new(EventSource::new_inherited(url, with_credentials)),
             global,
             proto,
-            can_gc,
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#sse-processing-model:fail-the-connection-3
+    /// <https://html.spec.whatwg.org/multipage/#sse-processing-model:fail-the-connection-3>
     pub(crate) fn cancel(&self) {
         self.droppable.cancel();
         self.fail_the_connection();
@@ -571,9 +575,9 @@ impl EventSource {
 impl EventSourceMethods<crate::DomTypeHolder> for EventSource {
     /// <https://html.spec.whatwg.org/multipage/#dom-eventsource>
     fn Constructor(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         url: DOMString,
         event_source_init: &EventSourceInit,
     ) -> Fallible<DomRoot<EventSource>> {
@@ -587,12 +591,12 @@ impl EventSourceMethods<crate::DomTypeHolder> for EventSource {
         };
         // Step 1 Let ev be a new EventSource object.
         let event_source = EventSource::new(
+            cx,
             global,
             proto,
             // Step 5 Set ev's url to urlRecord.
             url_record.clone(),
             event_source_init.withCredentials,
-            can_gc,
         );
         global.track_event_source(&event_source);
         let cors_attribute_state = if event_source_init.withCredentials {
@@ -627,7 +631,7 @@ impl EventSourceMethods<crate::DomTypeHolder> for EventSource {
         // Step 11 Set request's cache mode to "no-store".
         request.cache_mode = CacheMode::NoStore;
         // Step 13 Set ev's request to request.
-        *event_source.request.borrow_mut() = Some(request.clone());
+        *event_source.request.safe_borrow_mut(cx.no_gc()) = Some(request.clone());
         // Step 14 Let processEventSourceEndOfBody given response res be the following step:
         // if res is not a network error, then reestablish the connection.
 
@@ -716,13 +720,14 @@ impl EventSourceTimeoutCallback {
         // Step 5.3: If the EventSource object's last event ID string is not the empty string, then:
         //  - Let lastEventIDValue be the EventSource object's last event ID string, encoded as UTF-8.
         //  - Set (`Last-Event-ID`, lastEventIDValue) in request's header list.
-        if !event_source.last_event_id.borrow().is_empty() {
-            // TODO(eijebong): Change this once typed header support custom values
-            request.headers.insert(
-                HeaderName::from_static("last-event-id"),
+        if !event_source.last_event_id.borrow().is_empty() &&
+            let Ok(header_value) =
                 HeaderValue::from_str(&String::from(event_source.last_event_id.borrow().clone()))
-                    .unwrap(),
-            );
+        {
+            // TODO(eijebong): Change this once typed header support custom values
+            request
+                .headers
+                .insert(HeaderName::from_static("last-event-id"), header_value);
         }
 
         // Step 5.4: Fetch request and process the response obtained in this fashion, if

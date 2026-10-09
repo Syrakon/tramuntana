@@ -5,6 +5,7 @@
 use std::fmt::Debug;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::reflect_dom_object;
 
 use crate::dom::bindings::codegen::Bindings::DebuggerFrameEventBinding::DebuggerFrameEventMethods;
@@ -12,7 +13,6 @@ use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventM
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::event::Event;
 use crate::dom::types::{GlobalScope, PipelineId};
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 /// Event for Rust → JS calls in [`crate::dom::debugger::DebuggerGlobalScope`].
@@ -25,11 +25,11 @@ pub(crate) struct DebuggerFrameEvent {
 
 impl DebuggerFrameEvent {
     pub(crate) fn new(
+        cx: &mut JSContext,
         debugger_global: &GlobalScope,
         pipeline_id: &PipelineId,
         start: u32,
         count: u32,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
         let result = Box::new(Self {
             event: Event::new_inherited(),
@@ -37,7 +37,7 @@ impl DebuggerFrameEvent {
             start,
             count,
         });
-        let result = reflect_dom_object(result, debugger_global, can_gc);
+        let result = reflect_dom_object(cx, result, debugger_global);
         result.event.init_event("frames".into(), false, false);
 
         result

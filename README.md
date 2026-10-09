@@ -86,8 +86,9 @@ For more detailed build instructions, see the Servo Book under [Getting the Code
 
 ### Windows
 
-- Download [`uv`](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer), [`choco`](https://chocolatey.org/install#individual), and [`rustup`](https://win.rustup.rs/)
+- Download [`uv`](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer), and [`rustup`](https://win.rustup.rs/)
   - Be sure to select *Quick install via the Visual Studio Community installer*
+- Ensure that [`winget`](https://learn.microsoft.com/en-us/windows/package-manager/winget/) is available. It should be preinstalled on Windows 10 1809+ and Windows 11, otherwise can be [`manually installed`](https://github.com/microsoft/winget-cli#installing-the-client).
 - In the Visual Studio Installer, ensure the following components are installed:
   - **Windows 10/11 SDK (anything >= 10.0.19041.0)** (`Microsoft.VisualStudio.Component.Windows{10, 11}SDK.{>=19041}`)
   - **MSVC v143 - VS 2022 C++ x64/x86 build tools (Latest)** (`Microsoft.VisualStudio.Component.VC.Tools.x86.x64`)
@@ -109,12 +110,12 @@ For more detailed build instructions, see the Servo Book under [Getting the Code
 - Run the following command to install the necessary components:
   ```shell
   sudo $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --install \
-   "build-tools;34.0.0" \
+   "build-tools;36.0.0" \
    "emulator" \
-   "ndk;28.2.13676358" \
+   "ndk;29.0.14206865" \
    "platform-tools" \
-   "platforms;android-33" \
-   "system-images;android-33;google_apis;x86_64"
+   "platforms;android-37" \
+   "system-images;android-37;google_apis;x86_64"
   ```
 - Follow the instructions above for the platform you are building on
 

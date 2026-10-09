@@ -94,6 +94,7 @@ async def test_iframe_load(
         expected_event={
             "request": {"url": test_page_same_origin_frame},
             "context": top_context["context"],
+            **({"userContext": top_context["userContext"]} if "userContext" in events[0] else {}),
         },
     )
 
@@ -102,7 +103,8 @@ async def test_iframe_load(
         expected_event={
             "request": {"url": test_page},
             "context": frame_context["context"],
-        },
+            **({"userContext": top_context["userContext"]} if "userContext" in events[1] else {}),
+        }
     )
 
 
@@ -299,6 +301,112 @@ async def test_request_cookies(
         events[1],
         expected_event={"request": expected_request, "redirectCount": 0},
     )
+
+
+async def test_request_cookies_intercepted(
+    bidi_session,
+    top_context,
+    wait_for_event,
+    wait_for_future_safe,
+    url,
+    fetch,
+    setup_network_test,
+    add_intercept,
+):
+    text_url = url(PAGE_EMPTY_TEXT)
+
+    network_events = await setup_network_test(events=[BEFORE_REQUEST_SENT_EVENT])
+    events = network_events[BEFORE_REQUEST_SENT_EVENT]
+
+    intercept = await add_intercept(
+        phases=["beforeRequestSent"],
+        url_patterns=[{"type": "string", "pattern": text_url}],
+    )
+
+    await bidi_session.script.evaluate(
+        expression=(
+            "document.cookie = 'foo=bar; Path=/;';"
+            "document.cookie = 'other_path=123; Path=/other;';"
+        ),
+        target=ContextTarget(top_context["context"]),
+        await_promise=False,
+    )
+
+    on_before_request_sent = wait_for_event(BEFORE_REQUEST_SENT_EVENT)
+    fetch_task = asyncio.ensure_future(fetch(text_url, method="GET"))
+    await wait_for_future_safe(on_before_request_sent)
+
+    assert len(events) == 1
+    assert_before_request_sent_event(
+        events[0],
+        expected_event={
+            "request": {
+                "cookies": (
+                    {
+                        "httpOnly": False,
+                        "name": "foo",
+                        "path": "/",
+                        "secure": False,
+                        "size": 6,
+                        "value": {"type": "string", "value": "bar"},
+                    },
+                ),
+                "method": "GET",
+                "url": text_url,
+            },
+            "isBlocked": True,
+            "intercepts": [intercept],
+            "redirectCount": 0,
+        },
+    )
+
+    await bidi_session.network.continue_request(request=events[0]["request"]["request"])
+    await fetch_task
+
+    await bidi_session.script.evaluate(
+        expression="document.cookie = 'fuu=baz; Path=/;';",
+        target=ContextTarget(top_context["context"]),
+        await_promise=False,
+    )
+
+    on_before_request_sent = wait_for_event(BEFORE_REQUEST_SENT_EVENT)
+    fetch_task = asyncio.ensure_future(fetch(text_url, method="GET"))
+    await wait_for_future_safe(on_before_request_sent)
+
+    assert len(events) == 2
+    assert_before_request_sent_event(
+        events[1],
+        expected_event={
+            "request": {
+                "cookies": (
+                    {
+                        "httpOnly": False,
+                        "name": "foo",
+                        "path": "/",
+                        "secure": False,
+                        "size": 6,
+                        "value": {"type": "string", "value": "bar"},
+                    },
+                    {
+                        "httpOnly": False,
+                        "name": "fuu",
+                        "path": "/",
+                        "secure": False,
+                        "size": 6,
+                        "value": {"type": "string", "value": "baz"},
+                    },
+                ),
+                "method": "GET",
+                "url": text_url,
+            },
+            "isBlocked": True,
+            "intercepts": [intercept],
+            "redirectCount": 0,
+        },
+    )
+
+    await bidi_session.network.continue_request(request=events[1]["request"]["request"])
+    await fetch_task
 
 
 async def test_request_cookie_same_name_different_host(

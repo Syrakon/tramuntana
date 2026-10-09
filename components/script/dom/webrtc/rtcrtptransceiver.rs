@@ -5,6 +5,7 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::RTCRtpTransceiverBinding::{
@@ -13,7 +14,6 @@ use crate::dom::bindings::codegen::Bindings::RTCRtpTransceiverBinding::{
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::rtcrtpsender::RTCRtpSender;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct RTCRtpTransceiver {
@@ -23,28 +23,24 @@ pub(crate) struct RTCRtpTransceiver {
 }
 
 impl RTCRtpTransceiver {
-    fn new_inherited(
-        global: &GlobalScope,
-        direction: RTCRtpTransceiverDirection,
-        can_gc: CanGc,
-    ) -> Self {
-        let sender = RTCRtpSender::new(global, can_gc);
+    fn new_inherited(direction: RTCRtpTransceiverDirection, sender: &RTCRtpSender) -> Self {
         Self {
             reflector_: Reflector::new(),
             direction: Cell::new(direction),
-            sender: Dom::from_ref(&*sender),
+            sender: Dom::from_ref(sender),
         }
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         direction: RTCRtpTransceiverDirection,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
+        let sender = RTCRtpSender::new(cx, global);
         reflect_dom_object(
-            Box::new(Self::new_inherited(global, direction, can_gc)),
+            cx,
+            Box::new(Self::new_inherited(direction, &sender)),
             global,
-            can_gc,
         )
     }
 }

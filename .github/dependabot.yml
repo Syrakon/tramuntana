@@ -6,11 +6,15 @@ updates:
     - "tests/blink_perf/**"
     - "tests/wpt/**"
   schedule:
-    interval: daily
+    interval: "cron"
+    cronjob: "0 1 * * WED,SUN"  # wednesday and sunday at 1am
     # default timezone is UTC
     # CI is usually busiest during european daytime.
-    time: "00:00"
-  open-pull-requests-limit: 7
+    timezone: Europe/Berlin
+  cooldown:
+    default-days: 7
+    include: "*"
+  open-pull-requests-limit: 10
   allow:
   - dependency-type: direct
   - dependency-type: indirect
@@ -65,9 +69,6 @@ updates:
       patterns:
         - "serde"
         - "serde_core"
-    servo-media-related:
-      patterns:
-        - "servo-media*"
     strum-related:
       patterns:
         - "strum"
@@ -101,6 +102,10 @@ updates:
       patterns:
         - "zbus-lockstep"
         - "zbus-lockstep-macros"
+    wgpu:
+      patterns:
+        - "wgpu*"
+        - "naga*"
   ignore:
   # Ignore all stylo crates as their upgrades are coordinated via companion PRs.
   - dependency-name: selectors
@@ -114,3 +119,7 @@ updates:
   - dependency-name: stylo_traits
   - dependency-name: to_shmem
   - dependency-name: to_shmem_derive
+  # We only allow automatic patch updates of wgpu crates
+  # all others require at least expectation update
+  - dependency-name: "wgpu*"
+    update-types: ["version-update:semver-minor", "version-update:semver-major"]

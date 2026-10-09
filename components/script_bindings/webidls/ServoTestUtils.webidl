@@ -20,6 +20,11 @@ namespace ServoTestUtils {
   undefined js_backtrace();
 
   undefined panic();
+
+  undefined ensureAccessibilityActive();
+
+  [Exposed=Window]
+  AccessibilityUpdateResult forceAccessibilityUpdate();
 };
 
 [Exposed=Window, Pref="dom_servo_helpers_enabled"]
@@ -27,5 +32,14 @@ interface LayoutResult {
     readonly attribute /* FrozenArray<DOMString> */ any phases;
     readonly attribute unsigned long rebuiltFragmentCount;
     readonly attribute unsigned long restyleFragmentCount;
-    readonly attribute unsigned long possiblyMovedFragmentCount;
+    readonly attribute unsigned long onlyDescendantsChangedCount;
+
+};
+
+[Exposed=Window, Pref="dom_servo_helpers_enabled"]
+interface AccessibilityUpdateResult {
+    readonly attribute unsigned long nodesUpdatedFromDom;
+    readonly attribute unsigned long nodesUpdatedFromTree;
+    readonly attribute unsigned long nodesUpdatedBounds;
+    readonly attribute unsigned long nodesInTreeUpdate;
 };

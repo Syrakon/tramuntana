@@ -13,9 +13,9 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::AttributeMutation;
 use crate::dom::element::attributes::storage::AttrRef;
+use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::svg::svggraphicselement::SVGGraphicsElement;
-use crate::dom::virtualmethods::VirtualMethods;
 
 /// <https://svgwg.org/svg2-draft/embedded.html#Placement>
 const DEFAULT_WIDTH: u32 = 300;
@@ -79,7 +79,7 @@ impl VirtualMethods for SVGImageElement {
             .attribute_mutated(cx, attr, mutation);
         if attr.local_name() == &local_name!("href") &&
             matches!(attr.namespace(), &ns!() | &ns!(xlink)) &&
-            let AttributeMutation::Set(..) = mutation
+            let AttributeMutation::Set(_) = mutation
         {
             self.fetch_image_resource();
         }

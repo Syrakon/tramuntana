@@ -7,25 +7,34 @@ use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::{fs, io};
+use std::{fs, io, thread};
 
 use log::{debug, error, warn};
 use read_fonts::FileRef::{Collection, Font as OHOS_Font};
 use read_fonts::{FileRef, FontRef, TableProvider};
-use servo_base::text::{UnicodeBlock, UnicodeBlockMethod};
+use serde::{Deserialize, Serialize};
+use servo_base::text::UnicodeBlockMethod;
+use skrifa::{GlyphId, MetadataProvider};
 use style::Atom;
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{
-    FontStretch as StyleFontStretch, FontStyle as StyleFontStyle, FontWeight as StyleFontWeight,
+    FontStyle as StyleFontStyle, FontWeight as StyleFontWeight, FontWidth as StyleFontWidth,
 };
-use unicode_script::Script;
 
+use crate::platform::freetype::ohos::font_cache::{
+    font_file_cached_on_disk, read_from_disk, serialize_and_write_to_disk_wrapper,
+};
 use crate::{
     EmojiPresentationPreference, FallbackFontSelectionOptions, FontIdentifier, FontTemplate,
     FontTemplateDescriptor, LocalFontIdentifier, LowercaseFontFamilyName,
 };
 
 static FONT_LIST: LazyLock<FontList> = LazyLock::new(FontList::new);
+
+/// The length of [`UnicodeBlockSet`]'s array.
+/// Currently, there are 328 different unicode blocks supported by Servo (from `shared/base/unicode_block.rs`),
+/// so they can be represented by 64 * 6 = 384 bits.
+const UNICODE_BLOCK_SET_WORDS: usize = 6;
 
 /// When testing the ohos font code on linux, we can pass the fonts directory of the SDK
 /// via an environment variable.
@@ -36,15 +45,16 @@ static OHOS_FONTS_DIR: &str = env!("OHOS_SDK_FONTS_DIR");
 #[cfg(not(ohos_mock))]
 static OHOS_FONTS_DIR: &str = "/system/fonts";
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 // HarmonyOS only comes in Condensed and Normal variants
+// NOTE: If you modify this, you need to update CACHE_REVISION under [`font_cache.rs`].
 enum FontWidth {
     Condensed,
     #[default]
     Normal,
 }
 
-impl From<FontWidth> for StyleFontStretch {
+impl From<FontWidth> for StyleFontWidth {
     fn from(value: FontWidth) -> Self {
         match value {
             FontWidth::Condensed => Self::CONDENSED,
@@ -53,7 +63,22 @@ impl From<FontWidth> for StyleFontStretch {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+// NOTE: If you modify this, you need to update CACHE_REVISION under [`font_cache.rs`].
+struct UnicodeBlockSet([u64; UNICODE_BLOCK_SET_WORDS]);
+
+impl UnicodeBlockSet {
+    fn insert(&mut self, index: usize) {
+        self.0[index / 64] |= 1u64 << (index % 64);
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        (self.0[index / 64] & (1u64 << (index % 64))) != 0
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+// NOTE: If you modify this, you need to update CACHE_REVISION under [`font_cache.rs`].
 struct Font {
     // `LocalFontIdentifier` uses `Atom` for string interning and requires a String or str, so we
     // already require a String here, instead of using a PathBuf.
@@ -61,21 +86,27 @@ struct Font {
     weight: Option<i32>,
     style: Option<String>,
     width: FontWidth,
+    unicode_range: UnicodeBlockSet,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+// NOTE: If you modify this, you need to update CACHE_REVISION under [`font_cache.rs`].
 struct FontFamily {
     name: String,
     fonts: Vec<Font>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+// NOTE: If you modify this, you need to update CACHE_REVISION under [`font_cache.rs`].
 struct FontAlias {
     from: String,
     to: String,
     weight: Option<i32>,
 }
 
-struct FontList {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+// NOTE: If you modify this, you need to update CACHE_REVISION under [`font_cache.rs`].
+pub(super) struct FontList {
     families: Vec<FontFamily>,
     aliases: Vec<FontAlias>,
 }
@@ -110,7 +141,7 @@ fn detect_hos_font_style(font: &FontRef, file_path: &str) -> Option<String> {
             panic!("Failed to read {:?}'s postscript table!", file_path);
         })
         .italic_angle() !=
-        (0 as i32).into()
+        (0_i32).into()
     {
         Some("italic".to_string())
     } else {
@@ -134,10 +165,10 @@ fn detect_hos_font_width(font: &FontRef) -> FontWidth {
     // and we simply return `FontWidth::Normal` as a default.
     match font.os2() {
         Ok(result) => {
-            let font_width = result.us_width_class().clone();
+            let font_width = result.us_width_class();
             // According to https://learn.microsoft.com/en-us/typography/opentype/spec/os2#uswidthclass,
             // value between 1 & 4 inclusive represents condensed type.
-            if font_width >= 1 && font_width <= 4 {
+            if (1..=4).contains(&font_width) {
                 FontWidth::Condensed
             } else {
                 FontWidth::Normal
@@ -145,6 +176,31 @@ fn detect_hos_font_width(font: &FontRef) -> FontWidth {
         },
         Err(_) => FontWidth::Normal,
     }
+}
+
+/// Use the font's cmap table (<https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6cmap.html>)
+/// to obtain the range of unicode blocks the font supports, which will be used during coarse filtering by `fallback_font_families()`.
+///
+/// Although OS/2 table is more suitable for the task, it is found via testing that this table is not accurate in some HarmonyOS fonts
+/// (e.g. A HarmonyOS font's OS/2 table may claim that it supports CJK block, eventhough it doesn't).
+/// So cmap table is used instead as a form of optimization.
+fn detect_hos_font_unicode_range(font: &FontRef) -> UnicodeBlockSet {
+    // Conceptually, during initialization (if cache file doesn't exist or needs updating), Servo will traverse the font files
+    // one by one and check its cmap table, which lets us check all the codepoints that is available in a given font.
+    // From here, we map each codepoint to its respective unicode block and then mark an element of `bits`.
+    //
+    // `bits` represents the range of unicode block a font supports. For example, if the second LSB of `bits`' first
+    // word is set to 1, it means that at least one codepoint from `Latin1Supplement` block is supported by the font.
+    let mut bits = UnicodeBlockSet::default();
+    for (codepoint, glyph) in font.charmap().mappings() {
+        if glyph == GlyphId::NOTDEF {
+            continue;
+        }
+        if let Some(block) = char::from_u32(codepoint).and_then(|c| c.block()) {
+            bits.insert(block as usize);
+        }
+    }
+    bits
 }
 
 /// This function generates list of `FontFamily` based on font files with the extension `.otf`, `.ttc`, or `.otf`.
@@ -182,7 +238,7 @@ fn get_system_font_families(font_files: Vec<PathBuf>) -> Vec<FontFamily> {
 
         match file_ref {
             OHOS_Font(font) => {
-                if let Some(result) = get_family_name_and_generate_font_struct(&font, &font_file) {
+                if let Some(result) = get_family_name_and_generate_font_struct(&font, font_file) {
                     all_families.push(result);
                 }
             },
@@ -190,7 +246,7 @@ fn get_system_font_families(font_files: Vec<PathBuf>) -> Vec<FontFamily> {
                 // Process all the font files within the collection one by one.
                 for f in font_collection.iter() {
                     if let Some(result) =
-                        get_family_name_and_generate_font_struct(&(f.unwrap()), &font_file)
+                        get_family_name_and_generate_font_struct(&(f.unwrap()), font_file)
                     {
                         all_families.push(result);
                     };
@@ -215,25 +271,22 @@ fn get_system_font_families(font_files: Vec<PathBuf>) -> Vec<FontFamily> {
 
 fn get_family_name_and_generate_font_struct(
     font_ref: &FontRef,
-    file_path: &PathBuf,
+    file_path: &Path,
 ) -> Option<(String, Font)> {
     // Parse the file path to string. If this fails, then skip this font.
-    let Some(file_path_string_slice) = file_path.to_str() else {
-        return None;
-    };
+    let file_path_string_slice = file_path.to_str()?;
     let file_path_str = file_path_string_slice.to_string();
 
     // Obtain the font's styling
     let style = detect_hos_font_style(font_ref, file_path_string_slice);
     let weight = detect_hos_font_weight_alias(font_ref);
     let width = detect_hos_font_width(font_ref);
+    let unicode_range = detect_hos_font_unicode_range(font_ref);
 
     // Get the family name via the name table. According to TrueType's reference manual (https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6.html),
     // the name table is a mandatory table. Therefore, if Fontations fails to read this table for whatever reason, return `None` to skip this font altogether.
-    let Ok(font_name_table) = font_ref.name() else {
-        return None;
-    };
-    let Some(family_name) = font_name_table
+    let font_name_table = font_ref.name().ok()?;
+    let family_name = font_name_table
         .name_record()
         .iter()
         .filter(|record| record.name_id().to_u16() == 1) // According to the reference manual, name identifier code (nameID) `1` is the font family name.
@@ -242,73 +295,48 @@ fn get_family_name_and_generate_font_struct(
                 .string(font_name_table.string_data())
                 .ok()
                 .map(|s| s.to_string())
-        })
-    else {
-        return None;
-    };
+        })?;
 
     let font = Font {
         filepath: file_path_str,
         weight,
         style,
         width,
+        unicode_range,
     };
     Some((family_name, font))
 }
 
 impl FontList {
     fn new() -> FontList {
-        FontList {
-            families: Self::detect_installed_font_families(),
-            aliases: Self::fallback_font_aliases(),
+        if !font_file_cached_on_disk() {
+            let font_list = FontList {
+                families: Self::detect_installed_font_families(),
+                aliases: Self::fallback_font_aliases(),
+            };
+
+            let font_list_clone = font_list.clone();
+            thread::spawn(move || serialize_and_write_to_disk_wrapper(font_list_clone));
+            return font_list;
         }
+
+        read_from_disk().unwrap_or_else(|e| {
+            error!("Servo failed to read cached FontList from disk: {:?}", e);
+
+            // Since reading from disk failed, we have no choice but to generate the FontList...
+            FontList {
+                families: Self::detect_installed_font_families(),
+                aliases: Self::fallback_font_aliases(),
+            }
+        })
     }
 
     /// Detect available fonts or fallback to a hardcoded list
     fn detect_installed_font_families() -> Vec<FontFamily> {
-        let mut families = enumerate_font_files()
+        enumerate_font_files()
             .inspect_err(|e| error!("Failed to enumerate font files due to `{e:?}`"))
             .map(get_system_font_families)
-            .unwrap_or_else(|_| FontList::fallback_font_families());
-        families.extend(Self::hardcoded_font_families());
-        families
-    }
-
-    /// A List of hardcoded fonts, added in addition to both detected and fallback font families.
-    ///
-    /// There are only two emoji fonts, and their filenames are stable, so we just hardcode
-    /// their paths, instead of attempting to parse the family name from the filepaths.
-    fn hardcoded_font_families() -> Vec<FontFamily> {
-        let hardcoded_fonts = vec![
-            FontFamily {
-                name: "HMOS Color Emoji".to_string(),
-                fonts: vec![Font {
-                    filepath: FontList::font_absolute_path("HMOSColorEmojiCompat.ttf"),
-                    ..Default::default()
-                }],
-            },
-            FontFamily {
-                name: "HMOS Color Emoji Flags".to_string(),
-                fonts: vec![Font {
-                    filepath: FontList::font_absolute_path("HMOSColorEmojiFlags.ttf"),
-                    ..Default::default()
-                }],
-            },
-        ];
-        if log::log_enabled!(log::Level::Warn) {
-            for family in hardcoded_fonts.iter() {
-                for font in &family.fonts {
-                    let path = Path::new(&font.filepath);
-                    if !path.exists() {
-                        warn!(
-                            "Hardcoded Emoji Font {} was not found at `{}`",
-                            family.name, font.filepath
-                        )
-                    }
-                }
-            }
-        }
-        hardcoded_fonts
+            .unwrap_or_else(|_| FontList::fallback_font_families())
     }
 
     fn fallback_font_families() -> Vec<FontFamily> {
@@ -388,13 +416,13 @@ impl FontList {
 // Functions used by SystemFontService
 pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
-    F: FnMut(String),
+    F: FnMut(&str),
 {
     for family in &FONT_LIST.families {
-        callback(family.name.clone());
+        callback(&family.name);
     }
     for alias in &FONT_LIST.aliases {
-        callback(alias.from.clone());
+        callback(&alias.from);
     }
 }
 
@@ -408,7 +436,7 @@ where
             face_index: 0,
             named_instance_index: 0,
         };
-        let stretch = font.width.into();
+        let width = font.width.into();
         let weight = font
             .weight
             .map(|w| StyleFontWeight::from_float(w as f32))
@@ -425,11 +453,10 @@ where
             },
             None => StyleFontStyle::NORMAL,
         };
-        let descriptor = FontTemplateDescriptor::new(weight, stretch, style);
+        let descriptor = FontTemplateDescriptor::new(weight, width, style);
         callback(FontTemplate::new(
             FontIdentifier::Local(local_font_identifier),
             descriptor,
-            None,
             None,
         ));
     };
@@ -441,20 +468,25 @@ where
         return;
     }
 
-    if let Some(alias) = FONT_LIST.find_alias(family_name) {
-        if let Some(family) = FONT_LIST.find_family(&alias.to) {
-            for font in &family.fonts {
-                match (alias.weight, font.weight) {
-                    (None, _) => produce_font(font),
-                    (Some(w1), Some(w2)) if w1 == w2 => produce_font(font),
-                    _ => {},
-                }
+    if let Some(alias) = FONT_LIST.find_alias(family_name) &&
+        let Some(family) = FONT_LIST.find_family(&alias.to)
+    {
+        for font in &family.fonts {
+            match (alias.weight, font.weight) {
+                (None, _) => produce_font(font),
+                (Some(w1), Some(w2)) if w1 == w2 => produce_font(font),
+                _ => {},
             }
         }
     }
 }
 
-// Based on fonts present in OpenHarmony.
+/// Generate a list of candidate fonts and returns the list after sorting them: prioritize fonts whose family name contains `HarmonyOS` or `HMOS`.
+///
+/// The reason this is done is optimization: because the ordering returned by `fontations` (and therefore the generated FONT_LIST) is random,
+/// we want to prioritize `HarmonyOS` fonts during checks.
+///
+/// TODO: in the future, consider other factors such as language. And use multithreading to improve performance.
 pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'static str> {
     let mut families = vec![];
 
@@ -463,71 +495,29 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
         families.push("HMOS Color Emoji Flags");
     }
 
-    if Script::from(options.character) == Script::Han {
-        families.push("HarmonyOS Sans SC");
-        families.push("HarmonyOS Sans TC");
+    match options.character.block() {
+        Some(unicode_block) => {
+            let index = unicode_block as usize;
+            for font_family in &FONT_LIST.families {
+                for font in &font_family.fonts {
+                    if font.unicode_range.contains(index) {
+                        families.push(&font_family.name);
+                        break;
+                    }
+                }
+            }
+        },
+        None => {
+            for font_family in &FONT_LIST.families {
+                families.push(&font_family.name);
+            }
+        },
     }
 
-    if let Some(block) = options.character.block() {
-        match block {
-            UnicodeBlock::Hebrew => {
-                families.push("Noto Sans Hebrew");
-            },
-
-            UnicodeBlock::Arabic => {
-                families.push("HarmonyOS Sans Naskh Arabic");
-            },
-
-            UnicodeBlock::Devanagari => {
-                families.push("Noto Sans Devanagari");
-            },
-
-            UnicodeBlock::Tamil => {
-                families.push("Noto Sans Tamil");
-            },
-
-            UnicodeBlock::Thai => {
-                families.push("Noto Sans Thai");
-            },
-
-            UnicodeBlock::Georgian | UnicodeBlock::GeorgianSupplement => {
-                families.push("Noto Sans Georgian");
-            },
-
-            UnicodeBlock::Ethiopic | UnicodeBlock::EthiopicSupplement => {
-                families.push("Noto Sans Ethiopic");
-            },
-            UnicodeBlock::HangulCompatibilityJamo |
-            UnicodeBlock::HangulJamo |
-            UnicodeBlock::HangulJamoExtendedA |
-            UnicodeBlock::HangulJamoExtendedB |
-            UnicodeBlock::HangulSyllables => {
-                families.push("Noto Sans CJK KR");
-                families.push("Noto Sans Mono CJK KR");
-                families.push("Noto Serif CJK KR");
-                families.push("Noto Sans KR");
-            },
-            UnicodeBlock::Hiragana |
-            UnicodeBlock::Katakana |
-            UnicodeBlock::KatakanaPhoneticExtensions => {
-                families.push("Noto Sans CJK JP");
-                families.push("Noto Sans Mono CJK JP");
-                families.push("Noto Serif CJK JP");
-                families.push("Noto Sans JP");
-            },
-            UnicodeBlock::HalfwidthandFullwidthForms => {
-                families.push("HarmonyOS Sans SC");
-                families.push("Noto Sans CJK SC");
-                families.push("Noto Sans Mono CJK SC");
-            },
-            _ => {},
-        }
-    }
-
-    families.push("HarmonyOS Sans");
-    families.push("Noto Sans");
-    families.push("Noto Sans Symbols");
-    families.push("Noto Sans Symbols 2");
+    families.sort_by_key(|name| {
+        let is_priority = name.contains("HarmonyOS") || name.contains("HMOS");
+        (!is_priority, *name)
+    });
     families
 }
 
@@ -554,21 +544,25 @@ mod test {
     #[test]
     fn test_get_system_font_families() {
         use super::get_system_font_families;
-        let families = get_system_font_families(vec![PathBuf::from("NotoSansCJK-Regular.ttc")]);
+        let fonts_dir = PathBuf::from(super::OHOS_FONTS_DIR);
+        let families = get_system_font_families(vec![fonts_dir.join("NotoSansCJK-Regular.ttc")]);
         assert_eq!(families.len(), 1);
         let family = families.first().unwrap();
         assert_eq!(family.name, "Noto Sans CJK".to_string());
 
-        let families = get_system_font_families(vec![
-            PathBuf::from("NotoSerifGeorgian[wdth,wght].ttf"),
-            PathBuf::from("HarmonyOS_Sans_Naskh_Arabic_UI.ttf"),
-            PathBuf::from("HarmonyOS_Sans_Condensed.ttf"),
-            PathBuf::from("HarmonyOS_Sans_Condensed_Italic.ttf"),
-            PathBuf::from("NotoSansDevanagariUI-Bold.ttf"),
-            PathBuf::from("NotoSansDevanagariUI-Medium.ttf"),
-            PathBuf::from("NotoSansDevanagariUI-Regular.ttf"),
-            PathBuf::from("NotoSansDevanagariUI-SemiBold.ttf"),
-        ]);
+        let families_paths = [
+            "NotoSerifGeorgian[wdth,wght].ttf",
+            "HarmonyOS_Sans_Naskh_Arabic_UI.ttf",
+            "HarmonyOS_Sans_Condensed.ttf",
+            "HarmonyOS_Sans_Condensed_Italic.ttf",
+            "NotoSansDevanagariUI-Bold.ttf",
+            "NotoSansDevanagariUI-Medium.ttf",
+            "NotoSansDevanagariUI-Regular.ttf",
+            "NotoSansDevanagariUI-SemiBold.ttf",
+        ]
+        .map(|filename| fonts_dir.join(filename))
+        .to_vec();
+        let families = get_system_font_families(families_paths);
         assert_eq!(families.len(), 4);
     }
 

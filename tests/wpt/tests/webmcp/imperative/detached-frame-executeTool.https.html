@@ -17,7 +17,7 @@ promise_test(async t => {
   await load_promise;
 
   const iDOMException = iframe.contentWindow.DOMException;
-  const iframe_modelContext = iframe.contentWindow.navigator.modelContext;
+  const iframe_modelContext = iframe.contentWindow.document.modelContext;
 
   // Register a dummy tool so we have a valid tool object before detaching the frame.
   const toolchange_promise = new Promise(resolve => {
@@ -40,7 +40,7 @@ promise_test(async t => {
   iframe.remove();
 
   // Calling executeTool() should reject with InvalidStateError.
-  await promise_rejects_dom(t, 'InvalidStateError', iDOMException, iframe_modelContext.executeTool(tool, '{}'));
+  await promise_rejects_dom(t, 'InvalidStateError', iDOMException, iframe_modelContext.executeTool(tool));
 }, 'executeTool() throws `InvalidStateError` in detached frame');
 </script>
 </body>

@@ -32,13 +32,11 @@ impl GStreamerRegistryScanner {
     }
 
     fn is_codec_supported(&self, codec: &str) -> bool {
-        // A codec string carries the profile and level after the name of the
-        // codec, as in "avc1.42E01E", and those are registered as "avc*".
-        self.supported_codecs.contains(codec) ||
-            self.supported_codecs.iter().any(|supported| {
-                supported
-                    .strip_suffix('*')
-                    .is_some_and(|prefix| codec.starts_with(prefix))
+        self.supported_codecs
+            .iter()
+            .any(|entry| match entry.strip_suffix('*') {
+                Some(prefix) => codec.starts_with(prefix),
+                None => codec == *entry,
             })
     }
 

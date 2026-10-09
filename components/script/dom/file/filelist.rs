@@ -5,18 +5,18 @@
 use std::slice::Iter;
 
 use dom_struct::dom_struct;
+use js::context::{JSContext, NoGC};
 use script_bindings::reflector::{Reflector, reflect_dom_object};
+use script_bindings::serializable::Serializable;
+use script_bindings::structuredclone::StructuredData;
 use servo_base::id::{FileListId, FileListIndex};
 use servo_constellation_traits::SerializableFileList;
 
 use crate::dom::bindings::codegen::Bindings::FileListBinding::FileListMethods;
 use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::bindings::serializable::Serializable;
-use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::file::File;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 // https://w3c.github.io/FileAPI/#dfn-filelist
 #[dom_struct]
@@ -35,30 +35,30 @@ impl FileList {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         files: Vec<DomRoot<File>>,
-        can_gc: CanGc,
     ) -> DomRoot<FileList> {
         reflect_dom_object(
+            cx,
             Box::new(FileList::new_inherited(
                 files.iter().map(|r| Dom::from_ref(&**r)).collect(),
             )),
             window,
-            can_gc,
         )
     }
 
     pub(crate) fn new_in_global(
+        cx: &mut JSContext,
         global: &GlobalScope,
         files: Vec<DomRoot<File>>,
-        can_gc: CanGc,
     ) -> DomRoot<FileList> {
         reflect_dom_object(
+            cx,
             Box::new(FileList::new_inherited(
                 files.iter().map(|r| Dom::from_ref(&**r)).collect(),
             )),
             global,
-            can_gc,
         )
     }
 
@@ -67,32 +67,32 @@ impl FileList {
     }
 }
 
-impl Serializable for FileList {
+impl Serializable<crate::DomTypeHolder> for FileList {
     type Index = FileListIndex;
     type Data = SerializableFileList;
 
     /// <https://html.spec.whatwg.org/multipage/#serialization-steps>
-    fn serialize(&self) -> Result<(FileListId, SerializableFileList), ()> {
+    fn serialize(&self, no_gc: &NoGC) -> Result<(FileListId, SerializableFileList), ()> {
         let files = self
             .list
             .iter()
-            .map(|file| file.serialized_data())
+            .map(|file| file.serialized_data(no_gc))
             .collect::<Result<Vec<_>, _>>()?;
         Ok((FileListId::new(), SerializableFileList { files }))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#deserialization-steps>
     fn deserialize(
+        cx: &mut JSContext,
         owner: &GlobalScope,
         serialized: SerializableFileList,
-        can_gc: CanGc,
     ) -> Result<DomRoot<Self>, ()> {
         let files = serialized
             .files
             .into_iter()
-            .map(|file| File::deserialize(owner, file, can_gc))
+            .map(|file| File::deserialize(cx, owner, file))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(FileList::new_in_global(owner, files, can_gc))
+        Ok(FileList::new_in_global(cx, owner, files))
     }
 
     fn serialized_storage<'a>(

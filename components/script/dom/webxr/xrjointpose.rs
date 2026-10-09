@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::reflect_dom_object;
 
 use crate::dom::bindings::codegen::Bindings::XRJointPoseBinding::XRJointPoseMethods;
@@ -12,7 +13,6 @@ use crate::dom::window::Window;
 use crate::dom::xrpose::XRPose;
 use crate::dom::xrrigidtransform::XRRigidTransform;
 use crate::dom::xrsession::ApiRigidTransform;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct XRJointPose {
@@ -29,16 +29,16 @@ impl XRJointPose {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         pose: ApiRigidTransform,
         radius: Option<f32>,
-        can_gc: CanGc,
     ) -> DomRoot<XRJointPose> {
-        let transform = XRRigidTransform::new(window, pose, can_gc);
+        let transform = XRRigidTransform::new(cx, window, pose);
         reflect_dom_object(
+            cx,
             Box::new(XRJointPose::new_inherited(&transform, radius)),
             window,
-            can_gc,
         )
     }
 }

@@ -60,9 +60,6 @@
   //void print();
   //any showModalDialog(DOMString url, optional any argument);
 
-  unsigned long requestAnimationFrame(FrameRequestCallback callback);
-  undefined cancelAnimationFrame(unsigned long handle);
-
   [Throws, CrossOriginCallable]
   undefined postMessage(any message, USVString targetOrigin, optional sequence<object> transfer = []);
   [Throws, CrossOriginCallable]
@@ -129,7 +126,9 @@ partial interface Window {
 
   // client
   [Replaceable] readonly attribute long screenX;
+  [Replaceable] readonly attribute long screenLeft;
   [Replaceable] readonly attribute long screenY;
+  [Replaceable] readonly attribute long screenTop;
   [Replaceable] readonly attribute long outerWidth;
   [Replaceable] readonly attribute long outerHeight;
   [Replaceable] readonly attribute double devicePixelRatio;
@@ -138,8 +137,6 @@ partial interface Window {
 // WebDriver extensions
 partial interface Window {
   // Shouldn't be public, but just to make things work for now
-  undefined webdriverCallback(optional any result);
-  undefined webdriverException(optional any result);
   Element? webdriverElement(DOMString id);
   WindowProxy? webdriverFrame(DOMString id);
   WindowProxy webdriverWindow(DOMString id);
@@ -157,9 +154,6 @@ interface mixin WindowLocalStorage {
   [Throws] readonly attribute Storage localStorage;
 };
 Window includes WindowLocalStorage;
-
-// http://w3c.github.io/animation-timing/#framerequestcallback
-callback FrameRequestCallback = undefined (DOMHighResTimeStamp time);
 
 partial interface Window {
    [Pref="css_animations_testing_enabled"]

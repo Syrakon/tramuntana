@@ -24,9 +24,12 @@ servo-base = { workspace = true }
 webrender_api = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { workspace = true, features = ["html_reports"] }
+
+[lints]
+workspace = true
 
 [[bench]]
-name = "benches"
-path = "benches.rs"
+name = "unmultiply_inplace"
+path = "benches/unmultiply_inplace.rs"
 harness = false

@@ -26,13 +26,13 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::thread;
 use std::vec::Vec;
 
+use data_url::mime::Mime;
 use device_monitor::GStreamerDeviceMonitor;
 use gstreamer::prelude::*;
-use ipc_channel::ipc::IpcSender;
 use log::warn;
 use media_stream::GStreamerMediaStream;
-use mime::Mime;
 use registry_scanner::GSTREAMER_REGISTRY_SCANNER;
+use servo_base::generic_channel::GenericCallback;
 use servo_media::{Backend, BackendDeInit, BackendInit, MediaInstanceError, SupportsMediaType};
 use servo_media_audio::context::{AudioContext, AudioContextOptions};
 use servo_media_audio::decoder::AudioDecoder;
@@ -89,6 +89,35 @@ impl GStreamerBackend {
             BACKEND_THREAD.get_or_init(|| {
                 thread::spawn(|| glib::MainLoop::new(None, false).run());
                 true
+            });
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            // Remove the va plugins that have some issues on certain platforms.
+            // When the driver is fixed we will remove this.
+            let registry = gstreamer::Registry::get();
+            if let Some(plugin) = registry.find_plugin("va") {
+                registry.remove_plugin(&plugin);
+            }
+            if let Some(plugin) = registry.find_plugin("vaapi") {
+                registry.remove_plugin(&plugin);
+            }
+        }
+
+        // This is a workaround for a race condition in GStreamer. Real fix is
+        // in
+        // https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/12194
+        // . This will hold a connection to the server but it won't create
+        // streams. This happens during READY -> PAUSED.
+        #[cfg(target_os = "linux")]
+        {
+            static PULSESINK_KEEPALIVE: std::sync::OnceLock<Option<gstreamer::Element>> =
+                std::sync::OnceLock::new();
+            PULSESINK_KEEPALIVE.get_or_init(|| {
+                let sink = gstreamer::ElementFactory::make("pulsesink").build().ok()?;
+                sink.set_state(gstreamer::State::Ready).ok()?;
+                Some(sink)
             });
         }
 
@@ -175,7 +204,7 @@ impl Backend for GStreamerBackend {
         &self,
         context_id: &ClientContextId,
         stream_type: StreamType,
-        sender: IpcSender<PlayerEvent>,
+        sender: GenericCallback<PlayerEvent>,
         renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
         audio_renderer: Option<Arc<Mutex<dyn AudioRenderer>>>,
         gl_context: Box<dyn PlayerGLContext>,
@@ -258,13 +287,9 @@ impl Backend for GStreamerBackend {
 
     fn can_play_type(&self, media_type: &str) -> SupportsMediaType {
         if let Ok(mime) = media_type.parse::<Mime>() {
-            let mime_type = mime.type_().as_str().to_owned() + "/" + mime.subtype().as_str();
-            let codecs = match mime.get_param("codecs") {
-                Some(codecs) => codecs
-                    .as_str()
-                    .split(',')
-                    .map(|codec| codec.trim())
-                    .collect(),
+            let mime_type = format!("{}/{}", mime.type_, mime.subtype);
+            let codecs = match mime.get_parameter("codecs") {
+                Some(codecs) => codecs.split(',').map(|codec| codec.trim()).collect(),
                 None => vec![],
             };
 

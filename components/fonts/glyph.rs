@@ -13,7 +13,7 @@ use euclid::num::Zero;
 use itertools::Either;
 use log::{debug, error};
 use malloc_size_of_derive::MallocSizeOf;
-use serde::{Deserialize, Serialize};
+use servo_base::text::Utf32CodeUnits;
 
 use crate::{GlyphShapingResult, ShapedGlyph, ShapingOptions};
 
@@ -24,7 +24,7 @@ use crate::{GlyphShapingResult, ShapedGlyph, ShapingOptions};
 ///
 /// In the uncommon case (multiple glyphs per unicode character, large glyph index/advance, or glyph
 /// offsets), we create a DetailedGlyphEntry for the glyph and pack its index into the GlyphEntry.
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
 pub struct GlyphEntry {
     value: u32,
 }
@@ -125,7 +125,7 @@ impl GlyphEntry {
     }
 }
 
-#[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, MallocSizeOf)]
 pub struct DetailedGlyphEntry {
     /// The id of the this glyph within the font.
     id: u32,
@@ -136,7 +136,7 @@ pub struct DetailedGlyphEntry {
     offset: Option<Point2D<Au>>,
     /// The number of character this glyph corresponds to in the original string.
     /// This might be zero and this might be more than one.
-    character_count: usize,
+    character_count: Utf32CodeUnits,
     /// Whether or not the originating character for this glyph was a word separator
     is_word_separator: bool,
 }
@@ -185,9 +185,9 @@ impl GlyphInfo<'_> {
     /// than one when a single glyph is produced for multiple characters. This may
     /// be zero when multiple glyphs are produced for a single character.
     #[inline]
-    pub fn character_count(self) -> usize {
+    pub fn character_count(self) -> Utf32CodeUnits {
         match self {
-            GlyphInfo::Simple(..) => 1,
+            GlyphInfo::Simple(..) => Utf32CodeUnits(1),
             GlyphInfo::Detail(entry) => entry.character_count,
         }
     }
@@ -211,7 +211,7 @@ impl GlyphInfo<'_> {
 /// |               +---+---+                     |
 /// +---------------------------------------------+
 /// ~~~
-#[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, MallocSizeOf)]
 pub struct ShapedText {
     // TODO(pcwalton): Allocation of this buffer is expensive. Consider a small-vector
     // optimization.
@@ -228,7 +228,7 @@ pub struct ShapedText {
     total_advance: Au,
 
     /// The number of characters that correspond to the glyphs in this [`ShapedText`]
-    character_count: usize,
+    character_count: Utf32CodeUnits,
 
     /// A cache of the number of word separators in the entire glyph store.
     /// See <https://drafts.csswg.org/css-text/#word-separator>.
@@ -248,7 +248,7 @@ impl ShapedText {
             glyphs: Vec::with_capacity(length),
             detailed_glyphs: Default::default(),
             total_advance: Au::zero(),
-            character_count: 0,
+            character_count: Utf32CodeUnits(0),
             total_word_separators: 0,
             is_rtl,
         }
@@ -283,6 +283,10 @@ impl ShapedText {
 
         let mut previous_character_offset = None;
         let mut glyph_store = ShapedText::new(shaped_glyph_data.len(), shaped_run_is_rtl);
+        if shaped_glyph_data.len() == 0 {
+            return glyph_store;
+        }
+
         for mut shaped_glyph in shaped_glyph_data.iter() {
             // The glyph "cluster" (HarfBuzz terminology) is the byte offset in the string that
             // this glyph corresponds to. More than one glyph can share a cluster.
@@ -344,11 +348,16 @@ impl ShapedText {
         self.glyphs.len()
     }
 
+    /// Get the number of characters that were shaped to produce this [`ShapedText`].
+    pub fn character_count(&self) -> Utf32CodeUnits {
+        self.character_count
+    }
+
     /// Adds glyph that corresponds to a single character (as far we know) in the originating string.
     #[inline]
     pub(crate) fn add_glyph(&mut self, character: char, glyph: &ShapedGlyph) {
         if !glyph.can_be_simple_glyph() {
-            self.add_detailed_glyph(glyph, Some(character), 1);
+            self.add_detailed_glyph(glyph, Some(character), Utf32CodeUnits(1));
             return;
         }
 
@@ -358,7 +367,7 @@ impl ShapedText {
             simple_glyph_entry.set_char_is_word_separator();
         }
 
-        self.character_count += 1;
+        self.character_count += Utf32CodeUnits(1);
         self.total_advance += glyph.advance;
         self.glyphs.push(simple_glyph_entry)
     }
@@ -367,7 +376,7 @@ impl ShapedText {
         &mut self,
         shaped_glyph: &ShapedGlyph,
         character: Option<char>,
-        character_count: usize,
+        character_count: Utf32CodeUnits,
     ) {
         let is_word_separator = character.is_some_and(character_is_word_separator);
         if is_word_separator {
@@ -393,8 +402,8 @@ impl ShapedText {
             .detailed_glyphs
             .get_mut(detailed_glyph_index)
             .expect("GlyphEntry should have valid index to detailed glyph");
-        detailed_glyph.character_count += 1;
-        self.character_count += 1;
+        detailed_glyph.character_count += Utf32CodeUnits(1);
+        self.character_count += Utf32CodeUnits(1);
     }
 
     fn add_glyph_for_current_character(
@@ -407,16 +416,14 @@ impl ShapedText {
         // applied to the last glyph in the cluster. Note that this is unconditionally
         // converting the previous glyph to a detailed one because it's quite likely that
         // the advance will not fit into the simple bitmask due to being negative.
-        if let Some(letter_spacing) = options.letter_spacing &&
-            letter_spacing != Au::zero()
-        {
+        if options.letter_spacing != Au::zero() {
             let last_glyph_index = self.ensure_last_glyph_is_detailed();
-            self.detailed_glyphs[last_glyph_index].advance -= letter_spacing;
+            self.detailed_glyphs[last_glyph_index].advance -= options.letter_spacing;
         }
 
         // Add a detailed glyph entry for this new glyph, but it corresponds to a character
         // we have already started processing. It should not contribute any character count.
-        self.add_detailed_glyph(shaped_glyph, None, 0);
+        self.add_detailed_glyph(shaped_glyph, None, Utf32CodeUnits(0));
     }
 
     /// If the last glyph added to this [`ShapedText`] was a simple glyph, convert it to a
@@ -435,7 +442,7 @@ impl ShapedText {
             id: last_glyph.id(),
             advance: last_glyph.advance(),
             offset: Default::default(),
-            character_count: 1,
+            character_count: Utf32CodeUnits(1),
             is_word_separator: last_glyph.char_is_word_separator(),
         });
 
@@ -477,19 +484,15 @@ impl ShapedGlyph {
         character: char,
         shaping_options: &ShapingOptions,
     ) {
-        if let Some(letter_spacing) = shaping_options.letter_spacing_for_character(character) {
-            self.advance += letter_spacing;
-        };
+        self.advance += shaping_options.letter_spacing_for_character(character);
 
         // CSS 2.1 § 16.4 states that "word spacing affects each space (U+0020) and non-breaking
         // space (U+00A0) left in the text after the white space processing rules have been
         // applied. The effect of the property on other word-separator characters is undefined."
         // We elect to only space the two required code points.
-        if let Some(word_spacing) = shaping_options.word_spacing &&
-            (character == ' ' || character == '\u{a0}')
-        {
+        if character == ' ' || character == '\u{a0}' {
             // https://drafts.csswg.org/css-text-3/#word-spacing-property
-            self.advance += word_spacing;
+            self.advance += shaping_options.word_spacing;
         }
     }
 }
@@ -536,10 +539,34 @@ impl fmt::Debug for ShapedText {
     }
 }
 
+#[derive(Clone, Debug, MallocSizeOf)]
+struct GlyphCountAndAdvance {
+    count: usize,
+    advance: Au,
+}
+
+impl GlyphCountAndAdvance {
+    fn new(count: usize, advance: Au) -> Self {
+        Self { count, advance }
+    }
+}
+
+/// A record of the trailing white space at the end of a run of text or glyphs.
+///
+/// See <https://drafts.csswg.org/css-text-3/#white-space-phase-2>
+#[derive(Clone, Debug, MallocSizeOf)]
+pub struct TrailingWhiteSpace<Unit> {
+    /// The part of the run that "hangs". This comes before the removable parts of the run.
+    pub hangable: Unit,
+    /// The part of the run that is removed at the end of a line. This comes after the
+    /// hangable parts of the run.
+    pub removable: Unit,
+}
+
 /// A slice of a [`ShapedText`] which allows having different views into a shaped
 /// text run. This is used for splitting up shaped text during layout, without
 /// duplicating the entire run.
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, Debug, MallocSizeOf)]
 pub struct ShapedTextSlice {
     /// The [`ShapedText`] that this [`ShapedTextSlice`] refers to.
     #[conditional_malloc_size_of]
@@ -552,28 +579,21 @@ pub struct ShapedTextSlice {
     total_advance: Au,
 
     /// The number of characters that correspond to the glyphs in this [`ShapedTextSlice`]
-    character_count: usize,
+    character_count: Utf32CodeUnits,
 
     /// A precomputed count of the number of word separators in the entire [`ShapedTextSlice`]. See
     /// <https://drafts.csswg.org/css-text/#word-separator>.
     total_word_separators: usize,
 
-    /// Whether or not this [`ShapedTextSlice`] is entirely whitespace.
-    is_whitespace: bool,
+    /// The number of glyphs and their advance of the trailing white space portion of this
+    /// slice during inline line layout.
+    trailing_white_space: TrailingWhiteSpace<GlyphCountAndAdvance>,
 
-    /// Whether or not this [`ShapedTextSlice`] ends with whitespace glyphs.
-    /// Typically whitespace glyphs are placed in a separate slice,
-    /// but that may not be the case with `white-space: break-spaces`.
-    ends_with_whitespace: bool,
+    /// Whether or not the text that created this slice was entirely white space.
+    all_white_space: bool,
 }
 
 impl ShapedTextSlice {
-    /// Return the [`ShapedText`] that backs this [`ShapedTextSlice`].
-    #[inline]
-    pub fn shaped_text(&self) -> Arc<ShapedText> {
-        self.shaped_text.clone()
-    }
-
     /// Return the number of glyphs represented by this [`ShapedTextSlice`].
     #[inline]
     pub fn glyph_count(&self) -> usize {
@@ -584,7 +604,7 @@ impl ShapedTextSlice {
     /// characters correspond to more than one glyph and some glyphs correspond to more than
     /// one character.
     #[inline]
-    pub fn character_count(&self) -> usize {
+    pub fn character_count(&self) -> Utf32CodeUnits {
         self.character_count
     }
 
@@ -600,27 +620,135 @@ impl ShapedTextSlice {
         self.total_word_separators
     }
 
-    /// Whether or not this [`ShapedTextSlice`] is entirely whitespace.
-    #[inline]
-    pub fn is_whitespace(&self) -> bool {
-        self.is_whitespace
+    /// The number of word separators in the hanging and removable portion of this [`ShapedTextSlice`].
+    pub fn hanging_and_removable_word_separators(&self) -> usize {
+        let discard_glyph_count =
+            self.trailing_white_space.removable.count + self.trailing_white_space.hangable.count;
+        let iterator = if self.shaped_text.is_rtl {
+            self.shaped_text
+                .glyph_slice(self.glyph_range.start..self.glyph_range.start + discard_glyph_count)
+        } else {
+            self.shaped_text
+                .glyph_slice(self.glyph_range.end - discard_glyph_count..self.glyph_range.end)
+        };
+        iterator
+            .map(|glyph| if glyph.char_is_word_separator() { 1 } else { 0 })
+            .sum()
     }
 
-    /// Whether or not this [`ShapedTextSlice`] ends with whitespace.
-    #[inline]
-    pub fn ends_with_whitespace(&self) -> bool {
-        self.ends_with_whitespace
+    /// Whether or not this [`ShapedTextSlice`] is composed of only removable characters.
+    pub fn all_removable(&self) -> bool {
+        self.trailing_white_space.removable.count >= self.glyph_count()
+    }
+
+    /// Whether or not this [`ShapedTextSlice`] has any non-hangable and non-removable glyphs.
+    pub fn has_non_hangable_non_removable_content(&self) -> bool {
+        self.trailing_white_space.removable.count + self.trailing_white_space.hangable.count <
+            self.glyph_count()
+    }
+
+    /// The advance of this [`ShapedTextSlice`] that is removable at the end of a line.
+    pub fn removable_advance(&self) -> Au {
+        self.trailing_white_space.removable.advance
+    }
+
+    /// The advance of this [`ShapedTextSlice`] that is hangable at the end of a line.
+    pub fn hangable_advance(&self) -> Au {
+        self.trailing_white_space.hangable.advance
+    }
+
+    /// Whether or not this [`ShapedTextSlice`] is entirely composed of white space.
+    pub fn all_white_space(&self) -> bool {
+        self.all_white_space
     }
 
     /// An iterator over the glyphs represented by this [`ShapedTextSlice`].
     pub fn glyphs(&self) -> impl DoubleEndedIterator<Item = GlyphInfo<'_>> + use<'_> {
         self.shaped_text.glyph_slice(self.glyph_range.clone())
     }
+
+    fn split_off_count(&mut self, trimmed_glyph_count: usize) -> Arc<Self> {
+        let glyph_range = if self.shaped_text.is_rtl {
+            self.glyph_range.start + trimmed_glyph_count..self.glyph_range.end
+        } else {
+            self.glyph_range.start..self.glyph_range.end - trimmed_glyph_count
+        };
+
+        let split_glyph_range = if self.shaped_text.is_rtl {
+            self.glyph_range.start..glyph_range.start
+        } else {
+            glyph_range.end..self.glyph_range.end
+        };
+
+        let mut trimmed_characters = Utf32CodeUnits(0);
+        let mut trimmed_word_separators = 0;
+        let mut trimmed_advance = Au::zero();
+        let iterator = self.shaped_text.glyph_slice(split_glyph_range.clone());
+        for glyph in iterator {
+            trimmed_characters += glyph.character_count();
+            trimmed_advance += glyph.advance();
+            if glyph.char_is_word_separator() {
+                trimmed_word_separators += 1;
+            }
+        }
+
+        self.glyph_range = glyph_range;
+        self.character_count -= trimmed_characters;
+        self.total_word_separators -= trimmed_word_separators;
+        self.total_advance -= trimmed_advance;
+
+        let GlyphCountAndAdvance {
+            count: removable_glyphs,
+            advance: removable_advance,
+        } = self.trailing_white_space.removable;
+
+        let removable_glyphs_to_trim = trimmed_glyph_count.min(removable_glyphs);
+        let removable_advance_to_trim = trimmed_advance.min(removable_advance);
+        let hangable_glyphs_to_trim = trimmed_glyph_count - removable_glyphs_to_trim;
+        let hangable_advance_to_trim =
+            (trimmed_advance - removable_advance_to_trim).min(self.hangable_advance());
+
+        self.trailing_white_space.removable.count -= removable_glyphs_to_trim;
+        self.trailing_white_space.removable.advance -= removable_advance_to_trim;
+        self.trailing_white_space.hangable.count -= hangable_glyphs_to_trim;
+        self.trailing_white_space.hangable.advance -= hangable_advance_to_trim;
+
+        Arc::new(Self {
+            shaped_text: self.shaped_text.clone(),
+            glyph_range: split_glyph_range,
+            total_advance: trimmed_advance,
+            character_count: trimmed_characters,
+            total_word_separators: trimmed_word_separators,
+            trailing_white_space: TrailingWhiteSpace {
+                hangable: GlyphCountAndAdvance::new(
+                    hangable_glyphs_to_trim,
+                    hangable_advance_to_trim,
+                ),
+                removable: GlyphCountAndAdvance::new(
+                    removable_glyphs_to_trim,
+                    removable_advance_to_trim,
+                ),
+            },
+            // TODO: This is only correct because this function only splits off removable
+            // white space. Once that changes this should be calculated based on what is
+            // split off.
+            all_white_space: true,
+        })
+    }
+
+    /// Produce a new [`ShapedTextSlice`] that includes all of the glyphs that `self`
+    /// does except for the removable portion of the slice.
+    pub fn without_removable_white_space(&self) -> Arc<Self> {
+        let mut new = self.clone();
+        new.split_off_count(self.trailing_white_space.removable.count);
+        Arc::new(new)
+    }
 }
 
 /// A data structure used to efficiently slice up a [`ShapedText`] into [`ShapedTextSlice`]s.
 pub struct ShapedTextSlicer {
     current_glyph_offset: usize,
+    current_character_offset: Utf32CodeUnits,
     shaped_text: Arc<ShapedText>,
 }
 
@@ -634,24 +762,36 @@ impl ShapedTextSlicer {
 
         Self {
             current_glyph_offset,
+            current_character_offset: Utf32CodeUnits(0),
             shaped_text,
         }
     }
 
-    /// Given a desired character count, consume that number of characters worth
-    /// of glyphs from the [`ShapedText`] of this [`ShapedTextSlicer`]. In addition,
-    /// tag the resulting [`ShapedTextSlice`] with the given whitespace-related
-    /// properties.
-    pub fn slice_for_character_count(
+    /// Given a desired character offset, consume glyphs until that character offset
+    /// is reached (inclusive of glyphs that come from zero characters). Return those
+    /// glyphs as a [`ShapedTextSlice`] tagged with the given whitespace-related
+    /// properties. Returns `None` if the resulting slice would not hold any glyphs.
+    pub fn slice_until_character_offset(
         &mut self,
-        desired_character_count: usize,
-        is_whitespace: bool,
-        ends_with_whitespace: bool,
-    ) -> Arc<ShapedTextSlice> {
+        desired_character_offset: Utf32CodeUnits,
+        trailing_white_space: TrailingWhiteSpace<Utf32CodeUnits>,
+        all_white_space: bool,
+    ) -> Option<Arc<ShapedTextSlice>> {
         let mut glyph_count = 0;
-        let mut character_count = 0;
         let mut total_word_separators = 0;
         let mut total_advance = Au::zero();
+        let original_character_offset = self.current_character_offset;
+
+        if self.current_character_offset >= desired_character_offset {
+            return None;
+        }
+
+        let starting_removable_offset = desired_character_offset - trailing_white_space.removable;
+        let starting_hangable_offset = starting_removable_offset - trailing_white_space.hangable;
+        let mut hangable_glyph_count = 0;
+        let mut hangable_advance = Au::zero();
+        let mut removable_glyph_count = 0;
+        let mut removable_advance = Au::zero();
 
         // In `ShapedText` glyphs are stored in physical left-to-right order, which means that the
         // indices of the characters that they represent might decrease. Since we want to consume
@@ -671,17 +811,24 @@ impl ShapedTextSlicer {
         };
 
         for glyph in iterator {
-            // When one character produces multiple glyphs, only the first glyph has a character
-            // count of one and the rest have a character count of 0. This checks the potential
-            // total before accumulating a glyph, which allows merging glyphs with a 0 character
-            // count into the slice with the first glyph.
-            let glyph_character_count = glyph.character_count();
-            if character_count + glyph_character_count > desired_character_count {
+            // When glyphs span two character slices, prioritize the first slice and also
+            // ensure that glyphs that span zero characters are also included there.
+            if self.current_character_offset >= desired_character_offset &&
+                glyph.character_count().0 > 0
+            {
                 break;
             }
 
+            if self.current_character_offset >= starting_removable_offset {
+                removable_advance += glyph.advance();
+                removable_glyph_count += 1;
+            } else if self.current_character_offset >= starting_hangable_offset {
+                hangable_advance += glyph.advance();
+                hangable_glyph_count += 1;
+            }
+
             glyph_count += 1;
-            character_count += glyph_character_count;
+            self.current_character_offset += glyph.character_count();
             total_advance += glyph.advance();
             if glyph.char_is_word_separator() {
                 total_word_separators += 1;
@@ -703,15 +850,22 @@ impl ShapedTextSlicer {
             )
         };
 
+        if glyph_count == 0 {
+            return None;
+        }
+
         self.current_glyph_offset = new_glyph_offset;
-        Arc::new(ShapedTextSlice {
+        Some(Arc::new(ShapedTextSlice {
             shaped_text: self.shaped_text.clone(),
             glyph_range,
             total_advance,
-            character_count,
-            is_whitespace,
-            ends_with_whitespace,
+            character_count: self.current_character_offset - original_character_offset,
             total_word_separators,
-        })
+            trailing_white_space: TrailingWhiteSpace {
+                hangable: GlyphCountAndAdvance::new(hangable_glyph_count, hangable_advance),
+                removable: GlyphCountAndAdvance::new(removable_glyph_count, removable_advance),
+            },
+            all_white_space,
+        }))
     }
 }

@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -19,11 +21,10 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{RootedPromise, TracedPromise};
 use crate::dom::stream::byteteeunderlyingsource::ByteTeeUnderlyingSource;
 use crate::dom::stream::readablestream::ReadableStream;
-use crate::microtask::Microtask;
-use crate::script_runtime::CanGc;
+use crate::runtime::job_queue::MicrotaskRunnable;
 
 #[derive(JSTraceable, MallocSizeOf)]
 pub(crate) struct ByteTeeReadIntoRequestMicrotask {
@@ -32,8 +33,8 @@ pub(crate) struct ByteTeeReadIntoRequestMicrotask {
     tee_read_request: Trusted<ByteTeeReadIntoRequest>,
 }
 
-impl ByteTeeReadIntoRequestMicrotask {
-    pub(crate) fn microtask_chunk_steps(&self, cx: &mut JSContext) {
+impl MicrotaskRunnable for ByteTeeReadIntoRequestMicrotask {
+    fn handler(&self, cx: &mut JSContext) {
         self.tee_read_request
             .root()
             .chunk_steps(&self.chunk, cx)
@@ -58,13 +59,13 @@ pub(crate) struct ByteTeeReadIntoRequest {
     canceled_1: Rc<Cell<bool>>,
     #[conditional_malloc_size_of]
     canceled_2: Rc<Cell<bool>>,
-    #[conditional_malloc_size_of]
-    cancel_promise: Rc<Promise>,
+    cancel_promise: TracedPromise,
     tee_underlying_source: Dom<ByteTeeUnderlyingSource>,
 }
 impl ByteTeeReadIntoRequest {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        cx: &mut JSContext,
         for_branch2: bool,
         byob_branch: &ReadableStream,
         other_branch: &ReadableStream,
@@ -74,12 +75,12 @@ impl ByteTeeReadIntoRequest {
         reading: Rc<Cell<bool>>,
         canceled_1: Rc<Cell<bool>>,
         canceled_2: Rc<Cell<bool>>,
-        cancel_promise: Rc<Promise>,
+        cancel_promise: &RootedPromise,
         tee_underlying_source: &ByteTeeUnderlyingSource,
         global: &GlobalScope,
-        can_gc: CanGc,
     ) -> DomRoot<Self> {
         reflect_dom_object(
+            cx,
             Box::new(ByteTeeReadIntoRequest {
                 reflector_: Reflector::new(),
                 for_branch2,
@@ -91,16 +92,16 @@ impl ByteTeeReadIntoRequest {
                 reading,
                 canceled_1,
                 canceled_2,
-                cancel_promise,
+                cancel_promise: cancel_promise.to_traced(),
                 tee_underlying_source: Dom::from_ref(tee_underlying_source),
             }),
             global,
-            can_gc,
         )
     }
 
     pub(crate) fn enqueue_chunk_steps(
         &self,
+        cx: &mut JSContext,
         chunk: RootedTraceableBox<HeapBufferSource<ArrayBufferViewU8>>,
     ) {
         // Queue a microtask to perform the following steps:
@@ -110,9 +111,7 @@ impl ByteTeeReadIntoRequest {
         };
 
         self.global()
-            .enqueue_microtask(Microtask::ReadableStreamByteTeeReadIntoRequest(
-                byte_tee_read_request_chunk,
-            ));
+            .enqueue_microtask(cx, Box::new(byte_tee_read_request_chunk));
     }
 
     /// <https://streams.spec.whatwg.org/#ref-for-read-into-request-chunk-steps%E2%91%A0>
@@ -150,12 +149,7 @@ impl ByteTeeReadIntoRequest {
             // If cloneResult is an abrupt completion,
             if let Err(error) = clone_result {
                 rooted!(&in(cx) let mut error_value = UndefinedValue());
-                error.to_jsval(
-                    cx.into(),
-                    &self.global(),
-                    error_value.handle_mut(),
-                    CanGc::from_cx(cx),
-                );
+                error.to_jsval(cx, &self.global(), error_value.handle_mut());
 
                 // Perform ! ReadableByteStreamControllerError(byobBranch.[[controller]], cloneResult.[[Value]]).
                 let byob_branch_controller = self.byob_branch.get_byte_controller();
@@ -169,8 +163,7 @@ impl ByteTeeReadIntoRequest {
                 let cancel_result =
                     self.stream
                         .cancel(cx, &self.stream.global(), error_value.handle());
-                self.cancel_promise
-                    .resolve_native(&cancel_result, CanGc::from_cx(cx));
+                self.cancel_promise.resolve_native(cx, &cancel_result);
 
                 // Return.
                 return Ok(());
@@ -276,7 +269,7 @@ impl ByteTeeReadIntoRequest {
 
         // If byobCanceled is false or otherCanceled is false, resolve cancelPromise with undefined.
         if !byob_canceled || !other_canceled {
-            self.cancel_promise.resolve_native(&(), CanGc::from_cx(cx));
+            self.cancel_promise.resolve_native(cx, &());
         }
 
         Ok(())

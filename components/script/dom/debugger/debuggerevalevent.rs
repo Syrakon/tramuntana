@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::reflect_dom_object;
 use script_bindings::str::DOMString;
 
@@ -11,7 +12,6 @@ use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventM
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::event::Event;
 use crate::dom::types::{GlobalScope, PipelineId};
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 /// Event for Rust → JS calls in [`crate::dom::debugger::DebuggerGlobalScope`].
@@ -21,16 +21,18 @@ pub(crate) struct DebuggerEvalEvent {
     pipeline_id: Dom<PipelineId>,
     worker_id: Option<DOMString>,
     frame_actor_id: Option<DOMString>,
+    eager: bool,
 }
 
 impl DebuggerEvalEvent {
     pub(crate) fn new(
+        cx: &mut JSContext,
         debugger_global: &GlobalScope,
         code: DOMString,
         pipeline_id: &PipelineId,
         worker_id: Option<DOMString>,
         frame_actor_id: Option<DOMString>,
-        can_gc: CanGc,
+        eager: bool,
     ) -> DomRoot<Self> {
         let result = Box::new(Self {
             event: Event::new_inherited(),
@@ -38,8 +40,9 @@ impl DebuggerEvalEvent {
             pipeline_id: Dom::from_ref(pipeline_id),
             worker_id,
             frame_actor_id,
+            eager,
         });
-        let result = reflect_dom_object(result, debugger_global, can_gc);
+        let result = reflect_dom_object(cx, result, debugger_global);
         result.event.init_event("eval".into(), false, false);
 
         result
@@ -64,6 +67,10 @@ impl DebuggerEvalEventMethods<crate::DomTypeHolder> for DebuggerEvalEvent {
 
     fn GetFrameActorId(&self) -> Option<DOMString> {
         self.frame_actor_id.clone()
+    }
+
+    fn Eager(&self) -> bool {
+        self.eager
     }
 
     fn IsTrusted(&self) -> bool {

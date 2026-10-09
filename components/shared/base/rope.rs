@@ -9,7 +9,7 @@ use malloc_size_of_derive::MallocSizeOf;
 use rayon::iter::Either;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::text::{Utf8CodeUnitLength, Utf16CodeUnitLength};
+use crate::text::{AssumeUnder4GB, Utf8CodeUnits, Utf16CodeUnits, Utf32CodeUnits};
 
 fn contents_vec(contents: impl Into<String>) -> Vec<String> {
     let mut contents: Vec<_> = contents
@@ -54,6 +54,10 @@ impl Rope {
 
     pub fn contents(&self) -> String {
         self.lines.join("")
+    }
+
+    pub fn first_index(&self) -> RopeIndex {
+        RopeIndex::new(0, 0)
     }
 
     pub fn last_index(&self) -> RopeIndex {
@@ -153,8 +157,12 @@ impl Rope {
     }
 
     /// The total number of code units required to encode the content in utf16.
-    pub fn len_utf16(&self) -> Utf16CodeUnitLength {
-        Utf16CodeUnitLength(self.chars().map(char::len_utf16).sum())
+    pub fn len_utf16(&self) -> Utf16CodeUnits {
+        // TODO: add some check that ropes stay under 4 GiB total?
+        self.lines
+            .iter()
+            .map(|line| Utf16CodeUnits::length_of(AssumeUnder4GB, line))
+            .sum()
     }
 
     fn line(&self, index: usize) -> &str {
@@ -315,56 +323,55 @@ impl Rope {
     }
 
     /// Convert a [`RopeIndex`] into a byte offset from the start of the content.
-    pub fn index_to_utf8_offset(&self, rope_index: RopeIndex) -> Utf8CodeUnitLength {
+    pub fn index_to_utf8_offset(&self, rope_index: RopeIndex) -> Utf8CodeUnits {
         let rope_index = self.normalize_index(rope_index);
-        Utf8CodeUnitLength(
-            self.lines
-                .iter()
-                .take(rope_index.line)
-                .map(String::len)
-                .sum::<usize>() +
-                rope_index.code_point,
-        )
+        let sum = self
+            .lines
+            .iter()
+            .take(rope_index.line)
+            .map(String::len)
+            .sum::<usize>() +
+            rope_index.code_point;
+        // TODO: add some check that ropes stay under 4 GiB total?
+        Utf8CodeUnits(sum as u32)
     }
 
-    pub fn index_to_utf16_offset(&self, rope_index: RopeIndex) -> Utf16CodeUnitLength {
+    pub fn index_to_utf16_offset(&self, rope_index: RopeIndex) -> Utf16CodeUnits {
         let rope_index = self.normalize_index(rope_index);
         let final_line = self.line(rope_index.line);
 
         // The offset might be past the end of the line due to being an exclusive offset.
-        let final_line_offset = Utf16CodeUnitLength(
-            final_line[0..rope_index.code_point]
-                .chars()
-                .map(char::len_utf16)
-                .sum(),
-        );
+        let final_line_offset =
+            Utf16CodeUnits::length_of(AssumeUnder4GB, &final_line[..rope_index.code_point]);
 
-        self.lines
+        // TODO: add some check that ropes stay under 4 GiB total?
+        self.lines[..rope_index.line]
             .iter()
-            .take(rope_index.line)
-            .map(|line| Utf16CodeUnitLength(line.chars().map(char::len_utf16).sum()))
-            .sum::<Utf16CodeUnitLength>() +
+            .map(|line| Utf16CodeUnits::length_of(AssumeUnder4GB, line))
+            .sum::<Utf16CodeUnits>() +
             final_line_offset
     }
 
     /// Convert a [`RopeIndex`] into a character offset from the start of the content.
-    pub fn index_to_character_offset(&self, rope_index: RopeIndex) -> usize {
+    pub fn index_to_character_offset(&self, rope_index: RopeIndex) -> Utf32CodeUnits {
         let rope_index = self.normalize_index(rope_index);
 
         // The offset might be past the end of the line due to being an exclusive offset.
         let final_line = self.line(rope_index.line);
-        let final_line_offset = final_line[0..rope_index.code_point].chars().count();
+        // TODO: add some check that ropes stay under 4 GiB total?
+        let final_line_offset =
+            Utf32CodeUnits::length_of(AssumeUnder4GB, &final_line[..rope_index.code_point]);
         self.lines
             .iter()
             .take(rope_index.line)
-            .map(|line| line.chars().count())
-            .sum::<usize>() +
+            .map(|line| Utf32CodeUnits::length_of(AssumeUnder4GB, line))
+            .sum::<Utf32CodeUnits>() +
             final_line_offset
     }
 
     /// Convert a byte offset from the start of the content into a [`RopeIndex`].
-    pub fn utf8_offset_to_rope_index(&self, utf8_offset: Utf8CodeUnitLength) -> RopeIndex {
-        let mut current_utf8_offset = utf8_offset.0;
+    pub fn utf8_offset_to_rope_index(&self, utf8_offset: Utf8CodeUnits) -> RopeIndex {
+        let mut current_utf8_offset = usize::from(utf8_offset);
         for (line_index, line) in self.lines.iter().enumerate() {
             if current_utf8_offset == 0 || current_utf8_offset < line.len() {
                 return RopeIndex::new(line_index, current_utf8_offset);
@@ -374,22 +381,9 @@ impl Rope {
         self.last_index()
     }
 
-    pub fn utf16_offset_to_utf8_offset(
-        &self,
-        utf16_offset: Utf16CodeUnitLength,
-    ) -> Utf8CodeUnitLength {
-        let mut current_utf16_offset = Utf16CodeUnitLength::zero();
-        let mut current_utf8_offset = Utf8CodeUnitLength::zero();
-
-        for character in self.chars() {
-            let utf16_length = character.len_utf16();
-            if current_utf16_offset + Utf16CodeUnitLength(utf16_length) > utf16_offset {
-                return current_utf8_offset;
-            }
-            current_utf8_offset += Utf8CodeUnitLength(character.len_utf8());
-            current_utf16_offset += Utf16CodeUnitLength(utf16_length);
-        }
-        current_utf8_offset
+    pub fn utf16_offset_to_utf8_offset(&self, utf16_offset: Utf16CodeUnits) -> Utf8CodeUnits {
+        // TODO: add some check that ropes stay under 4 GiB total?
+        utf16_offset.to_utf8_code_units_in_iter(AssumeUnder4GB, &self.lines)
     }
 
     /// Find the boundaries of the word most relevant to the given [`RopeIndex`]. Word
@@ -454,7 +448,7 @@ pub struct RopeIndex {
     /// The index of the code point on the [`RopeIndex`]'s line in UTF-8 code
     /// points.
     ///
-    /// Note: This is not a `Utf8CodeUnitLength` in order to avoid continually having
+    /// Note: This is not a `Utf8CodeUnits` in order to avoid continually having
     /// to unpack the inner value.
     pub code_point: usize,
 }
@@ -547,6 +541,12 @@ impl<'a> RopeSlice<'a> {
             },
         }
     }
+
+    pub fn len_utf16(self) -> Utf16CodeUnits {
+        // TODO: add some check that ropes stay under 4 GiB total?
+        // TODO: iterate `&str` slices instead and use `Utf16CodeUnits::length_of`
+        self.chars().map(Utf16CodeUnits::length_of_char).sum()
+    }
 }
 
 /// A generic movement iterator for a [`Rope`]. This can move in both directions. Note
@@ -635,42 +635,42 @@ fn test_rope_index_conversion_to_utf8_offset() {
     let rope = Rope::new("A\nBB\nCCC\nDDDD");
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(0, 0)),
-        Utf8CodeUnitLength(0),
+        Utf8CodeUnits(0),
     );
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(0, 1)),
-        Utf8CodeUnitLength(1),
+        Utf8CodeUnits(1),
     );
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(0, 10)),
-        Utf8CodeUnitLength(1),
+        Utf8CodeUnits(1),
         "RopeIndex with offset past the end of the line should return final offset in line",
     );
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(1, 0)),
-        Utf8CodeUnitLength(2),
+        Utf8CodeUnits(2),
     );
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(1, 2)),
-        Utf8CodeUnitLength(4),
+        Utf8CodeUnits(4),
     );
 
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(3, 0)),
-        Utf8CodeUnitLength(9),
+        Utf8CodeUnits(9),
     );
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(3, 3)),
-        Utf8CodeUnitLength(12),
+        Utf8CodeUnits(12),
     );
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(3, 4)),
-        Utf8CodeUnitLength(13),
+        Utf8CodeUnits(13),
         "There should be no newline at the end of the TextInput",
     );
     assert_eq!(
         rope.index_to_utf8_offset(RopeIndex::new(3, 40)),
-        Utf8CodeUnitLength(13),
+        Utf8CodeUnits(13),
         "There should be no newline at the end of the TextInput",
     );
 }
@@ -680,34 +680,34 @@ fn test_rope_index_conversion_to_utf16_offset() {
     let rope = Rope::new("A\nBB\nCCC\n家家");
     assert_eq!(
         rope.index_to_utf16_offset(RopeIndex::new(0, 0)),
-        Utf16CodeUnitLength(0),
+        Utf16CodeUnits(0),
     );
     assert_eq!(
         rope.index_to_utf16_offset(RopeIndex::new(0, 1)),
-        Utf16CodeUnitLength(1),
+        Utf16CodeUnits(1),
     );
     assert_eq!(
         rope.index_to_utf16_offset(RopeIndex::new(0, 10)),
-        Utf16CodeUnitLength(1),
+        Utf16CodeUnits(1),
         "RopeIndex with offset past the end of the line should return final offset in line",
     );
     assert_eq!(
         rope.index_to_utf16_offset(RopeIndex::new(3, 0)),
-        Utf16CodeUnitLength(9),
+        Utf16CodeUnits(9),
     );
 
     assert_eq!(
         rope.index_to_utf16_offset(RopeIndex::new(3, 3)),
-        Utf16CodeUnitLength(10),
+        Utf16CodeUnits(10),
         "3 code unit UTF-8 encodede character"
     );
     assert_eq!(
         rope.index_to_utf16_offset(RopeIndex::new(3, 6)),
-        Utf16CodeUnitLength(11),
+        Utf16CodeUnits(11),
     );
     assert_eq!(
         rope.index_to_utf16_offset(RopeIndex::new(3, 20)),
-        Utf16CodeUnitLength(11),
+        Utf16CodeUnits(11),
     );
 }
 
@@ -715,35 +715,35 @@ fn test_rope_index_conversion_to_utf16_offset() {
 fn test_utf16_offset_to_utf8_offset() {
     let rope = Rope::new("A\nBB\nCCC\n家家");
     assert_eq!(
-        rope.utf16_offset_to_utf8_offset(Utf16CodeUnitLength(0)),
-        Utf8CodeUnitLength(0),
+        rope.utf16_offset_to_utf8_offset(Utf16CodeUnits(0)),
+        Utf8CodeUnits(0),
     );
     assert_eq!(
-        rope.utf16_offset_to_utf8_offset(Utf16CodeUnitLength(1)),
-        Utf8CodeUnitLength(1),
+        rope.utf16_offset_to_utf8_offset(Utf16CodeUnits(1)),
+        Utf8CodeUnits(1),
     );
     assert_eq!(
-        rope.utf16_offset_to_utf8_offset(Utf16CodeUnitLength(2)),
-        Utf8CodeUnitLength(2),
+        rope.utf16_offset_to_utf8_offset(Utf16CodeUnits(2)),
+        Utf8CodeUnits(2),
         "Offset past the end of the line",
     );
     assert_eq!(
-        rope.utf16_offset_to_utf8_offset(Utf16CodeUnitLength(9)),
-        Utf8CodeUnitLength(9),
+        rope.utf16_offset_to_utf8_offset(Utf16CodeUnits(9)),
+        Utf8CodeUnits(9),
     );
 
     assert_eq!(
-        rope.utf16_offset_to_utf8_offset(Utf16CodeUnitLength(10)),
-        Utf8CodeUnitLength(12),
+        rope.utf16_offset_to_utf8_offset(Utf16CodeUnits(10)),
+        Utf8CodeUnits(12),
         "3 code unit UTF-8 encodede character"
     );
     assert_eq!(
-        rope.utf16_offset_to_utf8_offset(Utf16CodeUnitLength(11)),
-        Utf8CodeUnitLength(15),
+        rope.utf16_offset_to_utf8_offset(Utf16CodeUnits(11)),
+        Utf8CodeUnits(15),
     );
     assert_eq!(
-        rope.utf16_offset_to_utf8_offset(Utf16CodeUnitLength(300)),
-        Utf8CodeUnitLength(15),
+        rope.utf16_offset_to_utf8_offset(Utf16CodeUnits(300)),
+        Utf8CodeUnits(15),
     );
 }
 
@@ -823,11 +823,8 @@ fn test_rope_index_intersects_character() {
     let rope = Rope::new("񉡚");
     let rope_index = RopeIndex::new(0, 1);
     assert_eq!(rope.normalize_index(rope_index), RopeIndex::new(0, 4));
-    assert_eq!(
-        rope.index_to_utf16_offset(rope_index),
-        Utf16CodeUnitLength(2)
-    );
-    assert_eq!(rope.index_to_utf8_offset(rope_index), Utf8CodeUnitLength(4));
+    assert_eq!(rope.index_to_utf16_offset(rope_index), Utf16CodeUnits(2));
+    assert_eq!(rope.index_to_utf8_offset(rope_index), Utf8CodeUnits(4));
 
     let rope = Rope::new("abc\ndef");
     assert_eq!(

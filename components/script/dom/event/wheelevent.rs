@@ -5,10 +5,13 @@
 use std::cell::Cell;
 
 use dom_struct::dom_struct;
+use embedder_traits::MouseButton;
 use euclid::Point2D;
+use js::context::JSContext;
 use js::rust::HandleObject;
 use keyboard_types::Modifiers;
 use script_bindings::reflector::reflect_dom_object_with_proto;
+use script_traits::MouseButtons;
 use style::Atom;
 use style_traits::CSSPixel;
 
@@ -24,7 +27,6 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct WheelEvent {
@@ -47,15 +49,16 @@ impl WheelEvent {
     }
 
     fn new_unintialized(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<WheelEvent> {
-        reflect_dom_object_with_proto(Box::new(WheelEvent::new_inherited()), window, proto, can_gc)
+        reflect_dom_object_with_proto(cx, Box::new(WheelEvent::new_inherited()), window, proto)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         event_type: Atom,
         can_bubble: EventBubbles,
@@ -66,17 +69,17 @@ impl WheelEvent {
         client_point: Point2D<i32, CSSPixel>,
         page_point: Point2D<i32, CSSPixel>,
         modifiers: Modifiers,
-        button: i16,
-        buttons: u16,
+        button: MouseButton,
+        buttons: MouseButtons,
         related_target: Option<&EventTarget>,
         point_in_target: Option<Point2D<f32, CSSPixel>>,
         delta_x: Finite<f64>,
         delta_y: Finite<f64>,
         delta_z: Finite<f64>,
         delta_mode: u32,
-        can_gc: CanGc,
     ) -> DomRoot<WheelEvent> {
         Self::new_with_proto(
+            cx,
             window,
             None,
             event_type,
@@ -96,12 +99,12 @@ impl WheelEvent {
             delta_y,
             delta_z,
             delta_mode,
-            can_gc,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
         event_type: Atom,
@@ -113,17 +116,16 @@ impl WheelEvent {
         client_point: Point2D<i32, CSSPixel>,
         page_point: Point2D<i32, CSSPixel>,
         modifiers: Modifiers,
-        button: i16,
-        buttons: u16,
+        button: MouseButton,
+        buttons: MouseButtons,
         related_target: Option<&EventTarget>,
         point_in_target: Option<Point2D<f32, CSSPixel>>,
         delta_x: Finite<f64>,
         delta_y: Finite<f64>,
         delta_z: Finite<f64>,
         delta_mode: u32,
-        can_gc: CanGc,
     ) -> DomRoot<WheelEvent> {
-        let ev = WheelEvent::new_unintialized(window, proto, can_gc);
+        let ev = WheelEvent::new_unintialized(cx, window, proto);
         ev.intitialize_wheel_event(
             event_type,
             can_bubble,
@@ -147,7 +149,7 @@ impl WheelEvent {
         ev
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn intitialize_wheel_event(
         &self,
         event_type: Atom,
@@ -159,8 +161,8 @@ impl WheelEvent {
         client_point: Point2D<i32, CSSPixel>,
         page_point: Point2D<i32, CSSPixel>,
         modifiers: Modifiers,
-        button: i16,
-        buttons: u16,
+        button: MouseButton,
+        buttons: MouseButtons,
         related_target: Option<&EventTarget>,
         point_in_target: Option<Point2D<f32, CSSPixel>>,
         delta_x: Finite<f64>,
@@ -197,9 +199,9 @@ impl WheelEvent {
 impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
     /// <https://w3c.github.io/uievents/#dom-wheelevent-wheelevent>
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         event_type: DOMString,
         init: &WheelEventBinding::WheelEventInit,
     ) -> Fallible<DomRoot<WheelEvent>> {
@@ -213,6 +215,7 @@ impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
         );
 
         let event = WheelEvent::new_with_proto(
+            cx,
             window,
             proto,
             event_type.into(),
@@ -224,15 +227,14 @@ impl WheelEventMethods<crate::DomTypeHolder> for WheelEvent {
             Point2D::new(init.parent.clientX, init.parent.clientY),
             Point2D::new(page_point.x, page_point.y),
             init.parent.parent.modifiers(),
-            init.parent.button,
-            init.parent.buttons,
+            init.parent.button.into(),
+            MouseButtons::from_bits_retain(init.parent.buttons),
             init.parent.relatedTarget.as_deref(),
             None,
             init.deltaX,
             init.deltaY,
             init.deltaZ,
             init.deltaMode,
-            can_gc,
         );
 
         Ok(event)

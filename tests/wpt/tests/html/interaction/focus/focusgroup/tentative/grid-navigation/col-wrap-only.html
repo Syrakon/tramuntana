@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
-<title>HTML Test: focusgroup - Validate that col-wrap allows only vertical wrapping.</title>
+<title>HTML Test: focusgroup - Validate that colwrap allows only vertical wrapping.</title>
 <link rel="author" title="Microsoft" href="http://www.microsoft.com/">
-<link rel="help" href="https://open-ui.org/components/scoped-focusgroup.explainer/">
+<link rel="help" href="https://open-ui.org/components/focusgroup-v2.explainer/#grid-wrapping-and-flow">
 <script src="/resources/testharness.js"></script>
 <script src="/resources/testharnessreport.js"></script>
 <script src="/resources/testdriver.js"></script>
@@ -11,7 +11,7 @@
 <script src="/shadow-dom/focus-navigation/resources/focus-utils.js"></script>
 <script src="../resources/focusgroup-utils.js"></script>
 
-<table focusgroup="grid col-wrap">
+<table focusgroup="grid colwrap">
   <tr>
     <td id=r1c1 tabindex=0>r1c1</td>
     <td id=r1c2 tabindex=0>r1c2</td>
@@ -27,31 +27,21 @@
 <script>
 
   promise_test(async t => {
-    var r1c3 = document.getElementById("r1c3");
-
     await focusAndSendDirectionalInput(r1c3, kRight);
     assert_equals(document.activeElement, r1c3);
   }, "Navigating right should not wrap the focus to the first column when only vertical wrap is supported by the focusgroup.");
 
   promise_test(async t => {
-    var r1c1 = document.getElementById("r1c1");
-    var r2c1 = document.getElementById("r2c1");
-
     await focusAndSendDirectionalInput(r2c1, kDown);
     assert_equals(document.activeElement, r1c1);
   }, "When on the last row, navigating down should move the focus to first row if the focusgroup wraps vertically.");
 
   promise_test(async t => {
-    var r1c1 = document.getElementById("r1c1");
-
     await focusAndSendDirectionalInput(r1c1, kLeft);
     assert_equals(document.activeElement, r1c1);
   }, "Navigating left should not wrap the focus to the last column when only vertical wrap is supported by the focusgroup.");
 
   promise_test(async t => {
-    var r1c1 = document.getElementById("r1c1");
-    var r2c1 = document.getElementById("r2c1");
-
     await focusAndSendDirectionalInput(r1c1, kUp);
     assert_equals(document.activeElement, r2c1);
   }, "When on the first row, navigating up should move the focus to last row if the focusgroup wraps vertically.");

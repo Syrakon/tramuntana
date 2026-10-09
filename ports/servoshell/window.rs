@@ -9,10 +9,11 @@ use std::sync::atomic::AtomicU64;
 use euclid::Scale;
 use log::warn;
 use servo::{
-    AuthenticationRequest, BluetoothDeviceSelectionRequest, ConsoleLogLevel, Cursor,
-    DeviceIndependentIntRect, DeviceIndependentPixel, DeviceIntPoint, DeviceIntSize, DevicePixel,
-    EmbedderControl, EmbedderControlId, InputEventId, InputEventResult, MediaSessionEvent,
-    PermissionRequest, RenderingContext, ScreenGeometry, WebView, WebViewBuilder, WebViewId,
+    AuthenticationRequest, BluetoothDeviceSelectionRequest, ConsoleLogLevel,
+    CreateNewWebViewRequest, Cursor, DeviceIndependentIntRect, DeviceIndependentPixel,
+    DeviceIntPoint, DeviceIntSize, DevicePixel, EmbedderControl, EmbedderControlId, InputEventId,
+    InputEventResult, MediaSessionEvent, PermissionRequest, RenderingContext, ScreenGeometry,
+    WebView, WebViewBuilder, WebViewId,
 };
 use url::Url;
 
@@ -67,6 +68,11 @@ pub(crate) struct ServoShellWindow {
     pending_commands: RefCell<Vec<UserInterfaceCommand>>,
 }
 
+pub(crate) enum TopLevelWebViewCreationRequest {
+    WithUrl(Url),
+    WithCreateRequest(CreateNewWebViewRequest),
+}
+
 impl ServoShellWindow {
     pub(crate) fn new(platform_window: Rc<dyn PlatformWindow>) -> Self {
         Self {
@@ -86,24 +92,35 @@ impl ServoShellWindow {
 
     /// Must be called *after* `self` is in `state.windows`, otherwise it will panic.
     pub(crate) fn create_and_activate_toplevel_webview(
-        &self,
+        self: &Rc<Self>,
         state: Rc<RunningAppState>,
-        url: Url,
+        creation_type: TopLevelWebViewCreationRequest,
     ) -> WebView {
-        let webview = self.create_toplevel_webview(state, url);
+        let webview = self.create_toplevel_webview(state, creation_type);
         self.activate_webview(webview.id());
         webview
     }
 
     /// Must be called *after* `self` is in `state.windows`, otherwise it will panic.
-    #[servo::servo_tracing::instrument(skip(self, state))]
-    pub(crate) fn create_toplevel_webview(&self, state: Rc<RunningAppState>, url: Url) -> WebView {
-        let mut webview_builder =
-            WebViewBuilder::new(state.servo(), self.platform_window.rendering_context())
-                .url(url)
-                .hidpi_scale_factor(self.platform_window.hidpi_scale_factor())
-                .user_content_manager(state.user_content_manager.clone())
-                .delegate(state.clone());
+    #[servo::servo_tracing::instrument(skip(self, state, creation_type))]
+    pub(crate) fn create_toplevel_webview(
+        &self,
+        state: Rc<RunningAppState>,
+        creation_type: TopLevelWebViewCreationRequest,
+    ) -> WebView {
+        let mut webview_builder = match creation_type {
+            TopLevelWebViewCreationRequest::WithUrl(url) => {
+                WebViewBuilder::new(state.servo(), self.platform_window.rendering_context())
+                    .url(url)
+            },
+            TopLevelWebViewCreationRequest::WithCreateRequest(request) => {
+                request.builder(self.platform_window.rendering_context())
+            },
+        };
+        webview_builder = webview_builder
+            .hidpi_scale_factor(self.platform_window.hidpi_scale_factor())
+            .user_content_manager(state.user_content_manager.clone())
+            .delegate(state.clone());
 
         #[cfg(all(
             feature = "gamepad",
@@ -114,8 +131,8 @@ impl ServoShellWindow {
         }
 
         let webview = webview_builder.build();
-        webview.notify_theme_change(self.platform_window.theme());
         self.add_webview(webview.clone());
+
         // If `self` is not in `state.windows`, our notify_accessibility_tree_update() will panic.
         if state.accessibility_active() {
             // Activate accessibility in the WebView.
@@ -125,7 +142,7 @@ impl ServoShellWindow {
         webview
     }
 
-    /// Repaint the focused [`WebView`].
+    /// Repaint the active [`WebView`].
     pub(crate) fn repaint_webviews(&self) {
         let Some(webview) = self.active_webview() else {
             return;
@@ -142,10 +159,6 @@ impl ServoShellWindow {
     /// Whether or not this [`ServoShellWindow`] has any [`WebView`]s.
     pub(crate) fn should_close(&self) -> bool {
         self.webview_collection.borrow().is_empty() || self.close_scheduled.get()
-    }
-
-    pub(crate) fn contains_webview(&self, id: WebViewId) -> bool {
-        self.webview_collection.borrow().contains(id)
     }
 
     pub(crate) fn webview_by_id(&self, id: WebViewId) -> Option<WebView> {
@@ -169,11 +182,8 @@ impl ServoShellWindow {
         self.platform_window.clone()
     }
 
-    pub(crate) fn focus(&self) {
-        self.platform_window.focus()
-    }
-
     pub(crate) fn add_webview(&self, webview: WebView) {
+        webview.notify_theme_change(self.platform_window.theme());
         self.webview_collection.borrow_mut().add(webview);
         self.set_needs_update();
         self.set_needs_repaint();
@@ -307,7 +317,7 @@ impl ServoShellWindow {
 
     /// Takes any events generated during UI updates and performs their actions.
     pub(crate) fn handle_interface_commands(
-        &self,
+        self: &Rc<Self>,
         state: &Rc<RunningAppState>,
         create_platform_window: Option<&dyn Fn(Url) -> Rc<dyn PlatformWindow>>,
     ) {
@@ -344,7 +354,7 @@ impl ServoShellWindow {
                     }
                 },
                 UserInterfaceCommand::ReloadAll => {
-                    for window in state.windows().values() {
+                    for window in state.windows().iter() {
                         window.set_needs_update();
                         for (_, webview) in window.webviews() {
                             webview.reload();
@@ -354,18 +364,27 @@ impl ServoShellWindow {
                 UserInterfaceCommand::NewWebView => {
                     self.set_needs_update();
                     let url = Url::parse("servo:newtab").expect("Should always be able to parse");
-                    self.create_and_activate_toplevel_webview(state.clone(), url);
+                    self.create_and_activate_toplevel_webview(
+                        state.clone(),
+                        TopLevelWebViewCreationRequest::WithUrl(url),
+                    );
                 },
                 UserInterfaceCommand::CloseWebView(id) => {
                     self.set_needs_update();
                     self.close_webview(id);
                 },
-                UserInterfaceCommand::NewWindow => {
-                    if let Some(create_platform_window) = create_platform_window {
-                        let url = Url::parse("servo:newtab").unwrap();
-                        let platform_window = create_platform_window(url.clone());
-                        state.open_window(platform_window, url);
-                    }
+                UserInterfaceCommand::NewWindow(creation_request) => {
+                    let Some(create_platform_window) = create_platform_window else {
+                        continue;
+                    };
+                    let url = match &creation_request {
+                        TopLevelWebViewCreationRequest::WithUrl(url) => url.clone(),
+                        TopLevelWebViewCreationRequest::WithCreateRequest(..) => {
+                            Url::parse("servo:newtab").unwrap()
+                        },
+                    };
+                    let platform_window = create_platform_window(url);
+                    state.open_window(platform_window, creation_request);
                 },
             }
         }
@@ -376,6 +395,12 @@ impl ServoShellWindow {
 /// be used in a servoshell execution. This currently includes headed (winit) and headless
 /// windows.
 pub(crate) trait PlatformWindow {
+    /// Whether or not the platform manages focus. This is used to decide whether
+    /// servoshell should focus another window when one closes.
+    fn platform_manages_focus(&self) -> bool {
+        false
+    }
+
     fn id(&self) -> ServoShellWindowId;
     fn screen_geometry(&self) -> ScreenGeometry;
     #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
@@ -383,11 +408,6 @@ pub(crate) trait PlatformWindow {
     fn hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel>;
     #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
     fn get_fullscreen(&self) -> bool;
-    /// Request that the `Window` rebuild its user interface, if it has one. This should
-    /// not repaint, but should prepare the user interface for painting when it is
-    /// actually requested.
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
-    fn rebuild_user_interface(&self, _: &RunningAppState, _: &ServoShellWindow) {}
     /// Inform the `Window` that the state of a `WebView` has changed and that it should
     /// do an incremental update of user interface state. Returns `true` if the user
     /// interface actually changed and a rebuild  and repaint is needed, `false` otherwise.
@@ -420,7 +440,6 @@ pub(crate) trait PlatformWindow {
     }
     fn window_rect(&self) -> DeviceIndependentIntRect;
     fn maximize(&self, _: &WebView) {}
-    fn focus(&self) {}
     fn has_platform_focus(&self) -> bool {
         true
     }

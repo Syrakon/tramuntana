@@ -30,7 +30,7 @@ use crate::prefs::ServoShellPreferences;
 use crate::running_app_state::RunningAppState;
 #[cfg(feature = "gamepad")]
 use crate::running_app_state::ServoshellGamepadDelegate;
-use crate::window::{PlatformWindow, ServoShellWindowId};
+use crate::window::{PlatformWindow, ServoShellWindowId, TopLevelWebViewCreationRequest};
 
 pub(crate) enum AppState {
     Initializing,
@@ -99,17 +99,17 @@ impl App {
             .event_loop_waker(self.waker.clone());
 
         let url = self.initial_url.as_url().clone();
+
+        let servo = servo_builder.build();
         let platform_window = self.create_platform_window(url, active_event_loop);
 
         #[cfg(feature = "webxr")]
-        let servo_builder =
-            servo_builder.webxr_registry(super::webxr::XrDiscoveryWebXrRegistry::new_boxed(
-                platform_window.clone(),
-                active_event_loop,
-                &self.preferences,
-            ));
+        servo.register_webxr_registry(super::webxr::XrDiscoveryWebXrRegistry::new_boxed(
+            platform_window.clone(),
+            active_event_loop,
+            &self.preferences,
+        ));
 
-        let servo = servo_builder.build();
         servo.setup_logging();
 
         let user_content_manager = Rc::new(UserContentManager::new(&servo));
@@ -130,9 +130,16 @@ impl App {
             user_content_manager,
             self.preferences.clone(),
             #[cfg(feature = "gamepad")]
-            ServoshellGamepadDelegate::maybe_new().map(Rc::new),
+            self.event_loop_proxy
+                .clone()
+                .map(ServoshellGamepadDelegate::new)
+                .map(Rc::new),
         ));
-        running_state.open_window(platform_window, self.initial_url.as_url().clone());
+        let initial_url = self.initial_url.as_url().clone();
+        running_state.open_window(
+            platform_window,
+            TopLevelWebViewCreationRequest::WithUrl(initial_url),
+        );
 
         self.state = AppState::Running(running_state);
     }
@@ -218,12 +225,20 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         };
 
-        if let Some(window) = app_event
-            .window_id()
-            .and_then(|window_id| state.window(ServoShellWindowId::from(u64::from(window_id)))) &&
-            let Some(headed_window) = window.platform_window().as_headed_window()
-        {
-            headed_window.handle_winit_app_event(state.clone(), app_event);
+        match app_event {
+            AppEvent::Waker => (),
+            AppEvent::Accessibility(ref event) => {
+                if let Some(window) =
+                    state.window(ServoShellWindowId::from(u64::from(event.window_id))) &&
+                    let Some(headed_window) = window.platform_window().as_headed_window()
+                {
+                    headed_window.handle_winit_app_event(state.clone(), app_event);
+                }
+            },
+            #[cfg(feature = "gamepad")]
+            AppEvent::Gamepad(event, gamepad_name, gamepad_index) => {
+                state.handle_gamepad_events(event, gamepad_name, gamepad_index);
+            },
         }
 
         if !self.pump_servo_event_loop(event_loop.into()) {

@@ -17,9 +17,22 @@ crate-type = ["rlib"]
 
 [features]
 # Note: Servoshell does not use the default features of servo, so you also
-# need to add features that should be default to ports/servoshell/Cargo.toml
-default = ["baked-in-resources", "clipboard", "js_jit"]
+# need to add feature-groups that should be default to ports/servoshell/Cargo.toml
+default = ["bundled", "clipboard", "js_jit", "multiprocess"]
+## Convenience feature groups, to select multiple related features for a sensible
+#  configuration with `--no-default-features` build
+#
+# A convenience feature to enable all default web features servo has.
+default_web_features = ["brotli-compression-stream", "clipboard", "webcrypto", "webgpu", "webgl", "webxr"]
+# Bundle required resources in the binary.
+bundled = ["baked-in-resources", "bundled_freetype"]
+
+# Individual features below this line.
 background_hang_monitor = ["servo-background-hang-monitor/sampler"]
+
+# Allow brotli to be used for compression and decompression in TransportStream JavaScript API
+brotli-compression-stream = ["script/brotli-compression-stream"]
+
 # This is slightly magical, but this will also work on ohos, where `servo-default-resource` is not added,
 # which makes `baked-in-resources a no-op (as intended) on ohos (and perhaps other platforms in the future).
 baked-in-resources = ["dep:servo-default-resources"]
@@ -31,7 +44,8 @@ bluetooth = [
     "script/bluetooth",
     "script_traits/bluetooth",
 ]
-clipboard = ["dep:arboard"]
+bundled_freetype = ["fonts/bundled_freetype"]
+clipboard = ["dep:arboard", "dep:ohos-pasteboard"]
 crown = ["script/crown"]
 debugmozjs = ["script/debugmozjs"]
 dynamic_freetype = ["webrender/dynamic_freetype"]
@@ -44,13 +58,18 @@ jitspew = ["script/jitspew"]
 js_backtrace = ["script/js_backtrace"]
 js_jit = ["script/js_jit"]
 media-gstreamer = ["servo-media-gstreamer", "gstreamer"]
+
+# Allows multiprocess and ipc mode. If enabled this still needs the correct preference flags to use multi process mode.
+multiprocess = ["servo-base/multiprocess", "servo-constellation/multiprocess"]
+
 native-bluetooth = ["servo-bluetooth/native-bluetooth"]
-no-wgl = ["mozangle/egl", "mozangle/build_dlls", "surfman/sm-angle-default", "paint_api/no-wgl"]
+no-wgl = ["dep:mozangle", "mozangle/egl", "mozangle/build_dlls", "surfman/sm-angle-default", "paint_api/no-wgl"]
 profilemozjs = ["script/profilemozjs"]
 testbinding = ["script/testbinding"]
 tracing = [
     "dep:tracing",
     "paint/tracing",
+    "paint_api/tracing",
     "servo-constellation/tracing",
     "fonts/tracing",
     "layout/tracing",
@@ -59,10 +78,21 @@ tracing = [
     "net/tracing",
 ]
 vello = ["servo-constellation/vello"]
+
+# Enable WebCrypto Web Platform Features
+webcrypto = ["servo-constellation-traits/webcrypto", "script/webcrypto"]
 webgl_backtrace = [
     "script/webgl_backtrace",
     "webgl/webgl_backtrace",
     "servo-canvas-traits/webgl_backtrace",
+]
+webgl = [
+    "dep:webgl",
+    "paint/webgl",
+    "script/webgl",
+    "script_traits/webgl",
+    "servo-constellation/webgl",
+    "servo-constellation-traits/webgl",
 ]
 webgpu = [
     "dep:webgpu",
@@ -72,6 +102,8 @@ webgpu = [
     "servo-constellation-traits/webgpu",
 ]
 webxr = [
+    "webgl",
+    "gamepad",
     "dep:webxr",
     "dep:webxr-api",
     "paint/webxr",
@@ -100,7 +132,7 @@ layout = { workspace = true }
 layout_api = { workspace = true }
 log = { workspace = true }
 media = { workspace = true }
-mozangle = { workspace = true }
+mozangle = { workspace = true, optional = true }
 net = { workspace = true }
 net_traits = { workspace = true }
 paint = { workspace = true }
@@ -135,7 +167,7 @@ surfman = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true, optional = true }
 url = { workspace = true }
-webgl = { workspace = true, default-features = false }
+webgl = { workspace = true, default-features = false, optional = true }
 webgpu = { workspace = true, optional = true }
 webrender = { workspace = true }
 webrender_api = { workspace = true }
@@ -152,31 +184,37 @@ webxr = { workspace = true, optional = true }
 
 [target.'cfg(not(any(target_os = "android", target_env = "ohos")))'.dependencies]
 arboard = { workspace = true, optional = true }
-webxr = { workspace = true, features = ["glwindow", "headless"] }
+webxr = { workspace = true, optional = true, features = ["glwindow", "headless"] }
 
-[target.'cfg(all(not(target_os = "windows"), not(target_os = "ios"), not(target_os = "android"), not(target_env = "ohos"), not(target_arch = "arm"), not(target_arch = "aarch64")))'.dependencies]
-gaol = "0.2.1"
+[target.'cfg(all(not(target_os = "windows"), not(target_os = "ios"), not(target_os = "android"), not(target_env = "ohos"), not(target_arch = "arm"), not(target_arch = "aarch64"), not(target_arch="riscv32"), not(target_arch="riscv64")))'.dependencies]
+gaol = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-webxr = { workspace = true, features = ["glwindow", "headless", "openxr-api"] }
+webxr = { workspace = true, optional = true, features = ["glwindow", "headless", "openxr-api"] }
 
 [target.'cfg(target_env = "ohos")'.dependencies]
 servo-media-ohos = { workspace = true }
+ohos-pasteboard = { workspace = true, optional = true }
 
 [dev-dependencies]
-accesskit_consumer = "0.35.0"
+accesskit_consumer = { workspace = true }
 content-security-policy = { workspace = true }
+gleam = { workspace = true }
+glow = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 itertools = { workspace = true }
 net = { workspace = true, features = ["test-util"] }
-rustls = { version = "0.23", default-features = false }
+rustls = { workspace = true, default-features = false }
 # This must always be a path dependency, we don't want to add a dependency on a
 # crates.io version of ourselves - we want to enable a feature of ourselves.
-servo = { path = ".", features = ["tracing"] }
+servo = { path = ".", features = ["testbinding", "tracing"] }
 tracing = { workspace = true }
 winit = { workspace = true }
+
+[lints]
+workspace = true
 
 [[test]]
 name = "multiprocess"

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use webxr_api::HitTestId;
 
@@ -10,7 +11,6 @@ use crate::dom::bindings::codegen::Bindings::XRHitTestSourceBinding::XRHitTestSo
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
 use crate::dom::xrsession::XRSession;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct XRHitTestSource {
@@ -30,15 +30,15 @@ impl XRHitTestSource {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         id: HitTestId,
         session: &XRSession,
-        can_gc: CanGc,
     ) -> DomRoot<XRHitTestSource> {
         reflect_dom_object(
+            cx,
             Box::new(XRHitTestSource::new_inherited(id, session)),
             window,
-            can_gc,
         )
     }
 

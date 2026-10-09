@@ -6,12 +6,16 @@
 	// Alternatively, uncomment the "build" property below to build the image from the Dockerfile in this folder.
 	// "build": {
 	// 	"dockerfile": "Ubuntu.Dockerfile",
+	// 	"target": "android",
 	// 	"context": ".."
 	// },
 
 
+	"features": {
+		"./features/common-cli-tools": {}
+	},
 	// Most dependencies are installed in the image, but we run mach bootstrap to ensure
-	// the environment matches what's expected in the current servo version, which might 
+	// the environment matches what's expected in the current servo version, which might
 	// have changed since the image was built.
 	"postCreateCommand":
 		"./mach bootstrap --yes",

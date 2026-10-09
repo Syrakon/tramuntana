@@ -5,13 +5,14 @@
 #![expect(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::borrow::Cow;
 use std::fmt::Debug;
 
+use atomic_refcell::AtomicRef;
 use net_traits::image_cache::Image;
 use pixels::ImageMetadata;
 use servo_arc::Arc;
 use servo_base::id::{BrowsingContextId, PipelineId};
+use servo_base::text::{RangeAny, Utf32CodeUnits};
 use servo_url::ServoUrl;
 use style::context::SharedStyleContext;
 use style::dom::{NodeInfo, OpaqueNode, TNode};
@@ -22,7 +23,7 @@ use crate::layout_dom::{DangerousStyleNodeOf, LayoutElementOf, LayoutNodeOf};
 use crate::pseudo_element_chain::PseudoElementChain;
 use crate::{
     GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutDataTrait, LayoutDomTypeBundle,
-    LayoutNodeType, SVGElementData, SharedSelection,
+    LayoutNodeType, SVGElementData,
 };
 
 /// A trait that exposes a DOM nodes to layout. Implementors of this trait must abide by certain
@@ -153,7 +154,7 @@ pub trait LayoutNode<'dom>: Copy + Debug + NodeInfo + Send + Sync {
 
     /// Returns the computed `:selected` style for the given node, properly handling
     /// pseudo-elements. For elements this returns their style and for other nodes, this
-    /// returns the style of the parent element, if one exists.
+    /// returns the selected style of the parent element, if one exists.
     ///
     /// # Panics
     ///
@@ -167,10 +168,23 @@ pub trait LayoutNode<'dom>: Copy + Debug + NodeInfo + Send + Sync {
     /// # Panics
     ///
     /// This method will panic if called on a node that is not a DOM text node.
-    fn text_content(self) -> Cow<'dom, str>;
+    fn text_content(self) -> AtomicRef<'dom, str>;
 
-    /// If this node manages a selection, this returns the shared selection for the node.
-    fn selection(&self) -> Option<SharedSelection>;
+    /// For a text node, returns which range of this text is part of the document selection
+    ///
+    /// Returned offsets are counted in `char`s in the `self.text_content()` string.
+    fn text_node_selection(&self) -> Option<RangeAny<Utf32CodeUnits>>;
+
+    /// For a text node, whether a caret should be painted when the selection is an empty range
+    /// (start == end)
+    fn text_node_paints_caret(&self) -> bool;
+
+    /// For a text node, whether a caret placeholder should be inserted in the box tree.
+    /// Caret placeholders are used as a place to draw text carets in otherwise empty
+    /// elements (such as `<input>` fields). In addition, this forces the creation of an
+    /// inline formatting context for empty text nodes and the allocation of the line
+    /// strut height during layout to ensure that empty `<input>` fields render properly.
+    fn text_node_needs_caret_placeholder(&self) -> bool;
 
     /// If this is an image element, returns its URL. If this is not an image element, fails.
     fn image_url(&self) -> Option<ServoUrl>;
@@ -180,6 +194,9 @@ pub trait LayoutNode<'dom>: Copy + Debug + NodeInfo + Send + Sync {
 
     /// If this is an image element, returns its image data. Otherwise, returns `None`.
     fn image_data(&self) -> Option<(Option<Image>, Option<ImageMetadata>)>;
+
+    /// Whether or not this node is selected when it is interpreted as a replaced element.
+    fn replaced_is_selected(&self) -> bool;
 
     /// Whether or not this is an image element that is showing a broken image icon.
     fn showing_broken_image_icon(&self) -> bool;

@@ -16,7 +16,9 @@ use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::PointerEventBinding::PointerEventMethods;
 use script_bindings::match_domstring_ascii;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
+use script_bindings::traits::DomEventTrait;
 use servo_base::cross_process_instant::CrossProcessInstant;
+use smallvec::SmallVec;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::callback::ExceptionHandling;
@@ -35,19 +37,23 @@ use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::document::Document;
 use crate::dom::element::Element;
 use crate::dom::eventtarget::{EventListeners, EventTarget, ListenerPhase};
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::html::form_controls::htmlinputelement::InputActivationState;
 use crate::dom::html::htmlslotelement::HTMLSlotElement;
-use crate::dom::html::input_element::InputActivationState;
 use crate::dom::mouseevent::MouseEvent;
+use crate::dom::node::virtualmethods::vtable_for;
 use crate::dom::node::{Node, NodeTraits};
-use crate::dom::shadowroot::ShadowRoot;
+use crate::dom::shadowroot::shadowroot::ShadowRoot;
 use crate::dom::types::{KeyboardEvent, PointerEvent, UserActivation};
-use crate::dom::virtualmethods::vtable_for;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
-use crate::task::TaskOnce;
+use crate::tasks::task::TaskOnce;
+
+/// Number of event path segments stored inline.
+/// TODO: confirm with benchmarks/real pages this is a good size?
+const EVENT_PATH_INLINE_CAPACITY: usize = 8;
 
 /// <https://dom.spec.whatwg.org/#concept-event>
 #[dom_struct]
@@ -84,7 +90,8 @@ pub(crate) struct Event {
     time_stamp: CrossProcessInstant,
 
     /// <https://dom.spec.whatwg.org/#event-path>
-    path: DomRefCell<Vec<EventPathSegment>>,
+    #[custom_trace]
+    path: DomRefCell<SmallVec<[EventPathSegment; EVENT_PATH_INLINE_CAPACITY]>>,
 
     /// <https://dom.spec.whatwg.org/#event-relatedtarget>
     related_target: MutNullableDom<EventTarget>,
@@ -131,37 +138,37 @@ impl Event {
         }
     }
 
-    pub(crate) fn new_uninitialized(global: &GlobalScope, can_gc: CanGc) -> DomRoot<Event> {
-        Self::new_uninitialized_with_proto(global, None, can_gc)
+    pub(crate) fn new_uninitialized(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<Event> {
+        Self::new_uninitialized_with_proto(cx, global, None)
     }
 
     pub(crate) fn new_uninitialized_with_proto(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<Event> {
-        reflect_dom_object_with_proto(Box::new(Event::new_inherited()), global, proto, can_gc)
+        reflect_dom_object_with_proto(cx, Box::new(Event::new_inherited()), global, proto)
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
-        can_gc: CanGc,
     ) -> DomRoot<Event> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable, can_gc)
+        Self::new_with_proto(cx, global, None, type_, bubbles, cancelable)
     }
 
     fn new_with_proto(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         type_: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
-        can_gc: CanGc,
     ) -> DomRoot<Event> {
-        let event = Event::new_uninitialized_with_proto(global, proto, can_gc);
+        let event = Event::new_uninitialized_with_proto(cx, global, proto);
 
         // NOTE: The spec doesn't tell us to call init event here, it just happens to do what we need.
         event.init_event(type_, bool::from(bubbles), bool::from(cancelable));
@@ -295,21 +302,6 @@ impl Event {
         self.dispatch_inner(cx, target, legacy_target_override, None)
     }
 
-    pub(crate) fn dispatch_with_legacy_output_did_listeners_throw(
-        &self,
-        cx: &mut JSContext,
-        target: &EventTarget,
-        legacy_target_override: bool,
-        legacy_output_did_listeners_throw: &Cell<bool>,
-    ) -> bool {
-        self.dispatch_inner(
-            cx,
-            target,
-            legacy_target_override,
-            Some(legacy_output_did_listeners_throw),
-        )
-    }
-
     fn dispatch_inner(
         &self,
         cx: &mut JSContext,
@@ -317,13 +309,21 @@ impl Event {
         legacy_target_override: bool,
         legacy_output_did_listeners_throw: Option<&Cell<bool>>,
     ) -> bool {
-        // > When a user interaction causes firing of an activation triggering input event in a Document document, the user agent
-        // > must perform the following activation notification steps before dispatching the event:
-        // <https://html.spec.whatwg.org/multipage/#user-activation-processing-model>
+        // From <https://html.spec.whatwg.org/multipage/#user-activation-processing-model>:
+        // > When a user interaction causes firing of an activation triggering
+        // > input event in a Document document, the user agent must perform
+        // > the following activation notification steps before dispatching the event:
         if self.is_an_activation_triggering_input_event() {
             // TODO: it is not quite clear what does the spec mean by in a `Document`. https://github.com/whatwg/html/issues/12126
             if let Some(document) = target.downcast::<Node>().map(|node| node.owner_doc()) {
                 UserActivation::handle_user_activation_notification(&document);
+            }
+            // From <https://w3c.github.io/event-timing/#set-event-timing-entry-duration>:
+            // Step 6.4. Set window’s has dispatched input event to true.
+            // Note: Spec refers use of interactionId for this,
+            // HTML "activation triggering input event" is a close approximation
+            if let Some(window) = target.global().downcast::<Window>() {
+                window.mark_has_dispatched_input_event();
             }
         }
 
@@ -335,6 +335,18 @@ impl Event {
 
         // Step 1. Set event’s dispatch flag.
         self.set_flags(EventFlags::Dispatch);
+
+        // From <https://www.w3.org/TR/largest-contentful-paint/#sec-modifications-DOM>
+        // > Right after step 1, we add the following step:
+        // > > If target’s relevant global object is a Window object, event’s
+        // > > type is scroll and its isTrusted is true, set target’s relevant
+        // > > global object’s has dispatched scroll event to true.
+        if let Some(window) = target.global().downcast::<Window>() &&
+            self.type_() == *"scroll" &&
+            self.is_trusted.get()
+        {
+            window.mark_has_dispatched_scroll_event();
+        }
 
         // Step 2. Let targetOverride be target, if legacy target override flag is not given,
         // and target’s associated Document otherwise.
@@ -352,10 +364,13 @@ impl Event {
         // Step 3. Let activationTarget be null.
         let mut activation_target = None;
 
+        // event's relatedTarget is not mutated while the path is being constructed, so root it once
+        // here instead of re-rooting it on every ancestor step below.
+        let event_related_target = self.related_target.get();
+
         // Step 4. Let relatedTarget be the result of retargeting event’s relatedTarget against target.
-        let related_target = self
-            .related_target
-            .get()
+        let related_target = event_related_target
+            .as_ref()
             .map(|related_target| related_target.retarget(&target));
 
         // Step 5. Let clearTargets be false.
@@ -364,7 +379,7 @@ impl Event {
         // Step 6. If target is not relatedTarget or target is event’s relatedTarget:
         let mut pre_activation_result: Option<InputActivationState> = None;
         if related_target.as_ref() != Some(&target) ||
-            self.related_target.get().as_ref() == Some(&target)
+            event_related_target.as_ref() == Some(&target)
         {
             // Step 6.1. Let touchTargets be a new list.
             // TODO
@@ -414,6 +429,13 @@ impl Event {
             let mut parent_or_none = target.get_the_parent(self);
             let mut done = false;
 
+            let target_root_of = |target: &EventTarget| {
+                target
+                    .downcast::<Node>()
+                    .map(|node| node.GetRootNode(&GetRootNodeOptions::empty()))
+            };
+            let mut target_root = target_root_of(&target);
+
             // Step 6.9. While parent is non-null:
             while let Some(parent) = parent_or_none.clone() {
                 // Step 6.9.1. If slottable is non-null:
@@ -446,9 +468,8 @@ impl Event {
                 }
 
                 // Step 6.9.3. Let relatedTarget be the result of retargeting event’s relatedTarget against parent.
-                let related_target = self
-                    .related_target
-                    .get()
+                let related_target = event_related_target
+                    .as_ref()
                     .map(|related_target| related_target.retarget(&parent));
 
                 // Step 6.9.4. Let touchTargets be a new list.
@@ -460,14 +481,20 @@ impl Event {
 
                 // Step 6.9.6. If parent is a Window object, or parent is a node and target’s root is a
                 // shadow-including inclusive ancestor of parent:
-                let root_is_shadow_inclusive_ancestor = parent
-                    .downcast::<Node>()
-                    .zip(target.downcast::<Node>())
-                    .is_some_and(|(parent, target)| {
-                        target
-                            .GetRootNode(&GetRootNodeOptions::empty())
-                            .is_shadow_including_inclusive_ancestor_of(parent)
-                    });
+                let root_is_shadow_inclusive_ancestor =
+                    match (parent.downcast::<Node>(), target_root.as_ref()) {
+                        (Some(parent_node), Some(root)) => {
+                            // Fast path: when `target` is a connected node outside any shadow
+                            // tree, its root is the Document. Every node reached by walking up
+                            // from `target` shares that document, so the Document is always a
+                            // shadow-including inclusive ancestor of `parent`. This avoids an
+                            // O(depth) ancestor walk here, which otherwise makes building the
+                            // path O(depth^2).
+                            root.is::<Document>() ||
+                                root.is_shadow_including_inclusive_ancestor_of(parent_node)
+                        },
+                        _ => false,
+                    };
                 if parent.is::<Window>() || root_is_shadow_inclusive_ancestor {
                     // Step 6.9.6.1. If isActivationEvent is true, event’s bubbles attribute is true, activationTarget
                     // is null, and parent has activation behavior, then set activationTarget to parent.
@@ -499,6 +526,8 @@ impl Event {
                 else {
                     // Step 6.9.8.1. Set target to parent.
                     target = parent.clone();
+                    // `target` changed, so its cached root node is stale.
+                    target_root = target_root_of(&target);
 
                     // Step 6.9.8.2. If isActivationEvent is true, activationTarget is null, and target has
                     // activation behavior, then set activationTarget to target.
@@ -573,6 +602,25 @@ impl Event {
             let timeline_window = DomRoot::downcast::<Window>(target.global())
                 .filter(|window| window.need_emit_timeline_marker(TimelineMarkerType::DOMEvent));
 
+            // Precompute, for each segment, the index of the segment whose shadow-adjusted
+            // target applies to it (its own, or the nearest preceding one that is non-null).
+            // "invoke" uses this to set event.target so resolving it once here turns invoke's
+            // per-segment backward scan which made dispatch O(path^2) into O(path). Indices
+            // keep this free of unrooted GC pointers: the targets stay reachable through the
+            // traced `self.path`.
+            let target_indices: SmallVec<[usize; EVENT_PATH_INLINE_CAPACITY]> = {
+                let path = self.path.borrow();
+                let mut current = 0;
+                let mut indices = SmallVec::with_capacity(path.len());
+                for (index, segment) in path.iter().enumerate() {
+                    if segment.shadow_adjusted_target.is_some() {
+                        current = index;
+                    }
+                    indices.push(current);
+                }
+                indices
+            };
+
             // Step 6.13. For each struct in event’s path, in reverse order:
             for (index, segment) in self.path.borrow().iter().enumerate().rev() {
                 // Step 6.13.1. If struct’s shadow-adjusted target is non-null, then set event’s
@@ -589,7 +637,7 @@ impl Event {
                 invoke(
                     cx,
                     segment,
-                    index,
+                    target_indices[index],
                     self,
                     ListenerPhase::Capturing,
                     timeline_window.as_deref(),
@@ -619,7 +667,7 @@ impl Event {
                 invoke(
                     cx,
                     segment,
-                    index,
+                    target_indices[index],
                     self,
                     ListenerPhase::Bubbling,
                     timeline_window.as_deref(),
@@ -766,21 +814,9 @@ impl Event {
     }
 
     /// <https://dom.spec.whatwg.org/#firing-events>
-    #[expect(unsafe_code)]
-    pub(crate) fn fire(&self, target: &EventTarget, _can_gc: CanGc) -> bool {
+    pub(crate) fn fire(&self, cx: &mut JSContext, target: &EventTarget) -> bool {
         self.set_trusted(true);
-
-        // TODO https://github.com/servo/servo/issues/44499
-        let mut cx = unsafe { script_bindings::script_runtime::temp_cx() };
-        let cx = &mut cx;
-
-        target.dispatch_event(cx, self)
-    }
-
-    pub(crate) fn fire_with_cx(&self, cx: &mut JSContext, target: &EventTarget) -> bool {
-        self.set_trusted(true);
-
-        target.dispatch_event(cx, self)
+        self.dispatch(cx, target, false)
     }
 
     pub(crate) fn fire_with_legacy_output_did_listeners_throw(
@@ -790,24 +826,19 @@ impl Event {
         legacy_output_did_listeners_throw: &Cell<bool>,
     ) -> bool {
         self.set_trusted(true);
-        self.dispatch_with_legacy_output_did_listeners_throw(
-            cx,
-            target,
-            false,
-            legacy_output_did_listeners_throw,
-        )
+        self.dispatch_inner(cx, target, false, Some(legacy_output_did_listeners_throw))
     }
 
     /// <https://dom.spec.whatwg.org/#inner-event-creation-steps>
     fn inner_creation_steps(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
         init: &EventBinding::EventInit,
-        can_gc: CanGc,
     ) -> DomRoot<Event> {
         // Step 1. Let event be the result of creating a new object using eventInterface.
         // If realm is non-null, then use that realm; otherwise, use the default behavior defined in Web IDL.
-        let event = Event::new_uninitialized_with_proto(global, proto, can_gc);
+        let event = Event::new_uninitialized_with_proto(cx, global, proto);
 
         // Step 2. Set event’s initialized flag.
         event.set_flags(EventFlags::Initialized);
@@ -867,15 +898,15 @@ impl Event {
 impl EventMethods<crate::DomTypeHolder> for Event {
     /// <https://dom.spec.whatwg.org/#concept-event-constructor>
     fn Constructor(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         type_: DOMString,
         init: &EventBinding::EventInit,
     ) -> Fallible<DomRoot<Event>> {
         // Step 1. Let event be the result of running the inner event creation steps with
         // this interface, null, now, and eventInitDict.
-        let event = Event::inner_creation_steps(global, proto, init, can_gc);
+        let event = Event::inner_creation_steps(cx, global, proto, init);
 
         // Step 2. Initialize event’s type attribute to type.
         *event.type_.borrow_mut() = Atom::from(type_);
@@ -1099,9 +1130,9 @@ impl EventMethods<crate::DomTypeHolder> for Event {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-timestamp>
-    fn TimeStamp(&self) -> DOMHighResTimeStamp {
+    fn TimeStamp(&self, cx: &mut JSContext) -> DOMHighResTimeStamp {
         self.global()
-            .performance()
+            .performance(cx)
             .to_dom_high_res_time_stamp(self.time_stamp)
     }
 
@@ -1280,7 +1311,7 @@ impl TaskOnce for SimpleEventTask {
 fn invoke(
     cx: &mut JSContext,
     segment: &EventPathSegment,
-    segment_index_in_path: usize,
+    resolved_target_index: usize,
     event: &Event,
     phase: ListenerPhase,
     timeline_window: Option<&Window>,
@@ -1289,11 +1320,8 @@ fn invoke(
     // Step 1. Set event’s target to the shadow-adjusted target of the last struct in event’s path,
     // that is either struct or preceding struct, whose shadow-adjusted target is non-null.
     event.target.set(
-        event.path.borrow()[..segment_index_in_path + 1]
-            .iter()
-            .rev()
-            .flat_map(|segment| segment.shadow_adjusted_target.clone())
-            .next()
+        event.path.borrow()[resolved_target_index]
+            .shadow_adjusted_target
             .as_deref(),
     );
 
@@ -1311,7 +1339,7 @@ fn invoke(
     event.current_target.set(Some(&segment.invocation_target));
 
     // Step 6. Let listeners be a clone of event’s currentTarget attribute value’s event listener list.
-    let listeners = segment.invocation_target.get_listeners_for(&event.type_());
+    rooted!(&in(cx) let listeners = segment.invocation_target.get_listeners_for(&event.type_()));
 
     // Step 7. Let invocationTargetInShadowTree be struct’s invocation-target-in-shadow-tree.
     let invocation_target_in_shadow_tree = segment.invocation_target_in_shadow_tree;
@@ -1403,11 +1431,11 @@ fn inner_invoke(
             event_target.remove_listener(&event.type_(), listener);
         }
 
-        let Some(compiled_listener) =
-            listener
-                .borrow()
-                .get_compiled_listener(cx, &event_target, &event.type_())
-        else {
+        rooted!(&in(cx) let compiled_listener = listener
+            .borrow()
+            .get_compiled_listener(cx, &event_target, &event.type_())
+        );
+        let Some(compiled_listener) = &*compiled_listener else {
             continue;
         };
 
@@ -1465,4 +1493,22 @@ fn inner_invoke(
 
     // Step 3.
     found
+}
+
+impl DomEventTrait<crate::DomTypeHolder> for Event {
+    fn new_inherited() -> Self {
+        Event::new_inherited()
+    }
+
+    fn init_event(&self, type_: style::Atom, bubbles: bool, cancelable: bool) {
+        Event::init_event(self, type_, bubbles, cancelable);
+    }
+
+    fn IsTrusted(&self) -> bool {
+        script_bindings::codegen::GenericBindings::EventBinding::EventMethods::<crate::DomTypeHolder>::IsTrusted(self)
+    }
+
+    fn fire(&self, cx: &mut js::context::JSContext, target: &EventTarget) {
+        Event::fire(self, cx, target);
+    }
 }

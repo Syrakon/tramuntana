@@ -11,30 +11,33 @@ use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{KeyType, KeyUsag
 use crate::dom::bindings::codegen::Bindings::SubtleCryptoBinding::KeyFormat;
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::cryptokey::{CryptoKey, Handle};
+use crate::dom::cryptokey::{CryptoKey, Handle, KeyUsageSliceHelper};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::subtlecrypto::{
-    CryptoAlgorithm, KeyAlgorithmAndDerivatives, NormalizedAlgorithm, SubtleKeyAlgorithm,
-    SubtlePbkdf2Params,
+    CryptoAlgorithm, KeyAlgorithm, KeyAlgorithmAndDerivatives, NormalizedAlgorithm, Pbkdf2Params,
 };
 
 /// <https://w3c.github.io/webcrypto/#pbkdf2-operations-derive-bits>
 pub(crate) fn derive_bits(
-    normalized_algorithm: &SubtlePbkdf2Params,
+    normalized_algorithm: &Pbkdf2Params,
     key: &CryptoKey,
     length: Option<u32>,
 ) -> Result<Vec<u8>, Error> {
     // Step 1. If length is null or is not a multiple of 8, then throw an OperationError.
     let Some(length) = length else {
-        return Err(Error::Operation(None));
+        return Err(Error::Operation(Some("Length is null".into())));
     };
     if length % 8 != 0 {
-        return Err(Error::Operation(None));
+        return Err(Error::Operation(Some(
+            "Length is not a multiple of 8".into(),
+        )));
     };
 
     // Step 2. If the iterations member of normalizedAlgorithm is zero, then throw an OperationError.
     let Ok(iterations) = NonZero::<u32>::try_from(normalized_algorithm.iterations) else {
-        return Err(Error::Operation(None));
+        return Err(Error::Operation(Some(
+            "Normalized algorithm's iterations is zero".into(),
+        )));
     };
 
     // Step 3. If length is zero, return an empty byte sequence.
@@ -50,7 +53,9 @@ pub(crate) fn derive_bits(
         CryptoAlgorithm::Sha384 => pbkdf2::PBKDF2_HMAC_SHA384,
         CryptoAlgorithm::Sha512 => pbkdf2::PBKDF2_HMAC_SHA512,
         _ => {
-            return Err(Error::NotSupported(None));
+            return Err(Error::NotSupported(Some(
+                "Normalized algorithm's hash name is not supported".into(),
+            )));
         },
     };
 
@@ -88,21 +93,15 @@ pub(crate) fn import_key(
 ) -> Result<DomRoot<CryptoKey>, Error> {
     // Step 1. If format is not "raw", throw a NotSupportedError
     if !matches!(format, KeyFormat::Raw | KeyFormat::Raw_secret) {
-        return Err(Error::NotSupported(None));
+        return Err(Error::NotSupported(Some("Format is not raw".into())));
     }
 
     // Step 2. If usages contains a value that is not "deriveKey" or "deriveBits", then throw a SyntaxError.
-    if usages
-        .iter()
-        .any(|usage| !matches!(usage, KeyUsage::DeriveKey | KeyUsage::DeriveBits)) ||
-        usages.is_empty()
-    {
-        return Err(Error::Syntax(None));
-    }
+    usages.ensure_only_contain_entries_from(&[KeyUsage::DeriveKey, KeyUsage::DeriveBits])?;
 
     // Step 3. If extractable is not false, then throw a SyntaxError.
     if extractable {
-        return Err(Error::Syntax(None));
+        return Err(Error::Syntax(Some("Extractable is not false".into())));
     }
 
     // Step 4. Let key be a new CryptoKey representing keyData.
@@ -110,7 +109,7 @@ pub(crate) fn import_key(
     // Step 6. Let algorithm be a new KeyAlgorithm object.
     // Step 7. Set the name attribute of algorithm to "PBKDF2".
     // Step 8. Set the [[algorithm]] internal slot of key to algorithm.
-    let algorithm = SubtleKeyAlgorithm {
+    let algorithm = KeyAlgorithm {
         name: CryptoAlgorithm::Pbkdf2,
     };
     let key = CryptoKey::new(
@@ -119,7 +118,7 @@ pub(crate) fn import_key(
         KeyType::Secret,
         extractable,
         KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
-        usages,
+        usages.normalized_value(),
         Handle::Pbkdf2(key_data.to_vec().into()),
     );
 

@@ -2,14 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use aes::cipher::crypto_common::Key;
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt};
 use aes::{Aes128, Aes192, Aes256};
-use cipher::generic_array::typenum::{GrEq, IsGreaterOrEqual, IsLessOrEqual, LeEq, NonZero};
-use cipher::{ArrayLength, BlockDecrypt, BlockEncrypt, BlockSizeUser};
 use js::context::JSContext;
-use ocb3::aead::AeadMutInPlace;
-use ocb3::aead::consts::{U6, U7, U8, U9, U10, U11, U12, U13, U14, U15, U16};
-use ocb3::{KeyInit, Nonce, Ocb3};
+use ocb3::aead::array::ArraySize;
+use ocb3::aead::array::typenum::{
+    GrEq, IsGreaterOrEqual, IsLessOrEqual, LeEq, NonZero, U6, U7, U8, U9, U10, U11, U12, U13, U14,
+    U15, U16,
+};
+use ocb3::aead::common::BlockSizeUser;
+use ocb3::aead::{Key, KeySizeUser};
+use ocb3::{AeadInOut, KeyInit, Ocb3};
 
 use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::KeyUsage;
 use crate::dom::bindings::codegen::Bindings::SubtleCryptoBinding::KeyFormat;
@@ -19,12 +22,12 @@ use crate::dom::cryptokey::{CryptoKey, Handle};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::subtlecrypto::aes_common::AesAlgorithm;
 use crate::dom::subtlecrypto::{
-    ExportedKey, SubtleAeadParams, SubtleAesDerivedKeyParams, SubtleAesKeyGenParams, aes_common,
+    AeadParams, AesDerivedKeyParams, AesKeyGenParams, ExportedKey, aes_common,
 };
 
 /// <https://wicg.github.io/webcrypto-modern-algos/#aes-ocb-operations-encrypt>
 pub(crate) fn encrypt(
-    normalized_algorithm: &SubtleAeadParams,
+    normalized_algorithm: &AeadParams,
     key: &CryptoKey,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
@@ -72,7 +75,7 @@ pub(crate) fn encrypt(
     // from the `ocb3` crate <https://docs.rs/ocb3/latest/ocb3/struct.Ocb3.html>. This range is
     // suggested in the paper <https://eprint.iacr.org/2023/326.pdf> to prevent an attack.
     let iv = &normalized_algorithm.iv;
-    let c = match key.handle() {
+    let ciphertext = match key.handle() {
         Handle::Aes128Key(key) => match (iv.len(), tag_length) {
             (6, 64) => ocb_encrypt::<Aes128, U6, U8>(key, plaintext, iv, additional_data)?,
             (7, 64) => ocb_encrypt::<Aes128, U7, U8>(key, plaintext, iv, additional_data)?,
@@ -207,7 +210,7 @@ pub(crate) fn encrypt(
     };
 
     // Step 5. Return C.
-    Ok(c)
+    Ok(ciphertext)
 }
 
 /// Helper for Step 5 of <https://wicg.github.io/webcrypto-modern-algos/#aes-ocb-operations-encrypt>
@@ -218,26 +221,30 @@ fn ocb_encrypt<Cipher, NonceSize, TagSize>(
     additional_data: &[u8],
 ) -> Result<Vec<u8>, Error>
 where
-    Cipher: BlockSizeUser<BlockSize = U16> + BlockEncrypt + KeyInit + BlockDecrypt,
-    NonceSize: ArrayLength<u8> + IsGreaterOrEqual<U6> + IsLessOrEqual<U15>,
+    Cipher: BlockSizeUser<BlockSize = U16> + BlockCipherEncrypt + KeyInit + BlockCipherDecrypt,
+    Cipher: KeySizeUser,
+    NonceSize: ArraySize + IsGreaterOrEqual<U6> + IsLessOrEqual<U15>,
     GrEq<NonceSize, U6>: NonZero,
     LeEq<NonceSize, U15>: NonZero,
-    TagSize: ArrayLength<u8> + NonZero + IsLessOrEqual<U16>,
+    TagSize: ArraySize + NonZero + IsLessOrEqual<U16>,
     LeEq<TagSize, U16>: NonZero,
 {
-    let mut c = plaintext.to_vec();
-    let mut cipher = Ocb3::<Cipher, NonceSize, TagSize>::new(key);
+    let iv = iv
+        .try_into()
+        .map_err(|_| Error::Operation(Some("Invalid AES-OCB IV".into())))?;
+    let mut ciphertext = plaintext.to_vec();
+    let cipher = Ocb3::<Cipher, NonceSize, TagSize>::new(key);
     cipher
-        .encrypt_in_place(Nonce::from_slice(iv), additional_data, &mut c)
+        .encrypt_in_place(&iv, additional_data, &mut ciphertext)
         .map_err(|_| {
             Error::Operation(Some("AES-OCB authenticated encryption failed".to_string()))
         })?;
-    Ok(c)
+    Ok(ciphertext)
 }
 
 /// <https://wicg.github.io/webcrypto-modern-algos/#aes-ocb-operations-decrypt>
 pub(crate) fn decrypt(
-    normalized_algorithm: &SubtleAeadParams,
+    normalized_algorithm: &AeadParams,
     key: &CryptoKey,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, Error> {
@@ -443,17 +450,21 @@ fn ocb_decrypt<Cipher, NonceSize, TagSize>(
     additional_data: &[u8],
 ) -> Result<Vec<u8>, Error>
 where
-    Cipher: BlockSizeUser<BlockSize = U16> + BlockEncrypt + KeyInit + BlockDecrypt,
-    NonceSize: ArrayLength<u8> + IsGreaterOrEqual<U6> + IsLessOrEqual<U15>,
+    Cipher: BlockSizeUser<BlockSize = U16> + BlockCipherEncrypt + KeyInit + BlockCipherDecrypt,
+    Cipher: KeySizeUser,
+    NonceSize: ArraySize + IsGreaterOrEqual<U6> + IsLessOrEqual<U15>,
     GrEq<NonceSize, U6>: NonZero,
     LeEq<NonceSize, U15>: NonZero,
-    TagSize: ArrayLength<u8> + NonZero + IsLessOrEqual<U16>,
+    TagSize: ArraySize + NonZero + IsLessOrEqual<U16>,
     LeEq<TagSize, U16>: NonZero,
 {
+    let iv = iv
+        .try_into()
+        .map_err(|_| Error::Operation(Some("Invalid AES-OCB IV".into())))?;
     let mut plaintext = ciphertext.to_vec();
-    let mut cipher = Ocb3::<Cipher, NonceSize, TagSize>::new(key);
+    let cipher = Ocb3::<Cipher, NonceSize, TagSize>::new(key);
     cipher
-        .decrypt_in_place(Nonce::from_slice(iv), additional_data, &mut plaintext)
+        .decrypt_in_place(&iv, additional_data, &mut plaintext)
         .map_err(|_| {
             Error::Operation(Some("AES-OCB authenticated decryption failed".to_string()))
         })?;
@@ -464,14 +475,14 @@ where
 pub(crate) fn generate_key(
     cx: &mut JSContext,
     global: &GlobalScope,
-    normalized_algorithm: &SubtleAesKeyGenParams,
+    normalized_algorithm: &AesKeyGenParams,
     extractable: bool,
     usages: Vec<KeyUsage>,
 ) -> Result<DomRoot<CryptoKey>, Error> {
     aes_common::generate_key(
-        AesAlgorithm::AesOcb,
         cx,
         global,
+        AesAlgorithm::AesOcb,
         normalized_algorithm,
         extractable,
         usages,
@@ -488,9 +499,9 @@ pub(crate) fn import_key(
     usages: Vec<KeyUsage>,
 ) -> Result<DomRoot<CryptoKey>, Error> {
     aes_common::import_key(
-        AesAlgorithm::AesOcb,
         cx,
         global,
+        AesAlgorithm::AesOcb,
         format,
         key_data,
         extractable,
@@ -505,7 +516,7 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
 
 /// <https://wicg.github.io/webcrypto-modern-algos/#aes-ocb-operations-get-key-length>
 pub(crate) fn get_key_length(
-    normalized_derived_key_algorithm: &SubtleAesDerivedKeyParams,
+    normalized_derived_key_algorithm: &AesDerivedKeyParams,
 ) -> Result<Option<u32>, Error> {
     aes_common::get_key_length(normalized_derived_key_algorithm)
 }

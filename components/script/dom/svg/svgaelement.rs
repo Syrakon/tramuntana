@@ -10,14 +10,9 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::document::Document;
 use crate::dom::node::Node;
+use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::svg::svggraphicselement::SVGGraphicsElement;
-use crate::dom::virtualmethods::VirtualMethods;
 
-/// <https://svgwg.org/svg2-draft/linking.html#InterfaceSVGAElement>
-///
-/// The link itself is not followed yet: this exists so that the interface is on
-/// the global and an `<a>` inside an `<svg>` reflects to it, which scripts test
-/// for when they decide how to treat a click target.
 #[dom_struct]
 pub(crate) struct SVGAElement {
     svggraphicselement: SVGGraphicsElement,

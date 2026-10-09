@@ -64,21 +64,6 @@ async function expect_long_frame(cb, t) {
   return entry;
 }
 
-function generate_long_animation_frame(duration = 120) {
-  busy_wait(duration / 2);
-  const reference_time = performance.now();
-  busy_wait(duration / 2);
-  return new Promise(resolve => new PerformanceObserver((entries, observer) => {
-    const entry = entries.getEntries().find(e =>
-        (e.startTime < reference_time) &&
-        (reference_time < (e.startTime + e.duration)));
-    if (entry) {
-      observer.disconnect();
-      resolve(entry);
-    }
-  }).observe({type: "long-animation-frame"}));
-}
-
 async function expect_long_frame_with_script(cb, predicate, t) {
   const entry = await expect_long_frame(cb, t);
   for (const script of entry.scripts ?? []) {
@@ -161,4 +146,10 @@ function test_promise_script(cb, resolve_or_reject, invoker, label) {
 
 function test_self_script_block(cb, invoker, type) {
   test_loaf_script(cb, invoker, type);
+}
+
+function close_enough(actual, expected) {
+  const diff = Math.abs(actual - expected);
+  const max_abs = Math.max(Math.abs(actual), Math.abs(expected));
+  return diff * 10 < max_abs + 1e-9;
 }

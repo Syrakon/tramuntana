@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use std::collections::HashSet;
-use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
@@ -13,7 +12,6 @@ use script_bindings::cell::DomRefCell;
 use script_bindings::inheritance::Castable;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::GenericSend;
-use servo_config::pref;
 use servo_url::origin::ImmutableOrigin;
 use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
 use storage_traits::indexeddb::{
@@ -22,6 +20,7 @@ use storage_traits::indexeddb::{
 use stylo_atoms::Atom;
 use uuid::Uuid;
 
+use crate::dom::RootedPromise;
 use crate::dom::bindings::codegen::Bindings::IDBFactoryBinding::{
     IDBDatabaseInfo, IDBFactoryMethods,
 };
@@ -34,10 +33,9 @@ use crate::dom::bindings::trace::HashMapTracedValues;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::indexeddb::idbopendbrequest::IDBOpenDBRequest;
+use crate::dom::indexeddb::key::{convert_value_to_key, map_backend_error_to_dom_error};
 use crate::dom::promise::Promise;
 use crate::dom::types::IDBTransaction;
-use crate::indexeddb::{convert_value_to_key, map_backend_error_to_dom_error};
-use crate::script_runtime::CanGc;
 
 /// A non-jstraceable string wrapper for use in `HashMapTracedValues`.
 #[derive(Clone, Debug, Eq, Hash, MallocSizeOf, PartialEq)]
@@ -62,33 +60,6 @@ pub struct IDBFactory {
 }
 
 impl IDBFactory {
-    /// <https://storage.spec.whatwg.org/#obtain-a-storage-key-for-non-storage-purposes>
-    fn obtain_storage_key_for_non_storage_purposes(environment: &GlobalScope) -> ImmutableOrigin {
-        // Step 1: Let origin be environment’s origin if environment is an environment settings object; otherwise environment’s creation URL’s origin.
-        // Step 2: Return a tuple consisting of origin.
-        environment.origin().immutable().clone()
-    }
-
-    /// <https://storage.spec.whatwg.org/#obtain-a-storage-key>
-    pub(crate) fn obtain_storage_key(environment: &GlobalScope) -> Option<ImmutableOrigin> {
-        // Step 1: Let key be the result of running obtain a storage key for non-storage purposes
-        // with environment.
-        let key = Self::obtain_storage_key_for_non_storage_purposes(environment);
-
-        // Step 2: If key's origin is an opaque origin, then return failure.
-        if let ImmutableOrigin::Opaque(_) = key {
-            return None;
-        }
-
-        // Step 3: If the user has disabled storage, then return failure.
-        if !pref!(dom_indexeddb_enabled) {
-            return None;
-        }
-
-        // Step 4: Return key.
-        Some(key)
-    }
-
     pub fn new_inherited() -> IDBFactory {
         IDBFactory {
             reflector_: Reflector::new(),
@@ -99,7 +70,7 @@ impl IDBFactory {
     }
 
     pub(crate) fn register_indexeddb_transaction(&self, txn: &IDBTransaction) {
-        let db_name = DBName(txn.get_db_name().to_string());
+        let db_name = DBName(String::from(txn.get_db_name()));
         let mut map = self.indexeddb_transactions.borrow_mut();
         let bucket = map.entry(db_name).or_default();
         if !bucket.iter().any(|entry| &**entry == txn) {
@@ -109,7 +80,7 @@ impl IDBFactory {
     }
 
     pub(crate) fn unregister_indexeddb_transaction(&self, txn: &IDBTransaction) {
-        let db_name = DBName(txn.get_db_name().to_string());
+        let db_name = DBName(String::from(txn.get_db_name()));
         let mut map = self.indexeddb_transactions.borrow_mut();
         if let Some(bucket) = map.get_mut(&db_name) {
             bucket.retain(|entry| &**entry != txn);
@@ -120,7 +91,7 @@ impl IDBFactory {
         txn.clear_registered_in_global();
     }
 
-    pub(crate) fn cleanup_indexeddb_transactions(&self) -> bool {
+    pub(crate) fn cleanup_indexeddb_transactions(&self, cx: &mut JSContext) -> bool {
         // We implement the HTML-triggered deactivation effect by tracking script-created
         // transactions on the global and deactivating them at the microtask checkpoint.
         let snapshot: Vec<DomRoot<IDBTransaction>> = {
@@ -166,7 +137,7 @@ impl IDBFactory {
                 txn.set_active_flag(false);
                 txn.clear_cleanup_event_loop();
                 if txn.is_usable() {
-                    txn.maybe_commit();
+                    txn.maybe_commit(cx);
                 }
             }
         }
@@ -186,7 +157,7 @@ impl IDBFactory {
         true
     }
 
-    pub(crate) fn maybe_commit_txn(&self, db_name: &str, txn_serial: u64) {
+    pub(crate) fn maybe_commit_txn(&self, cx: &mut JSContext, db_name: &str, txn_serial: u64) {
         let key = DBName(db_name.to_string());
         let snapshot: Vec<DomRoot<IDBTransaction>> = {
             let map = self.indexeddb_transactions.borrow();
@@ -198,7 +169,7 @@ impl IDBFactory {
 
         for txn in snapshot {
             if txn.get_serial_number() == txn_serial {
-                txn.maybe_commit();
+                txn.maybe_commit(cx);
                 break;
             }
         }
@@ -226,8 +197,8 @@ impl IDBFactory {
         );
     }
 
-    pub fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<IDBFactory> {
-        reflect_dom_object(Box::new(IDBFactory::new_inherited()), global, can_gc)
+    pub fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<IDBFactory> {
+        reflect_dom_object(cx, Box::new(IDBFactory::new_inherited()), global)
     }
 
     /// Setup the callback to the backend service, if this hasn't been done already.
@@ -243,7 +214,7 @@ impl IDBFactory {
             .task_manager()
             .database_access_task_source()
             .to_sendable();
-        let callback = GenericCallback::new(global.time_profiler_chan().clone(), move |message| {
+        let callback = GenericCallback::new(move |message| {
             let response_listener = response_listener.clone();
             let response = match message {
                 Ok(inner) => inner,
@@ -305,17 +276,17 @@ impl IDBFactory {
                 let connection = request.get_or_init_connection(
                     cx,
                     &self.global(),
-                    name.clone(),
+                    name,
                     version,
+                    object_store_names,
                     upgraded,
                 );
-                connection.set_object_store_names_from_backend(object_store_names);
 
                 // Step 2.2: Otherwise,
                 // set request’s result to result,
                 // set request’s done flag,
                 // and fire an event named success at request.
-                request.dispatch_success(cx, name, version, upgraded);
+                request.dispatch_success(cx, &connection);
             },
             ConnectionMsg::Upgrade {
                 name,
@@ -334,10 +305,16 @@ impl IDBFactory {
                     );
                 };
 
-                let connection = request.get_or_init_connection(cx, &global, name, version, false);
+                let connection = request.get_or_init_connection(
+                    cx,
+                    &global,
+                    name,
+                    version,
+                    object_store_names,
+                    false,
+                );
                 // https://w3c.github.io/IndexedDB/#upgrade-transaction-steps
                 // Step 3. Set transaction’s scope to connection’s object store set.
-                connection.set_object_store_names_from_backend(object_store_names);
                 request.upgrade_db_version(cx, &connection, old_version, version, transaction);
             },
             ConnectionMsg::VersionError { name, id } => {
@@ -365,8 +342,7 @@ impl IDBFactory {
                         "There should be a request to handle ConnectionMsg::VersionChange."
                     );
                 };
-                let connection =
-                    request.get_or_init_connection(cx, &global, name.clone(), version, false);
+                let connection = request.connection();
 
                 // Step 10.2: fire a version change event named versionchange at entry with db’s version and version.
                 connection.dispatch_versionchange(cx, old_version, Some(version));
@@ -408,9 +384,9 @@ impl IDBFactory {
                 self.global()
                     .task_manager()
                     .dom_manipulation_task_source()
-                    .queue(task!(indexeddb_maybe_commit_txn: move || {
+                    .queue(task!(indexeddb_maybe_commit_txn: move |cx| {
                         let factory = factory.root();
-                        factory.maybe_commit_txn(&db_name, txn);
+                        factory.maybe_commit_txn(cx, &db_name, txn);
                     }));
             },
         }
@@ -448,7 +424,7 @@ impl IDBFactory {
         request.set_result(HandleValue::undefined());
 
         // Step 5.3.1.2: Set request’s error to result.
-        request.set_error(Some(dom_exception), CanGc::from_cx(cx));
+        request.set_error(cx, Some(dom_exception));
         // Open requests expose a transaction only while `upgradeneeded` is being dispatched;
         // otherwise `IDBOpenDBRequest.transaction` must be null.
         // https://w3c.github.io/IndexedDB/#dom-idbrequest-transaction
@@ -463,13 +439,13 @@ impl IDBFactory {
         // with its bubbles
         // and cancelable attributes initialized to true.
         let event = Event::new(
+            cx,
             &global,
             Atom::from("error"),
             EventBubbles::Bubbles,
             EventCancelable::Cancelable,
-            CanGc::from_cx(cx),
         );
-        event.fire(request.upcast(), CanGc::from_cx(cx));
+        event.fire(cx, request.upcast());
     }
 
     /// <https://w3c.github.io/IndexedDB/#open-a-database-connection>
@@ -498,7 +474,7 @@ impl IDBFactory {
         let open_operation = SyncOperation::OpenDatabase(
             callback,
             storage_key,
-            name.to_string(),
+            String::from(name),
             version,
             request.get_id(),
             proxy_map,
@@ -515,10 +491,10 @@ impl IDBFactory {
         Ok(())
     }
 
-    pub(crate) fn abort_pending_upgrades(&self) {
+    pub(crate) fn abort_pending_upgrades_and_close_databases(&self) {
         let global = self.global();
-        let pending = self.connections.borrow();
-        let pending_upgrades = pending
+        let connections = self.connections.borrow();
+        let pending_upgrades = connections
             .iter()
             .map(|(key, val)| {
                 let ids: HashSet<Uuid> = val.iter().map(|(k, _v)| *k).collect();
@@ -542,6 +518,14 @@ impl IDBFactory {
             .is_err()
         {
             error!("Failed to send SyncOperation::AbortPendingUpgrade");
+        }
+
+        for requests in connections.values() {
+            for request in requests.values() {
+                if let Some(database) = request.pending_connection() {
+                    database.close_a_database_connection(true /* forced */);
+                }
+            }
         }
     }
 
@@ -573,7 +557,12 @@ impl IDBFactory {
 
 impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
     /// <https://w3c.github.io/IndexedDB/#dom-idbfactory-open>
-    fn Open(&self, name: DOMString, version: Option<u64>) -> Fallible<DomRoot<IDBOpenDBRequest>> {
+    fn Open(
+        &self,
+        cx: &mut JSContext,
+        name: DOMString,
+        version: Option<u64>,
+    ) -> Fallible<DomRoot<IDBOpenDBRequest>> {
         // Step 1: If version is 0 (zero), throw a TypeError.
         if version == Some(0) {
             return Err(Error::Type(
@@ -586,7 +575,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
 
         // Step 3: Let storageKey be the result of running obtain a storage key given environment.
         // If failure is returned, then throw a "SecurityError" DOMException and abort these steps.
-        let Some(storage_key) = Self::obtain_storage_key(&global) else {
+        let Some(storage_key) = global.obtain_storage_key() else {
             return Err(Error::Security(None));
         };
 
@@ -596,7 +585,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
             self.obtain_a_local_storage_bottle_map(&global, global.origin().immutable().clone())?;
 
         // Step 4: Let request be a new open request.
-        let request = IDBOpenDBRequest::new(&self.global(), CanGc::deprecated_note());
+        let request = IDBOpenDBRequest::new(cx, &self.global());
 
         // Step 5: Runs in parallel
         if self
@@ -611,13 +600,17 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
     }
 
     /// <https://www.w3.org/TR/IndexedDB/#dom-idbfactory-deletedatabase>
-    fn DeleteDatabase(&self, name: DOMString) -> Fallible<DomRoot<IDBOpenDBRequest>> {
+    fn DeleteDatabase(
+        &self,
+        cx: &mut JSContext,
+        name: DOMString,
+    ) -> Fallible<DomRoot<IDBOpenDBRequest>> {
         // Step 1: Let environment be this’s relevant settings object.
         let global = self.global();
 
         // Step 2: Let storageKey be the result of running obtain a storage key given environment.
         // If failure is returned, then throw a "SecurityError" DOMException and abort these steps.
-        let Some(storage_key) = Self::obtain_storage_key(&global) else {
+        let Some(storage_key) = global.obtain_storage_key() else {
             return Err(Error::Security(None));
         };
 
@@ -627,11 +620,11 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
             self.obtain_a_local_storage_bottle_map(&global, global.origin().immutable().clone())?;
 
         // Step 3: Let request be a new open request
-        let request = IDBOpenDBRequest::new(&self.global(), CanGc::deprecated_note());
+        let request = IDBOpenDBRequest::new(cx, &self.global());
 
         // Step 4: Runs in parallel
         if request
-            .delete_database(storage_key, name.to_string(), proxy_map)
+            .delete_database(storage_key, String::from(name), proxy_map)
             .is_err()
         {
             return Err(Error::Operation(None));
@@ -642,27 +635,27 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
     }
 
     /// <https://www.w3.org/TR/IndexedDB/#dom-idbfactory-databases>
-    fn Databases(&self, cx: &mut JSContext) -> Rc<Promise> {
+    fn Databases(&self, cx: &mut JSContext) -> RootedPromise {
         // Step 1: Let environment be this’s relevant settings object.
         let global = self.global();
 
         // Step 2: Let storageKey be the result of running obtain a storage key given environment.
         // If failure is returned, then return a promise rejected with a "SecurityError" DOMException.
-        let storage_key = match Self::obtain_storage_key(&global) {
+        let storage_key = match global.obtain_storage_key() {
             Some(storage_key) => storage_key,
             None => {
-                let p = Promise::new(&global, CanGc::from_cx(cx));
-                p.reject_error(Error::Security(None), CanGc::from_cx(cx));
+                let p = Promise::new(cx, &global);
+                p.reject_error(cx, Error::Security(None));
                 return p;
             },
         };
 
         // Step 3: Let p be a new promise.
-        let p = Promise::new(&global, CanGc::from_cx(cx));
+        let p = Promise::new(cx, &global);
 
         // Note: the option is required to pass the promise to a task from within the generic callback,
         // see #41356
-        let mut trusted_promise: Option<TrustedPromise> = Some(TrustedPromise::new(p.clone()));
+        let mut trusted_promise: Option<TrustedPromise> = Some(TrustedPromise::from(&p));
 
         // Step 4: Run these steps in parallel:
         // Note implementing by communicating with the backend.
@@ -670,7 +663,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
             .task_manager()
             .database_access_task_source()
             .to_sendable();
-        let callback = GenericCallback::new(global.time_profiler_chan().clone(), move |message| {
+        let callback = GenericCallback::new(move |message| {
             let result: BackendResult<Vec<DatabaseInfo>> = message.unwrap();
             let Some(trusted_promise) = trusted_promise.take() else {
                 return error!("Callback for `DataBases` called twice.");
@@ -678,14 +671,14 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
 
             // Step 4.4: Queue a database task to resolve p with result.
             task_source.queue(task!(set_request_result_to_database: move |cx| {
-                let promise = trusted_promise.root();
+                let promise = trusted_promise.root(cx);
                 match result {
                     Err(err) => {
                         let error = map_backend_error_to_dom_error(err);
                         rooted!(&in(cx) let mut rval = UndefinedValue());
                         error
-                            .to_jsval(cx.into(), &promise.global(), rval.handle_mut(), CanGc::from_cx(cx));
-                        promise.reject_native(&rval.handle(), CanGc::from_cx(cx));
+                            .to_jsval(cx, &promise.global(), rval.handle_mut());
+                        promise.reject_native(cx, &rval.handle());
                     },
                     Ok(info_list) => {
                         let info_list: Vec<IDBDatabaseInfo> = info_list
@@ -695,7 +688,7 @@ impl IDBFactoryMethods<crate::DomTypeHolder> for IDBFactory {
                                 version: Some(info.version),
                         })
                         .collect();
-                        promise.resolve_native(&info_list, CanGc::from_cx(cx));
+                        promise.resolve_native(cx, &info_list);
                 },
             }
             }));

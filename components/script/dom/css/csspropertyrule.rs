@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use servo_arc::Arc;
 use style::shared_lock::ToCssWithGuard;
 use style::stylesheets::{CssRuleType, PropertyRule};
@@ -17,6 +17,7 @@ use super::cssstylesheet::CSSStyleSheet;
 use crate::dom::bindings::codegen::Bindings::CSSPropertyRuleBinding::CSSPropertyRuleMethods;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
+use crate::dom::css::cssgroupingrule::CSSGroupingRule;
 use crate::dom::window::Window;
 
 #[dom_struct]
@@ -28,9 +29,13 @@ pub(crate) struct CSSPropertyRule {
 }
 
 impl CSSPropertyRule {
-    fn new_inherited(parent_stylesheet: &CSSStyleSheet, property_rule: Arc<PropertyRule>) -> Self {
+    fn new_inherited(
+        parent_rule: Option<&CSSGroupingRule>,
+        parent_stylesheet: &CSSStyleSheet,
+        property_rule: Arc<PropertyRule>,
+    ) -> Self {
         CSSPropertyRule {
-            css_rule: CSSRule::new_inherited(parent_stylesheet),
+            css_rule: CSSRule::new_inherited(parent_rule, parent_stylesheet),
             property_rule: RefCell::new(property_rule),
         }
     }
@@ -38,13 +43,18 @@ impl CSSPropertyRule {
     pub(crate) fn new(
         cx: &mut JSContext,
         window: &Window,
+        parent_rule: Option<&CSSGroupingRule>,
         parent_stylesheet: &CSSStyleSheet,
         property_rule: Arc<PropertyRule>,
     ) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(
-            Box::new(Self::new_inherited(parent_stylesheet, property_rule)),
-            window,
+        reflect_dom_object(
             cx,
+            Box::new(Self::new_inherited(
+                parent_rule,
+                parent_stylesheet,
+                property_rule,
+            )),
+            window,
         )
     }
 

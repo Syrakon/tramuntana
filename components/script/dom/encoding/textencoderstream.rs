@@ -4,96 +4,27 @@
 
 use std::cell::Cell;
 use std::num::{NonZero, NonZeroU16};
-use std::ptr::{self, NonNull};
+use std::ptr;
 
 use dom_struct::dom_struct;
-use js::conversions::latin1_to_string;
-use js::jsapi::{
-    JS_DeprecatedStringHasLatin1Chars, JS_GetTwoByteStringCharsAndLength, JS_IsExceptionPending,
-    JSObject, JSType, ToPrimitive,
-};
+use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
+use js::jsapi::{JSObject, JSString};
 use js::jsval::UndefinedValue;
-use js::rust::{
-    HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
-    MutableHandleValue as SafeMutableHandleValue, ToString,
-};
+use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue};
 use js::typedarray::Uint8;
-use script_bindings::conversions::SafeToJSValConvertible;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
+use script_bindings::str::js_string_to_code_units;
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
 use crate::dom::bindings::codegen::Bindings::TextEncoderStreamBinding::TextEncoderStreamMethods;
-use crate::dom::bindings::error::{Error, Fallible, throw_dom_exception};
+use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::str::{ConversionResult, DOMString};
 use crate::dom::stream::readablestream::ReadableStream;
 use crate::dom::stream::transformstreamdefaultcontroller::TransformerType;
 use crate::dom::stream::writablestream::WritableStream;
 use crate::dom::types::{GlobalScope, TransformStream, TransformStreamDefaultController};
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
-
-/// String converted from an input JS Value
-enum ConvertedInput<'a> {
-    String(String),
-    CodeUnits(&'a [u16]),
-}
-
-/// Converts a JS value to primitive type so that it can be used with
-/// `ToString`.
-///
-/// Set `rval` to `chunk` if `chunk` is a primitive JS value. Otherwise, convert
-/// `chunk` into a primitive JS value and then set `rval` to the converted
-/// primitive. This follows the `ToString` procedure with the exception that it
-/// does not convert the value to string.
-///
-/// See below for the `ToString` procedure in spec:
-/// <https://tc39.es/ecma262/multipage/abstract-operations.html#sec-tostring>
-#[expect(unsafe_code)]
-fn jsval_to_primitive(
-    cx: SafeJSContext,
-    global: &GlobalScope,
-    chunk: SafeHandleValue,
-    mut rval: SafeMutableHandleValue,
-    can_gc: CanGc,
-) -> Fallible<()> {
-    // Step 1. If argument is a String, return argument.
-    // Step 2. If argument is a Symbol, throw a TypeError exception.
-    // Step 3. If argument is undefined, return "undefined".
-    // Step 4. If argument is null, return "null".
-    // Step 5. If argument is true, return "true".
-    // Step 6. If argument is false, return "false".
-    // Step 7. If argument is a Number, return Number::toString(argument, 10).
-    // Step 8. If argument is a BigInt, return BigInt::toString(argument, 10).
-    if chunk.is_primitive() {
-        rval.set(chunk.get());
-
-        return Ok(());
-    }
-
-    // Step 9. Assert: argument is an Object.
-    assert!(chunk.is_object());
-
-    // Step 10. Let primValue be ? ToPrimitive(argument, string).
-    rooted!(in(*cx) let obj = chunk.to_object());
-    let is_success =
-        unsafe { ToPrimitive(*cx, obj.handle().into(), JSType::JSTYPE_STRING, rval.into()) };
-    log::debug!("ToPrimitive is_success={:?}", is_success);
-    if !is_success {
-        unsafe {
-            if !JS_IsExceptionPending(*cx) {
-                throw_dom_exception(
-                    cx,
-                    global,
-                    Error::Type(c"Cannot convert JSObject to primitive".to_owned()),
-                    can_gc,
-                );
-            }
-        }
-        return Err(Error::JSFailed);
-    }
-
-    Ok(())
-}
 
 /// <https://encoding.spec.whatwg.org/#textencoderstream-encoder>
 #[derive(Default, JSTraceable, MallocSizeOf)]
@@ -103,9 +34,9 @@ pub(crate) struct Encoder {
 }
 
 impl Encoder {
-    fn encode(&self, maybe_ill_formed: ConvertedInput<'_>) -> String {
+    fn encode(&self, maybe_ill_formed: ConversionResult) -> String {
         match maybe_ill_formed {
-            ConvertedInput::String(s) => {
+            ConversionResult::String(s) => {
                 // Rust String is already UTF-8 encoded and cannot contain
                 // surrogate
                 if !s.is_empty() && self.leading_surrogate.take().is_some() {
@@ -117,7 +48,7 @@ impl Encoder {
 
                 s
             },
-            ConvertedInput::CodeUnits(code_units) => self.encode_from_code_units(code_units),
+            ConversionResult::CodeUnits(code_units) => self.encode_from_code_units(&code_units.0),
         }
     }
 
@@ -211,54 +142,21 @@ fn code_point_type(value: u16) -> CodePointType {
 }
 
 /// <https://encoding.spec.whatwg.org/#encode-and-enqueue-a-chunk>
-#[expect(unsafe_code)]
 pub(crate) fn encode_and_enqueue_a_chunk(
-    cx: &mut js::context::JSContext,
+    cx: &mut JSContext,
     global: &GlobalScope,
     chunk: SafeHandleValue,
     encoder: &Encoder,
     controller: &TransformStreamDefaultController,
 ) -> Fallible<()> {
     // Step 1. Let input be the result of converting chunk to a DOMString.
+    // Note: using not a DOMString but ConversionResult,
+    // because a DOMString assumes utf-8.
+    rooted!(&in(cx) let mut target = ptr::null_mut::<JSString>());
+    let input = js_string_to_code_units(cx, chunk, target.handle_mut())?;
+
     // Step 2. Convert input to an I/O queue of code units.
-    rooted!(&in(cx) let mut rval = UndefinedValue());
-    jsval_to_primitive(
-        cx.into(),
-        global,
-        chunk,
-        rval.handle_mut(),
-        CanGc::from_cx(cx),
-    )?;
-
-    assert!(!rval.is_object());
-    rooted!(&in(cx) let jsstr = unsafe { ToString(cx.raw_cx(), rval.handle()) });
-    if jsstr.is_null() {
-        unsafe {
-            if !JS_IsExceptionPending(cx.raw_cx()) {
-                throw_dom_exception(
-                    cx.into(),
-                    global,
-                    Error::Type(c"Cannot convert JS primitive to string".to_owned()),
-                    CanGc::from_cx(cx),
-                );
-            }
-        }
-
-        return Err(Error::JSFailed);
-    }
-
-    let input = unsafe {
-        if JS_DeprecatedStringHasLatin1Chars(*jsstr) {
-            let s = NonNull::new(*jsstr).expect("jsstr cannot be null");
-            ConvertedInput::String(latin1_to_string(cx.raw_cx(), s))
-        } else {
-            let mut len = 0;
-            let data =
-                JS_GetTwoByteStringCharsAndLength(cx.raw_cx(), std::ptr::null(), *jsstr, &mut len);
-            let maybe_ill_formed_code_units = std::slice::from_raw_parts(data, len);
-            ConvertedInput::CodeUnits(maybe_ill_formed_code_units)
-        }
-    };
+    // Note: passing input as a slice.
 
     // Step 3. Let output be the I/O queue of bytes « end-of-queue ».
     // Step 4. While true:
@@ -281,15 +179,10 @@ pub(crate) fn encode_and_enqueue_a_chunk(
     // Step 4.2.2.1 Let chunk be the result of creating a Uint8Array object
     //      given output and encoder’s relevant realm.
     rooted!(&in(cx) let mut js_object = ptr::null_mut::<JSObject>());
-    let chunk = create_buffer_source::<Uint8>(
-        cx.into(),
-        output,
-        js_object.handle_mut(),
-        CanGc::from_cx(cx),
-    )
-    .map_err(|_| Error::Type(c"Cannot convert byte sequence to Uint8Array".to_owned()))?;
+    let chunk = create_buffer_source::<Uint8>(cx, output, js_object.handle_mut())
+        .map_err(|_| Error::Type(c"Cannot convert byte sequence to Uint8Array".to_owned()))?;
     rooted!(&in(cx) let mut rval = UndefinedValue());
-    chunk.safe_to_jsval(cx.into(), rval.handle_mut(), CanGc::from_cx(cx));
+    chunk.to_jsval(cx, rval.handle_mut());
     // Step 4.2.2.2 Enqueue chunk into encoder’s transform.
     controller.enqueue(cx, global, rval.handle())?;
     Ok(())
@@ -297,7 +190,7 @@ pub(crate) fn encode_and_enqueue_a_chunk(
 
 /// <https://encoding.spec.whatwg.org/#encode-and-flush>
 pub(crate) fn encode_and_flush(
-    cx: &mut js::context::JSContext,
+    cx: &mut JSContext,
     global: &GlobalScope,
     encoder: &Encoder,
     controller: &TransformStreamDefaultController,
@@ -307,15 +200,13 @@ pub(crate) fn encode_and_flush(
         // Step 1.1 Let chunk be the result of creating a Uint8Array object
         //      given « 0xEF, 0xBF, 0xBD » and encoder’s relevant realm.
         rooted!(&in(cx) let mut js_object = ptr::null_mut::<JSObject>());
-        let chunk = create_buffer_source::<Uint8>(
-            cx.into(),
-            &[0xEF_u8, 0xBF, 0xBD],
-            js_object.handle_mut(),
-            CanGc::from_cx(cx),
-        )
-        .map_err(|_| Error::Type(c"Cannot convert byte sequence to Uint8Array".to_owned()))?;
+        let chunk =
+            create_buffer_source::<Uint8>(cx, &[0xEF_u8, 0xBF, 0xBD], js_object.handle_mut())
+                .map_err(|_| {
+                    Error::Type(c"Cannot convert byte sequence to Uint8Array".to_owned())
+                })?;
         rooted!(&in(cx) let mut rval = UndefinedValue());
-        chunk.safe_to_jsval(cx.into(), rval.handle_mut(), CanGc::from_cx(cx));
+        chunk.to_jsval(cx, rval.handle_mut());
         // Step 1.2 Enqueue chunk into encoder’s transform.
         return controller.enqueue(cx, global, rval.handle());
     }
@@ -342,7 +233,7 @@ impl TextEncoderStream {
 
     /// <https://encoding.spec.whatwg.org/#dom-textencoderstream>
     fn new_with_proto(
-        cx: &mut js::context::JSContext,
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<SafeHandleObject>,
     ) -> Fallible<DomRoot<TextEncoderStream>> {
@@ -353,20 +244,19 @@ impl TextEncoderStream {
         //      and runs the encode and enqueue a chunk algorithm with this and chunk.
         // Step 3. Let flushAlgorithm be an algorithm which runs the encode and flush
         //      algorithm with this.
-        let transformer_type = TransformerType::Encoder(encoder);
 
         // Step 4. Let transformStream be a new TransformStream.
-        let transform = TransformStream::new_with_proto(global, None, CanGc::from_cx(cx));
+        let transform = TransformStream::new_with_proto(cx, global, None);
         // Step 5. Set up transformStream with transformAlgorithm set to transformAlgorithm
         //      and flushAlgorithm set to flushAlgorithm.
-        transform.set_up(cx, global, transformer_type)?;
+        transform.set_up(cx, global, TransformerType::Encoder(encoder))?;
 
         // Step 6. Set this’s transform to transformStream.
-        Ok(reflect_dom_object_with_proto_and_cx(
+        Ok(reflect_dom_object_with_proto(
+            cx,
             Box::new(TextEncoderStream::new_inherited(&transform)),
             global,
             proto,
-            cx,
         ))
     }
 }
@@ -374,7 +264,7 @@ impl TextEncoderStream {
 impl TextEncoderStreamMethods<crate::DomTypeHolder> for TextEncoderStream {
     /// <https://encoding.spec.whatwg.org/#dom-textencoderstream>
     fn Constructor(
-        cx: &mut js::context::JSContext,
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<SafeHandleObject>,
     ) -> Fallible<DomRoot<TextEncoderStream>> {
@@ -384,7 +274,7 @@ impl TextEncoderStreamMethods<crate::DomTypeHolder> for TextEncoderStream {
     /// <https://encoding.spec.whatwg.org/#dom-textencoder-encoding>
     fn Encoding(&self) -> DOMString {
         // Returns "utf-8".
-        DOMString::from("utf-8")
+        DOMString::from_static("utf-8")
     }
 
     /// <https://streams.spec.whatwg.org/#dom-generictransformstream-readable>

@@ -8,10 +8,12 @@ extern crate servo_media_auto;
 use std::sync::{Arc, Mutex, mpsc};
 use std::{thread, time};
 
+use servo_media::audio::audio_node::{
+    AudioNodeInit, AudioNodeMessage, AudioScheduledSourceNodeMessage,
+};
 use servo_media::audio::block::FRAMES_PER_BLOCK_USIZE;
 use servo_media::audio::buffer_source_node::{AudioBuffer, AudioBufferSourceNodeMessage};
 use servo_media::audio::context::{AudioContextOptions, OfflineAudioContextOptions};
-use servo_media::audio::node::{AudioNodeInit, AudioNodeMessage, AudioScheduledSourceNodeMessage};
 use servo_media::{ClientContextId, ServoMedia};
 
 fn run_example(servo_media: Arc<ServoMedia>) {
@@ -74,7 +76,7 @@ fn run_example(servo_media: Arc<ServoMedia>) {
     context.message_node(
         buffer_source,
         AudioNodeMessage::AudioBufferSourceNode(AudioBufferSourceNodeMessage::SetBuffer(Some(
-            AudioBuffer::from_buffer(processed_audio_.lock().unwrap().to_vec(), sample_rate),
+            AudioBuffer::from_buffer(processed_audio_.lock().unwrap().to_vec(), sample_rate).into(),
         ))),
     );
     let _ = context.resume();

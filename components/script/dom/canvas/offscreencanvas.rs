@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use euclid::default::Size2D;
@@ -13,19 +12,28 @@ use js::rust::{HandleObject, HandleValue};
 use pixels::{EncodedImageType, Snapshot};
 use rustc_hash::FxHashMap;
 use script_bindings::cell::{DomRefCell, Ref};
+#[cfg(feature = "webgl")]
 use script_bindings::inheritance::Castable;
-use script_bindings::reflector::{DomObject, reflect_dom_object_with_proto_and_cx};
+#[cfg(feature = "webgl")]
+use script_bindings::reflector::DomObject;
+use script_bindings::reflector::reflect_dom_object_with_proto;
+use script_bindings::structuredclone::StructuredData;
 use script_bindings::weakref::WeakRef;
 use servo_base::id::{OffscreenCanvasId, OffscreenCanvasIndex};
+#[cfg(feature = "webgl")]
 use servo_canvas_traits::webgl::{GLContextAttributes, WebGLVersion};
 use servo_constellation_traits::{BlobImpl, TransferableOffscreenCanvas};
 
 use crate::canvas_context::{CanvasContext, OffscreenRenderingContext};
+#[cfg(feature = "webgl")]
 use crate::conversions::Convert;
+use crate::dom::RootedPromise;
+use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::CanvasRenderingContext2DSettings;
 use crate::dom::bindings::codegen::Bindings::OffscreenCanvasBinding::{
     ImageEncodeOptions, OffscreenCanvasMethods,
     OffscreenRenderingContext as RootedOffscreenRenderingContext, OffscreenRenderingContextId,
 };
+#[cfg(feature = "webgl")]
 use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLContextAttributes;
 use crate::dom::bindings::codegen::UnionTypes::HTMLCanvasElementOrOffscreenCanvas as RootedHTMLCanvasElementOrOffscreenCanvas;
 use crate::dom::bindings::conversions::ConversionResult;
@@ -33,7 +41,6 @@ use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::blob::Blob;
 use crate::dom::eventtarget::EventTarget;
@@ -43,9 +50,10 @@ use crate::dom::imagebitmap::ImageBitmap;
 use crate::dom::imagebitmaprenderingcontext::ImageBitmapRenderingContext;
 use crate::dom::offscreencanvasrenderingcontext2d::OffscreenCanvasRenderingContext2D;
 use crate::dom::promise::Promise;
+#[cfg(feature = "webgl")]
 use crate::dom::types::{WebGLRenderingContext, Window};
+#[cfg(feature = "webgl")]
 use crate::dom::webgl::webgl2renderingcontext::WebGL2RenderingContext;
-use crate::script_runtime::CanGc;
 
 /// <https://html.spec.whatwg.org/multipage/#offscreencanvas>
 #[dom_struct]
@@ -87,11 +95,11 @@ impl OffscreenCanvas {
         height: u64,
         placeholder: Option<WeakRef<HTMLCanvasElement>>,
     ) -> DomRoot<OffscreenCanvas> {
-        reflect_dom_object_with_proto_and_cx(
+        reflect_dom_object_with_proto(
+            cx,
             Box::new(OffscreenCanvas::new_inherited(width, height, placeholder)),
             global,
             proto,
-            cx,
         )
     }
 
@@ -102,23 +110,21 @@ impl OffscreenCanvas {
         )
     }
 
-    #[expect(unsafe_code)]
+    #[cfg(feature = "webgl")]
     fn get_gl_attributes(
         cx: &mut js::context::JSContext,
         options: HandleValue,
     ) -> Option<GLContextAttributes> {
-        unsafe {
-            match WebGLContextAttributes::new(cx.into(), options, CanGc::from_cx(cx)) {
-                Ok(ConversionResult::Success(attrs)) => Some(attrs.convert()),
-                Ok(ConversionResult::Failure(error)) => {
-                    throw_type_error(cx.raw_cx(), &error);
-                    None
-                },
-                _ => {
-                    debug!("Unexpected error on conversion of WebGLContextAttributes");
-                    None
-                },
-            }
+        match WebGLContextAttributes::new(cx, options) {
+            Ok(ConversionResult::Success(attrs)) => Some(attrs.convert()),
+            Ok(ConversionResult::Failure(error)) => {
+                throw_type_error(cx, &error);
+                None
+            },
+            _ => {
+                debug!("Unexpected error on conversion of WebGLContextAttributes");
+                None
+            },
         }
     }
 
@@ -153,9 +159,11 @@ impl OffscreenCanvas {
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#offscreen-2d-context-creation-algorithm>
     pub(crate) fn get_or_init_2d_context(
         &self,
         cx: &mut js::context::JSContext,
+        options: HandleValue,
     ) -> Option<DomRoot<OffscreenCanvasRenderingContext2D>> {
         if let Some(ctx) = self.context() {
             return match *ctx {
@@ -163,15 +171,27 @@ impl OffscreenCanvas {
                 _ => None,
             };
         }
+
+        // Step 2. Let settings be the result of converting arg to the dictionary type
+        // CanvasRenderingContext2DSettings. (This can throw an exception.)
+        let settings = match CanvasRenderingContext2DSettings::new(cx, options) {
+            Ok(ConversionResult::Success(settings)) => settings,
+            Ok(ConversionResult::Failure(error)) => {
+                throw_type_error(cx, &error);
+                return None;
+            },
+            Err(()) => return None,
+        };
         let context = OffscreenCanvasRenderingContext2D::new(
+            cx,
             &self.global(),
             self,
             self.get_size(),
-            CanGc::from_cx(cx),
+            &settings,
         )?;
-        *self.context.borrow_mut() = Some(OffscreenRenderingContext::Context2d(Dom::from_ref(
-            &*context,
-        )));
+        *self.context.safe_borrow_mut(cx.no_gc()) = Some(OffscreenRenderingContext::Context2d(
+            Dom::from_ref(&*context),
+        ));
         Some(context)
     }
 
@@ -195,17 +215,18 @@ impl OffscreenCanvas {
         let canvas =
             RootedHTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(DomRoot::from_ref(self));
 
-        let context = ImageBitmapRenderingContext::new(&self.global(), &canvas, CanGc::from_cx(cx));
+        let context = ImageBitmapRenderingContext::new(cx, &self.global(), &canvas);
 
         // Step 2. Set this's context mode to bitmaprenderer.
-        *self.context.borrow_mut() = Some(OffscreenRenderingContext::BitmapRenderer(
-            Dom::from_ref(&*context),
-        ));
+        *self.context.safe_borrow_mut(cx.no_gc()) = Some(
+            OffscreenRenderingContext::BitmapRenderer(Dom::from_ref(&*context)),
+        );
 
         // Step 3. Return context.
         Some(context)
     }
 
+    #[cfg(feature = "webgl")]
     // <https://html.spec.whatwg.org/multipage/#offscreen-context-type-webgl>
     pub(crate) fn get_or_init_webgl_context(
         &self,
@@ -228,19 +249,12 @@ impl OffscreenCanvas {
         self.global()
             .downcast::<Window>()
             .and_then(|window| {
-                WebGLRenderingContext::new(
-                    window,
-                    &canvas,
-                    WebGLVersion::WebGL1,
-                    size,
-                    attrs,
-                    CanGc::from_cx(cx),
-                )
+                WebGLRenderingContext::new(cx, window, &canvas, WebGLVersion::WebGL1, size, attrs)
             })
             .map(|context| {
                 // Step 2. If context is null, then return null;
                 // otherwise set this's context mode to webgl or webgl2.
-                *self.context.borrow_mut() =
+                *self.context.safe_borrow_mut(cx.no_gc()) =
                     Some(OffscreenRenderingContext::WebGL(Dom::from_ref(&*context)));
 
                 // Step 3. Return context.
@@ -248,16 +262,15 @@ impl OffscreenCanvas {
             })
     }
 
+    #[cfg(feature = "webgl")]
     // <https://html.spec.whatwg.org/multipage/#offscreen-context-type-webgl>
     fn get_or_init_webgl2_context(
         &self,
         cx: &mut js::context::JSContext,
         options: HandleValue,
     ) -> Option<DomRoot<WebGL2RenderingContext>> {
-        if !WebGL2RenderingContext::is_webgl2_enabled(
-            cx.into(),
-            self.global().reflector().get_jsobject(),
-        ) {
+        if !WebGL2RenderingContext::is_webgl2_enabled(cx, self.global().reflector().get_jsobject())
+        {
             return None;
         }
         if let Some(ctx) = self.context() {
@@ -275,13 +288,11 @@ impl OffscreenCanvas {
         let attrs = Self::get_gl_attributes(cx, options)?;
         self.global()
             .downcast::<Window>()
-            .and_then(|window| {
-                WebGL2RenderingContext::new(window, &canvas, size, attrs, CanGc::from_cx(cx))
-            })
+            .and_then(|window| WebGL2RenderingContext::new(cx, window, &canvas, size, attrs))
             .map(|context| {
                 // Step 2. If context is null, then return null;
                 // otherwise set this's context mode to webgl or webgl2.
-                *self.context.borrow_mut() =
+                *self.context.safe_borrow_mut(cx.no_gc()) =
                     Some(OffscreenRenderingContext::WebGL2(Dom::from_ref(&*context)));
 
                 // Step 3. Return context.
@@ -303,7 +314,7 @@ impl Transferable for OffscreenCanvas {
     /// <https://html.spec.whatwg.org/multipage/#the-offscreencanvas-interface:transfer-steps>
     fn transfer(
         &self,
-        _cx: &mut js::context::JSContext,
+        cx: &mut js::context::JSContext,
     ) -> Fallible<(OffscreenCanvasId, TransferableOffscreenCanvas)> {
         // <https://html.spec.whatwg.org/multipage/#structuredserializewithtransfer>
         // Step 5.2. If transferable has a [[Detached]] internal slot and
@@ -325,7 +336,7 @@ impl Transferable for OffscreenCanvas {
         }
 
         // Step 2. Set value's context mode to detached.
-        *self.context.borrow_mut() = Some(OffscreenRenderingContext::Detached);
+        *self.context.safe_borrow_mut(cx.no_gc()) = Some(OffscreenRenderingContext::Detached);
 
         // Step 3. Let width and height be the dimensions of value's bitmap.
         // Step 5. Unset value's bitmap.
@@ -407,6 +418,13 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
         id: OffscreenRenderingContextId,
         options: HandleValue,
     ) -> Fallible<Option<RootedOffscreenRenderingContext>> {
+        // Step 1. If options is not an object, then set options to null.
+        let options = if options.get().is_object() {
+            options
+        } else {
+            HandleValue::null()
+        };
+
         // Step 3. Throw an "InvalidStateError" DOMException if the
         // OffscreenCanvas object's context mode is detached.
         if let Some(OffscreenRenderingContext::Detached) = *self.context.borrow() {
@@ -415,20 +433,24 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
 
         match id {
             OffscreenRenderingContextId::_2d => Ok(self
-                .get_or_init_2d_context(cx)
+                .get_or_init_2d_context(cx, options)
                 .map(RootedOffscreenRenderingContext::OffscreenCanvasRenderingContext2D)),
             OffscreenRenderingContextId::Bitmaprenderer => Ok(self
                 .get_or_init_bitmaprenderer_context(cx)
                 .map(RootedOffscreenRenderingContext::ImageBitmapRenderingContext)),
+            #[cfg(feature = "webgl")]
             OffscreenRenderingContextId::Webgl => Ok(self
                 .get_or_init_webgl_context(cx, options)
                 .map(RootedOffscreenRenderingContext::WebGLRenderingContext)),
+            #[cfg(feature = "webgl")]
             OffscreenRenderingContextId::Experimental_webgl => Ok(self
                 .get_or_init_webgl_context(cx, options)
                 .map(RootedOffscreenRenderingContext::WebGLRenderingContext)),
+            #[cfg(feature = "webgl")]
             OffscreenRenderingContextId::Webgl2 => Ok(self
                 .get_or_init_webgl2_context(cx, options)
                 .map(RootedOffscreenRenderingContext::WebGL2RenderingContext)),
+            #[cfg(feature = "webgl")]
             OffscreenRenderingContextId::Experimental_webgl2 => Ok(self
                 .get_or_init_webgl2_context(cx, options)
                 .map(RootedOffscreenRenderingContext::WebGL2RenderingContext)),
@@ -496,7 +518,7 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
             return Err(Error::InvalidState(None));
         };
 
-        let image_bitmap = ImageBitmap::new(&self.global(), snapshot, CanGc::from_cx(cx));
+        let image_bitmap = ImageBitmap::new(cx, &self.global(), snapshot);
         image_bitmap.set_origin_clean(self.origin_is_clean());
 
         // Step 4. Set this OffscreenCanvas object's bitmap to reference a newly
@@ -516,7 +538,7 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
         &self,
         cx: &mut js::context::JSContext,
         options: &ImageEncodeOptions,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         // Step 5. Let result be a new promise object.
         let mut realm = CurrentRealm::assert(cx);
         let promise = Promise::new_in_realm(&mut realm);
@@ -525,7 +547,7 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
         // then return a promise rejected with an "InvalidStateError"
         // DOMException.
         if let Some(OffscreenRenderingContext::Detached) = *self.context.borrow() {
-            promise.reject_error(Error::InvalidState(None), CanGc::from_cx(cx));
+            promise.reject_error(cx, Error::InvalidState(None));
             return promise;
         }
 
@@ -533,7 +555,7 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
         // output bitmap's origin-clean flag is set to false, then return a
         // promise rejected with a "SecurityError" DOMException.
         if !self.origin_is_clean() {
-            promise.reject_error(Error::Security(None), CanGc::from_cx(cx));
+            promise.reject_error(cx, Error::Security(None));
             return promise;
         }
 
@@ -541,13 +563,13 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
         // dimension or its vertical dimension is zero), then return a promise
         // rejected with an "IndexSizeError" DOMException.
         if self.Width() == 0 || self.Height() == 0 {
-            promise.reject_error(Error::IndexSize(None), CanGc::from_cx(cx));
+            promise.reject_error(cx, Error::IndexSize(None));
             return promise;
         }
 
         // Step 4. Let bitmap be a copy of this's bitmap.
         let Some(mut snapshot) = self.get_image_data() else {
-            promise.reject_error(Error::InvalidState(None), CanGc::from_cx(cx));
+            promise.reject_error(cx, Error::InvalidState(None));
             return promise;
         };
 
@@ -557,9 +579,9 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
         // Step 7.2. Queue a global task on the canvas blob serialization task
         // source given global to run these steps:
         let trusted_this = Trusted::new(self);
-        let trusted_promise = TrustedPromise::new(promise.clone());
+        let trusted_promise = TrustedPromise::from(&promise);
 
-        let image_type = EncodedImageType::from(options.type_.to_string());
+        let image_type = EncodedImageType::from(&options.type_.str() as &str);
         let quality = options.quality;
 
         self.global()
@@ -567,23 +589,23 @@ impl OffscreenCanvasMethods<crate::DomTypeHolder> for OffscreenCanvas {
             .canvas_blob_task_source()
             .queue(task!(convert_to_blob: move |cx| {
                 let this = trusted_this.root();
-                let promise = trusted_promise.root();
+                let promise = trusted_promise.root(cx);
 
                 let mut encoded: Vec<u8> = vec![];
 
                 if snapshot.encode_for_mime_type(&image_type, quality, &mut encoded).is_err() {
                     // Step 7.2.1. If file is null, then reject result with an
                     // "EncodingError" DOMException.
-                    promise.reject_error(Error::Encoding(None), CanGc::from_cx(cx));
+                    promise.reject_error(cx, Error::Encoding(None));
                     return;
                 };
 
                 // Step 7.2.2. Otherwise, resolve result with a new Blob object,
                 // created in global's relevant realm, representing file.
-                let blob_impl = BlobImpl::new_from_bytes(encoded, image_type.as_mime_type());
-                let blob = Blob::new(&this.global(), blob_impl, CanGc::from_cx(cx));
+                let blob_impl = BlobImpl::new_from_bytes(encoded, image_type.as_mime_type().to_owned());
+                let blob = Blob::new(cx, &this.global(), blob_impl);
 
-                promise.resolve_native(&blob, CanGc::from_cx(cx));
+                promise.resolve_native(cx, &blob);
             }));
 
         // Step 8. Return result.

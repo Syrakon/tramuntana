@@ -48,6 +48,9 @@ jobs:
     name: OpenHarmony Build
     timeout-minutes: 60
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: read
     strategy:
       matrix:
         target: ["aarch64-unknown-linux-ohos", "x86_64-unknown-linux-ohos"]
@@ -55,17 +58,7 @@ jobs:
       artifact_ids: ${{ steps.artifact_ids.outputs.artifact_ids }}
       signed: ${{ steps.signing_config.outputs.signed }}
     steps:
-      - uses: actions/checkout@v6
-        if: github.event_name != 'pull_request_target'
-        with:
-          fetch-depth: 2
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
-      - uses: actions/checkout@v6
-        if: github.event_name == 'pull_request_target'
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 2
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Install crown
         run: cargo install --path support/crown
       - name: Setup Python
@@ -74,15 +67,20 @@ jobs:
         uses: ./.github/actions/apt-mirrors
       - name: Bootstrap dependencies
         timeout-minutes: 30
-        run: sudo apt update && ./mach bootstrap --yes --skip-lints --skip-nextest
+        run: sudo apt update && ./mach bootstrap --yes --skip-lints --skip-nextest --ohos
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1"
+          directory: ${{ runner.temp }}/llvm
       - name: Setup OpenHarmony SDK
         id: setup_sdk
-        uses: openharmony-rs/setup-ohos-sdk@v0.2.4
+        uses: openharmony-rs/setup-ohos-sdk@v1.0.0
         with:
-          version: "6.0.0.1" # api 20 in openharmony
+          version: "6.1" # api 23 in openharmony
           fixup-path: true
       - name: Install node for hvigor
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install hvigor modules
@@ -107,6 +105,7 @@ jobs:
         env:
           OHOS_SDK_NATIVE: ${{ steps.setup_sdk.outputs.ohos_sdk_native }}
           OHOS_BASE_SDK_HOME: ${{ steps.setup_sdk.outputs.ohos-base-sdk-home }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ./mach build --locked --target ${{ matrix.target }} --profile ${{ inputs.profile }}
           mv target/cargo-timings target/cargo-timings-ohos-${{ matrix.target }}
@@ -174,23 +173,29 @@ jobs:
     timeout-minutes: 60
     runs-on: hos-builder
     if: github.repository == 'servo/servo'
+    permissions:
+      contents: read
+      attestations: read
     outputs:
       # We need to save the job status as an output, since our usage of `continue-on-error`
       # will make `needs.build-harmonyos-aarch64.result` evaluate to `success` even if the job failed.
       job_status: ${{ steps.result.outputs.JOB_STATUS }}
     steps:
-      - if: ${{ github.event_name != 'pull_request_target' }}
-        run: git fetch --depth=1 origin $GITHUB_SHA
-      - if: ${{ github.event_name == 'pull_request_target' }}
-        run: git fetch --depth=1 origin ${{ github.event.pull_request.head.sha }}
-      # Safeguard: -- means FETCH_HEAD is revision instead of path.
-      # See <https://github.com/servo/servo/pull/44309>
-      - run: |
-          git switch --detach
-          git reset --hard FETCH_HEAD --
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Adding test files to directory
         run: cp -r support/hitrace-bencher/* support/openharmony/AppScope/resources/resfile/
+      # This should be a no-op in most cases, since the image build already ran bootstrap.
+      - name: Bootstrap dependencies
+        timeout-minutes: 10
+        run: ./mach bootstrap --yes --skip-lints --skip-nextest --skip-platform --ohos
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1"
+          directory: ${{ runner.temp }}/llvm
       - name: Build for aarch64 HarmonyOS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ./mach build --locked --target aarch64-unknown-linux-ohos --profile=${{ inputs.profile }} --flavor=harmonyos --no-default-features --features tracing,tracing-hitrace
       - uses: actions/upload-artifact@v7
@@ -240,13 +245,12 @@ jobs:
         if: github.event_name != 'pull_request_target'
         with:
           fetch-depth: 0
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
       - uses: actions/checkout@v6
         if: github.event_name == 'pull_request_target'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          allow-unsafe-pr-checkout: true
       - name: Setup Python
         uses: ./.github/actions/setup-python
       - name: Get model name

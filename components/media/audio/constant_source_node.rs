@@ -4,11 +4,11 @@
 
 use malloc_size_of_derive::MallocSizeOf;
 
-use crate::block::{Chunk, Tick};
-use crate::node::{
+use crate::audio_node::{
     AudioNodeEngine, AudioNodeType, AudioScheduledSourceNodeMessage, BlockInfo, ChannelInfo,
     OnEndedCallback, ShouldPlay,
 };
+use crate::block::{Chunk, Tick};
 use crate::param::{Param, ParamType};
 
 #[derive(Copy, Clone, Debug, MallocSizeOf)]
@@ -72,8 +72,10 @@ impl AudioNodeEngine for ConstantSourceNode {
             while let Some(mut frame) = iter.next() {
                 let tick = frame.tick();
                 if tick < start_at {
+                    // AudioParam must still be updated because they are a function of time.
+                    self.update_parameters(info, frame.tick());
                     continue;
-                } else if tick > stop_at {
+                } else if tick >= stop_at {
                     break;
                 }
                 if self.update_parameters(info, frame.tick()) {

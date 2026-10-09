@@ -7,7 +7,7 @@ use stylo_atoms::atom;
 use taffy::MaxTrackSizingFunction;
 use taffy::style_helpers::*;
 
-use super::stylo;
+use super::{as_clamped_i16, stylo};
 
 #[inline]
 pub fn length_percentage(val: &stylo::LengthPercentage) -> taffy::LengthPercentage {
@@ -22,17 +22,29 @@ pub fn length_percentage(val: &stylo::LengthPercentage) -> taffy::LengthPercenta
 }
 
 #[inline]
-pub fn dimension(val: &stylo::Size) -> taffy::Dimension {
-    match val {
-        stylo::Size::LengthPercentage(val) => length_percentage(&val.0).into(),
-        stylo::Size::Auto => taffy::Dimension::AUTO,
+fn fit_content_function(limit: &stylo::LengthPercentage) -> taffy::Dimension {
+    match limit.unpack() {
+        stylo::UnpackedLengthPercentage::Length(length) => {
+            taffy::Dimension::fit_content_px(length.px())
+        },
+        stylo::UnpackedLengthPercentage::Percentage(percentage) => {
+            taffy::Dimension::fit_content_percent(percentage.0)
+        },
+        // TODO: fit-content() with a calc() limit
+        stylo::UnpackedLengthPercentage::Calc(_) => taffy::Dimension::fit_content(),
+    }
+}
 
-        // TODO: implement other values in Taffy
-        stylo::Size::MaxContent => taffy::Dimension::AUTO,
-        stylo::Size::MinContent => taffy::Dimension::AUTO,
-        stylo::Size::FitContent => taffy::Dimension::AUTO,
-        stylo::Size::FitContentFunction(_) => taffy::Dimension::AUTO,
-        stylo::Size::Stretch | stylo::Size::WebkitFillAvailable => taffy::Dimension::AUTO,
+#[inline]
+pub fn dimension(value: &stylo::Size) -> taffy::Dimension {
+    match value {
+        stylo::Size::LengthPercentage(value) => length_percentage(&value.0).into(),
+        stylo::Size::Auto => taffy::Dimension::AUTO,
+        stylo::Size::MaxContent => taffy::Dimension::max_content(),
+        stylo::Size::MinContent => taffy::Dimension::min_content(),
+        stylo::Size::FitContent => taffy::Dimension::fit_content(),
+        stylo::Size::FitContentFunction(limit) => fit_content_function(&limit.0),
+        stylo::Size::Stretch | stylo::Size::WebkitFillAvailable => taffy::Dimension::stretch(),
 
         // Anchor positioning will be flagged off for time being
         stylo::Size::AnchorSizeFunction(_) => unreachable!(),
@@ -41,21 +53,46 @@ pub fn dimension(val: &stylo::Size) -> taffy::Dimension {
 }
 
 #[inline]
-pub fn max_size_dimension(val: &stylo::MaxSize) -> taffy::Dimension {
-    match val {
-        stylo::MaxSize::LengthPercentage(val) => length_percentage(&val.0).into(),
-        stylo::MaxSize::None => taffy::Dimension::AUTO,
+pub fn min_size(value: &stylo::Size) -> taffy::LengthPercentageAuto {
+    match value {
+        stylo::Size::LengthPercentage(value) => length_percentage(&value.0).into(),
+        stylo::Size::Auto => taffy::LengthPercentageAuto::AUTO,
 
         // TODO: implement other values in Taffy
-        stylo::MaxSize::MaxContent => taffy::Dimension::AUTO,
-        stylo::MaxSize::MinContent => taffy::Dimension::AUTO,
-        stylo::MaxSize::FitContent => taffy::Dimension::AUTO,
-        stylo::MaxSize::FitContentFunction(_) => taffy::Dimension::AUTO,
-        stylo::MaxSize::Stretch | stylo::MaxSize::WebkitFillAvailable => taffy::Dimension::AUTO,
+        stylo::Size::MaxContent => taffy::LengthPercentageAuto::AUTO,
+        stylo::Size::MinContent => taffy::LengthPercentageAuto::AUTO,
+        stylo::Size::FitContent => taffy::LengthPercentageAuto::AUTO,
+        stylo::Size::FitContentFunction(_) => taffy::LengthPercentageAuto::AUTO,
+        stylo::Size::Stretch | stylo::Size::WebkitFillAvailable => {
+            taffy::LengthPercentageAuto::AUTO
+        },
 
         // Anchor positioning will be flagged off for time being
-        stylo::MaxSize::AnchorSizeFunction(_) => unreachable!(),
-        stylo::MaxSize::AnchorContainingCalcFunction(_) => unreachable!(),
+        stylo::Size::AnchorSizeFunction(_) | stylo::Size::AnchorContainingCalcFunction(_) => {
+            unreachable!("Anchor positioning is disabled in stylo")
+        },
+    }
+}
+
+#[inline]
+pub fn max_size(value: &stylo::MaxSize) -> taffy::LengthPercentageAuto {
+    match value {
+        stylo::MaxSize::LengthPercentage(value) => length_percentage(&value.0).into(),
+        stylo::MaxSize::None => taffy::LengthPercentageAuto::AUTO,
+
+        // TODO: implement other values in Taffy
+        stylo::MaxSize::MaxContent => taffy::LengthPercentageAuto::AUTO,
+        stylo::MaxSize::MinContent => taffy::LengthPercentageAuto::AUTO,
+        stylo::MaxSize::FitContent => taffy::LengthPercentageAuto::AUTO,
+        stylo::MaxSize::FitContentFunction(_) => taffy::LengthPercentageAuto::AUTO,
+        stylo::MaxSize::Stretch | stylo::MaxSize::WebkitFillAvailable => {
+            taffy::LengthPercentageAuto::AUTO
+        },
+
+        // Anchor positioning will be flagged off for time being
+        stylo::MaxSize::AnchorSizeFunction(_) | stylo::MaxSize::AnchorContainingCalcFunction(_) => {
+            unreachable!("Anchor positioning is disabled in stylo")
+        },
     }
 }
 
@@ -66,8 +103,10 @@ pub fn margin(val: &stylo::MarginVal) -> taffy::LengthPercentageAuto {
         stylo::MarginVal::LengthPercentage(val) => length_percentage(val).into(),
 
         // Anchor positioning will be flagged off for time being
-        stylo::MarginVal::AnchorSizeFunction(_) => unreachable!(),
-        stylo::MarginVal::AnchorContainingCalcFunction(_) => unreachable!(),
+        stylo::MarginVal::AnchorSizeFunction(_) |
+        stylo::MarginVal::AnchorContainingCalcFunction(_) => {
+            unreachable!("Anchor positioning is disabled in stylo")
+        },
     }
 }
 
@@ -78,9 +117,11 @@ pub fn inset(val: &stylo::InsetVal) -> taffy::LengthPercentageAuto {
         stylo::InsetVal::LengthPercentage(val) => length_percentage(val).into(),
 
         // Anchor positioning will be flagged off for time being
-        stylo::InsetVal::AnchorSizeFunction(_) => unreachable!(),
-        stylo::InsetVal::AnchorFunction(_) => unreachable!(),
-        stylo::InsetVal::AnchorContainingCalcFunction(_) => unreachable!(),
+        stylo::InsetVal::AnchorSizeFunction(_) |
+        stylo::InsetVal::AnchorFunction(_) |
+        stylo::InsetVal::AnchorContainingCalcFunction(_) => {
+            unreachable!("Anchor positioning is disabled in stylo")
+        },
     }
 }
 
@@ -154,44 +195,58 @@ pub fn aspect_ratio(input: stylo::AspectRatio) -> Option<f32> {
 
 #[inline]
 pub fn content_alignment(input: stylo::ContentDistribution) -> Option<taffy::AlignContent> {
-    match input.primary().value() {
-        stylo::AlignFlags::NORMAL => None,
-        stylo::AlignFlags::AUTO => None,
-        stylo::AlignFlags::START => Some(taffy::AlignContent::Start),
-        stylo::AlignFlags::END => Some(taffy::AlignContent::End),
-        stylo::AlignFlags::LEFT => Some(taffy::AlignContent::Start),
-        stylo::AlignFlags::RIGHT => Some(taffy::AlignContent::End),
-        stylo::AlignFlags::FLEX_START => Some(taffy::AlignContent::FlexStart),
-        stylo::AlignFlags::STRETCH => Some(taffy::AlignContent::Stretch),
-        stylo::AlignFlags::FLEX_END => Some(taffy::AlignContent::FlexEnd),
-        stylo::AlignFlags::CENTER => Some(taffy::AlignContent::Center),
-        stylo::AlignFlags::SPACE_BETWEEN => Some(taffy::AlignContent::SpaceBetween),
-        stylo::AlignFlags::SPACE_AROUND => Some(taffy::AlignContent::SpaceAround),
-        stylo::AlignFlags::SPACE_EVENLY => Some(taffy::AlignContent::SpaceEvenly),
+    let keyword = match input.primary().value() {
+        stylo::AlignFlags::NORMAL => return None,
+        stylo::AlignFlags::AUTO => return None,
+        stylo::AlignFlags::START => taffy::AlignContentKeyword::Start,
+        stylo::AlignFlags::END => taffy::AlignContentKeyword::End,
+        stylo::AlignFlags::LEFT => taffy::AlignContentKeyword::Start,
+        stylo::AlignFlags::RIGHT => taffy::AlignContentKeyword::End,
+        stylo::AlignFlags::FLEX_START => taffy::AlignContentKeyword::FlexStart,
+        stylo::AlignFlags::STRETCH => taffy::AlignContentKeyword::Stretch,
+        stylo::AlignFlags::FLEX_END => taffy::AlignContentKeyword::FlexEnd,
+        stylo::AlignFlags::CENTER => taffy::AlignContentKeyword::Center,
+        stylo::AlignFlags::SPACE_BETWEEN => taffy::AlignContentKeyword::SpaceBetween,
+        stylo::AlignFlags::SPACE_AROUND => taffy::AlignContentKeyword::SpaceAround,
+        stylo::AlignFlags::SPACE_EVENLY => taffy::AlignContentKeyword::SpaceEvenly,
         // Should never be hit. But no real reason to panic here.
-        _ => None,
-    }
+        _ => return None,
+    };
+
+    let safety = match input.primary().flags() {
+        stylo::AlignFlags::SAFE => taffy::AlignmentSafety::Safe,
+        _ => taffy::AlignmentSafety::Unsafe,
+    };
+
+    Some(taffy::AlignContent { keyword, safety })
 }
 
 #[inline]
 pub fn item_alignment(input: stylo::AlignFlags) -> Option<taffy::AlignItems> {
-    match input.value() {
-        stylo::AlignFlags::AUTO => None,
-        stylo::AlignFlags::NORMAL => Some(taffy::AlignItems::Stretch),
-        stylo::AlignFlags::STRETCH => Some(taffy::AlignItems::Stretch),
-        stylo::AlignFlags::FLEX_START => Some(taffy::AlignItems::FlexStart),
-        stylo::AlignFlags::FLEX_END => Some(taffy::AlignItems::FlexEnd),
-        stylo::AlignFlags::SELF_START => Some(taffy::AlignItems::Start),
-        stylo::AlignFlags::SELF_END => Some(taffy::AlignItems::End),
-        stylo::AlignFlags::START => Some(taffy::AlignItems::Start),
-        stylo::AlignFlags::END => Some(taffy::AlignItems::End),
-        stylo::AlignFlags::LEFT => Some(taffy::AlignItems::Start),
-        stylo::AlignFlags::RIGHT => Some(taffy::AlignItems::End),
-        stylo::AlignFlags::CENTER => Some(taffy::AlignItems::Center),
-        stylo::AlignFlags::BASELINE => Some(taffy::AlignItems::Baseline),
+    let keyword = match input.value() {
+        stylo::AlignFlags::AUTO => return None,
+        stylo::AlignFlags::NORMAL => taffy::AlignItemsKeyword::Stretch,
+        stylo::AlignFlags::STRETCH => taffy::AlignItemsKeyword::Stretch,
+        stylo::AlignFlags::FLEX_START => taffy::AlignItemsKeyword::FlexStart,
+        stylo::AlignFlags::FLEX_END => taffy::AlignItemsKeyword::FlexEnd,
+        stylo::AlignFlags::SELF_START => taffy::AlignItemsKeyword::Start,
+        stylo::AlignFlags::SELF_END => taffy::AlignItemsKeyword::End,
+        stylo::AlignFlags::START => taffy::AlignItemsKeyword::Start,
+        stylo::AlignFlags::END => taffy::AlignItemsKeyword::End,
+        stylo::AlignFlags::LEFT => taffy::AlignItemsKeyword::Start,
+        stylo::AlignFlags::RIGHT => taffy::AlignItemsKeyword::End,
+        stylo::AlignFlags::CENTER => taffy::AlignItemsKeyword::Center,
+        stylo::AlignFlags::BASELINE => taffy::AlignItemsKeyword::Baseline,
         // Should never be hit. But no real reason to panic here.
-        _ => None,
-    }
+        _ => return None,
+    };
+
+    let safety = match input.flags() {
+        stylo::AlignFlags::SAFE => taffy::AlignmentSafety::Safe,
+        _ => taffy::AlignmentSafety::Unsafe,
+    };
+
+    Some(taffy::AlignItems { keyword, safety })
 }
 
 #[inline]
@@ -228,15 +283,15 @@ pub fn grid_line(input: &stylo::GridLine) -> taffy::GridPlacement<Atom> {
         if input.ident.0 != atom!("") {
             taffy::GridPlacement::NamedSpan(
                 input.ident.0.clone(),
-                input.line_num.try_into().unwrap(),
+                as_clamped_i16(input.line_num) as u16,
             )
         } else {
             taffy::GridPlacement::Span(input.line_num as u16)
         }
     } else if input.ident.0 != atom!("") {
-        taffy::GridPlacement::NamedLine(input.ident.0.clone(), input.line_num as i16)
+        taffy::GridPlacement::NamedLine(input.ident.0.clone(), as_clamped_i16(input.line_num))
     } else if input.line_num != 0 {
-        taffy::style_helpers::line(input.line_num as i16)
+        taffy::style_helpers::line(as_clamped_i16(input.line_num))
     } else {
         taffy::GridPlacement::Auto
     }
@@ -245,7 +300,9 @@ pub fn grid_line(input: &stylo::GridLine) -> taffy::GridPlacement<Atom> {
 #[inline]
 pub fn track_repeat(input: stylo::RepeatCount<i32>) -> taffy::RepetitionCount {
     match input {
-        stylo::RepeatCount::Number(val) => taffy::RepetitionCount::Count(val.try_into().unwrap()),
+        stylo::RepeatCount::Number(count) => {
+            taffy::RepetitionCount::Count(as_clamped_i16(count) as u16)
+        },
         stylo::RepeatCount::AutoFill => taffy::RepetitionCount::AutoFill,
         stylo::RepeatCount::AutoFit => taffy::RepetitionCount::AutoFit,
     }
@@ -270,7 +327,7 @@ pub fn track_size(input: &stylo::TrackSize<stylo::LengthPercentage>) -> taffy::T
                 },
 
                 // Are these valid? Taffy doesn't support this in any case
-                stylo::TrackBreadth::Fr(_) => unreachable!(),
+                stylo::TrackBreadth::Flex(_) => unreachable!(),
                 stylo::TrackBreadth::Auto => unreachable!(),
                 stylo::TrackBreadth::MinContent => unreachable!(),
                 stylo::TrackBreadth::MaxContent => unreachable!(),
@@ -285,7 +342,7 @@ pub fn min_track(
 ) -> taffy::MinTrackSizingFunction {
     match input {
         stylo::TrackBreadth::Breadth(lp) => length_percentage(lp).into(),
-        stylo::TrackBreadth::Fr(_) => taffy::MinTrackSizingFunction::AUTO,
+        stylo::TrackBreadth::Flex(_) => taffy::MinTrackSizingFunction::AUTO,
         stylo::TrackBreadth::Auto => taffy::MinTrackSizingFunction::AUTO,
         stylo::TrackBreadth::MinContent => taffy::MinTrackSizingFunction::MIN_CONTENT,
         stylo::TrackBreadth::MaxContent => taffy::MinTrackSizingFunction::MAX_CONTENT,
@@ -298,7 +355,7 @@ pub fn max_track(
 ) -> taffy::MaxTrackSizingFunction {
     match input {
         stylo::TrackBreadth::Breadth(lp) => length_percentage(lp).into(),
-        stylo::TrackBreadth::Fr(val) => fr(*val),
+        stylo::TrackBreadth::Flex(val) => fr(val.0),
         stylo::TrackBreadth::Auto => taffy::MaxTrackSizingFunction::AUTO,
         stylo::TrackBreadth::MinContent => taffy::MaxTrackSizingFunction::MIN_CONTENT,
         stylo::TrackBreadth::MaxContent => taffy::MaxTrackSizingFunction::MAX_CONTENT,

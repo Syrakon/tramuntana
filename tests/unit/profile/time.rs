@@ -5,10 +5,10 @@
 use std::thread;
 
 use ::time::Duration;
-use ipc_channel::ipc;
 use profile::time;
 use profile_traits::ipc as ProfiledIpc;
 use profile_traits::time::{ProfilerCategory, ProfilerData, ProfilerMsg};
+use servo_base::generic_channel;
 use servo_config::opts::OutputOptions;
 
 #[test]
@@ -16,7 +16,7 @@ fn time_profiler_smoke_test() {
     let chan = time::Profiler::create(&None, None);
     assert!(true, "Can create the profiler thread");
 
-    let (ipcchan, _ipcport) = ipc::channel().unwrap();
+    let (ipcchan, _ipcport) = generic_channel::channel().unwrap();
     chan.send(ProfilerMsg::Exit(ipcchan));
     assert!(true, "Can tell the profiler thread to exit");
 }
@@ -73,34 +73,9 @@ fn channel_profiler_test() {
     let val_profile_receiver = profiled_receiver.recv().unwrap();
     assert_eq!(val_profile_receiver, 43);
 
-    let (sender, receiver) = ipc::channel().unwrap();
+    let (sender, receiver) = generic_channel::channel().unwrap();
     chan.send(ProfilerMsg::Get(
         (ProfilerCategory::IpcReceiver, None),
-        sender.clone(),
-    ));
-
-    match receiver.recv().unwrap() {
-        // asserts that the time spent in the sleeping thread is more than 1500 milliseconds
-        ProfilerData::Record(time_data) => assert!(time_data[0] > Duration::milliseconds(1500)),
-        ProfilerData::NoRecords => assert!(false),
-    };
-}
-
-#[test]
-fn bytes_channel_profiler_test() {
-    let chan = time::Profiler::create(&Some(OutputOptions::Stdout(5.0)), None);
-    let (profiled_sender, profiled_receiver) = ProfiledIpc::bytes_channel(chan.clone()).unwrap();
-    thread::spawn(move || {
-        thread::sleep(std::time::Duration::from_secs(2));
-        profiled_sender.send(&[1, 2, 3]).unwrap();
-    });
-
-    let val_profile_receiver = profiled_receiver.recv().unwrap();
-    assert_eq!(val_profile_receiver, [1, 2, 3]);
-
-    let (sender, receiver) = ipc::channel().unwrap();
-    chan.send(ProfilerMsg::Get(
-        (ProfilerCategory::IpcBytesReceiver, None),
         sender.clone(),
     ));
 

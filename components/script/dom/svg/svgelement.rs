@@ -4,17 +4,24 @@
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
 use js::rust::HandleObject;
 use script_bindings::codegen::GenericBindings::ElementBinding::ScrollLogicalPosition;
 use script_bindings::codegen::GenericBindings::WindowBinding::ScrollBehavior;
 use script_bindings::str::DOMString;
+use style::attr::AttrValue;
+use style::parser::ParserContext;
+use style::properties::{PropertyDeclaration, longhands};
+use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
+use style::values::generics::NonNegative;
+use style::values::specified;
+use style_traits::ParsingMode;
 use stylo_dom::ElementState;
 
 use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
 use crate::dom::bindings::codegen::Bindings::SVGElementBinding::SVGElementMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::css::cssstyledeclaration::{
     CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner,
 };
@@ -22,11 +29,16 @@ use crate::dom::document::Document;
 use crate::dom::document::focus::FocusableArea;
 use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
+use crate::dom::node::focus::FocusTrigger;
+use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{ChildrenMutation, Node, NodeTraits, ShadowIncluding};
-use crate::dom::scrolling_box::{ScrollAxisState, ScrollRequirement};
+use crate::dom::svg::svgcircleelement::SVGCircleElement;
+use crate::dom::svg::svgellipseelement::SVGEllipseElement;
+use crate::dom::svg::svgimageelement::SVGImageElement;
+use crate::dom::svg::svgpathelement::SVGPathElement;
+use crate::dom::svg::svgrectelement::SVGRectElement;
 use crate::dom::svg::svgsvgelement::SVGSVGElement;
-use crate::dom::virtualmethods::VirtualMethods;
-use crate::script_runtime::CanGc;
+use crate::dom::window::scrolling_box::{ScrollAxisState, ScrollRequirement};
 
 #[dom_struct]
 pub(crate) struct SVGElement {
@@ -76,14 +88,14 @@ impl SVGElement {
 
     /// What an `<svg>` element draws is rasterized from the markup of its
     /// subtree, so a change anywhere inside of it makes that out of date.
-    fn invalidate_svg_ancestor(&self) {
+    fn invalidate_svg_ancestor(&self, no_gc: &NoGC) {
         let svg_ancestor = self
             .upcast::<Node>()
             .inclusive_ancestors(ShadowIncluding::No)
             .skip(1)
             .find_map(DomRoot::downcast::<SVGSVGElement>);
         if let Some(svg_ancestor) = svg_ancestor {
-            svg_ancestor.invalidate_cached_serialized_subtree();
+            svg_ancestor.invalidate_cached_serialized_subtree_and_rasterization_result(no_gc);
         }
     }
 }
@@ -105,37 +117,70 @@ impl VirtualMethods for SVGElement {
         let element = self.as_element();
         if let (&local_name!("nonce"), mutation) = (attr.local_name(), mutation) {
             match mutation {
-                AttributeMutation::Set(..) => {
+                AttributeMutation::Set(_) => {
                     let nonce = &**attr.value();
-                    element.update_nonce_internal_slot(nonce.to_owned());
+                    element.update_nonce_internal_slot(nonce.to_owned(), cx.no_gc());
                 },
                 AttributeMutation::Removed => {
-                    element.update_nonce_internal_slot(String::new());
+                    element.update_nonce_internal_slot(String::new(), cx.no_gc());
                 },
             }
         }
-        self.invalidate_svg_ancestor();
+        self.invalidate_svg_ancestor(cx.no_gc());
     }
 
     fn children_changed(&self, cx: &mut JSContext, mutation: &ChildrenMutation) {
         if let Some(super_type) = self.super_type() {
             super_type.children_changed(cx, mutation);
         }
-        self.invalidate_svg_ancestor();
+        self.invalidate_svg_ancestor(cx.no_gc());
+    }
+
+    fn attribute_affects_presentational_hints(&self, attr: AttrRef<'_>) -> bool {
+        matches!(
+            attr.local_name(),
+            &local_name!("fill") |
+                &local_name!("fill-opacity") |
+                &local_name!("fill-rule") |
+                &local_name!("stroke") |
+                &local_name!("stroke-width") |
+                &local_name!("stroke-linecap") |
+                &local_name!("stroke-linejoin") |
+                &local_name!("stroke-dasharray") |
+                &local_name!("stroke-dashoffset") |
+                &local_name!("stroke-miterlimit") |
+                &local_name!("stroke-opacity") |
+                &local_name!("display") |
+                &local_name!("visibility") |
+                &local_name!("opacity") |
+                &local_name!("cx") |
+                &local_name!("cy") |
+                &local_name!("r") |
+                &local_name!("rx") |
+                &local_name!("ry") |
+                &local_name!("x") |
+                &local_name!("y") |
+                &local_name!("width") |
+                &local_name!("height") |
+                &local_name!("d")
+        ) || self
+            .super_type()
+            .unwrap()
+            .attribute_affects_presentational_hints(attr)
     }
 }
 
 impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
     /// <https://html.spec.whatwg.org/multipage/#the-style-attribute>
-    fn Style(&self) -> DomRoot<CSSStyleDeclaration> {
+    fn Style(&self, cx: &mut JSContext) -> DomRoot<CSSStyleDeclaration> {
         self.style_decl.or_init(|| {
             let global = self.owner_window();
             CSSStyleDeclaration::new(
+                cx,
                 &global,
                 CSSStyleOwner::Element(Dom::from_ref(self.upcast())),
                 None,
                 CSSModificationAccess::ReadWrite,
-                CanGc::deprecated_note(),
             )
         })
     }
@@ -149,9 +194,9 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-noncedelement-nonce>
-    fn SetNonce(&self, _cx: &mut JSContext, value: DOMString) {
+    fn SetNonce(&self, cx: &mut JSContext, value: DOMString) {
         self.as_element()
-            .update_nonce_internal_slot(value.to_string())
+            .update_nonce_internal_slot(String::from(value), cx.no_gc())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-fe-autofocus>
@@ -171,7 +216,10 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
         // TODO: Implement this.
 
         // 2. Run the focusing steps for this.
-        if !self.upcast::<Node>().run_the_focusing_steps(cx, None) {
+        if !self
+            .upcast::<Node>()
+            .run_the_focusing_steps(cx, None, FocusTrigger::Other)
+        {
             // The specification seems to imply we should scroll into view even if this element
             // is not a focusable area. No browser does this, so we return early in that case.
             // See https://github.com/whatwg/html/issues/12231.
@@ -191,6 +239,7 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
                 requirement: ScrollRequirement::IfNotVisible,
             };
             self.upcast::<Element>().scroll_into_view_with_options(
+                cx,
                 ScrollBehavior::Smooth,
                 scroll_axis,
                 scroll_axis,
@@ -210,7 +259,7 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
         // <https://html.spec.whatwg.org/multipage/#unfocusing-steps>
         self.owner_document()
             .focus_handler()
-            .focus(cx, FocusableArea::Viewport);
+            .focus(cx, &FocusableArea::Viewport);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-tabindex>
@@ -221,6 +270,233 @@ impl SVGElementMethods<crate::DomTypeHolder> for SVGElement {
     /// <https://html.spec.whatwg.org/multipage/#dom-tabindex>
     fn SetTabIndex(&self, cx: &mut JSContext, tab_index: i32) {
         self.element
-            .set_int_attribute(cx, &local_name!("tabindex"), tab_index);
+            .set_attribute(cx, &local_name!("tabindex"), tab_index.into());
+    }
+}
+
+impl<'dom> LayoutDom<'dom, SVGElement> {
+    pub(crate) fn synthesize_presentational_hints(
+        self,
+        document: LayoutDom<'dom, Document>,
+        push: &mut impl FnMut(PropertyDeclaration),
+    ) {
+        let element = self.upcast::<Element>();
+
+        if element.is::<SVGSVGElement>() {
+            if let Some(width) = element
+                .get_attr_for_layout(&ns!(), &local_name!("width"))
+                .and_then(AttrValue::as_length_percentage)
+            {
+                push(PropertyDeclaration::Width(
+                    specified::Size::LengthPercentage(NonNegative(width.clone())),
+                ));
+            }
+            if let Some(height) = element
+                .get_attr_for_layout(&ns!(), &local_name!("height"))
+                .and_then(AttrValue::as_length_percentage)
+            {
+                push(PropertyDeclaration::Height(
+                    specified::Size::LengthPercentage(NonNegative(height.clone())),
+                ));
+            }
+        }
+        let url_data = UrlExtraData(document.url_for_layout().get_arc());
+        let parsing_mode =
+            ParsingMode::ALLOW_UNITLESS_LENGTH | ParsingMode::ALLOW_ALL_NUMERIC_VALUES;
+        let parser_context = ParserContext::new(
+            Origin::Author,
+            &url_data,
+            Some(CssRuleType::Style),
+            parsing_mode,
+            document.quirks_mode(),
+            Default::default(),
+            None,
+            None,
+            Default::default(),
+        );
+
+        self.parse_svg_attribute(
+            &parser_context,
+            "fill",
+            longhands::fill::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "fill-opacity",
+            longhands::fill_opacity::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "fill-rule",
+            longhands::fill_rule::parse_declared,
+            push,
+        );
+
+        self.parse_svg_attribute(
+            &parser_context,
+            "stroke",
+            longhands::stroke::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "stroke-width",
+            longhands::stroke_width::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "stroke-linecap",
+            longhands::stroke_linecap::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "stroke-linejoin",
+            longhands::stroke_linejoin::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "stroke-dasharray",
+            longhands::stroke_dasharray::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "stroke-dashoffset",
+            longhands::stroke_dashoffset::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "stroke-miterlimit",
+            longhands::stroke_miterlimit::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "stroke-opacity",
+            longhands::stroke_opacity::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "display",
+            longhands::display::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "visibility",
+            longhands::visibility::parse_declared,
+            push,
+        );
+        self.parse_svg_attribute(
+            &parser_context,
+            "opacity",
+            longhands::opacity::parse_declared,
+            push,
+        );
+
+        // Parse geometry attributes based on element type
+        // <circle>: https://svgwg.org/svg2-draft/shapes.html#CircleElement
+        if element.downcast::<SVGCircleElement>().is_some() {
+            self.parse_svg_attribute(&parser_context, "cx", longhands::cx::parse_declared, push);
+            self.parse_svg_attribute(&parser_context, "cy", longhands::cy::parse_declared, push);
+            self.parse_svg_attribute(&parser_context, "r", longhands::r::parse_declared, push);
+        }
+        // <ellipse>: https://svgwg.org/svg2-draft/shapes.html#EllipseElement
+        if element.downcast::<SVGEllipseElement>().is_some() {
+            self.parse_svg_attribute(&parser_context, "cx", longhands::cx::parse_declared, push);
+            self.parse_svg_attribute(&parser_context, "cy", longhands::cy::parse_declared, push);
+            self.parse_svg_attribute(&parser_context, "rx", longhands::rx::parse_declared, push);
+            self.parse_svg_attribute(&parser_context, "ry", longhands::ry::parse_declared, push);
+        }
+        // <rect>: https://svgwg.org/svg2-draft/shapes.html#RectElement
+        if element.downcast::<SVGRectElement>().is_some() {
+            self.parse_svg_attribute(&parser_context, "x", longhands::x::parse_declared, push);
+            self.parse_svg_attribute(&parser_context, "y", longhands::y::parse_declared, push);
+            self.parse_svg_attribute(
+                &parser_context,
+                "width",
+                longhands::width::parse_declared,
+                push,
+            );
+            self.parse_svg_attribute(
+                &parser_context,
+                "height",
+                longhands::height::parse_declared,
+                push,
+            );
+            self.parse_svg_attribute(&parser_context, "rx", longhands::rx::parse_declared, push);
+            self.parse_svg_attribute(&parser_context, "ry", longhands::ry::parse_declared, push);
+        }
+        // <image>: https://svgwg.org/svg2-draft/embedded.html#ImageElement
+        if element.downcast::<SVGImageElement>().is_some() {
+            self.parse_svg_attribute(&parser_context, "x", longhands::x::parse_declared, push);
+            self.parse_svg_attribute(&parser_context, "y", longhands::y::parse_declared, push);
+            self.parse_svg_attribute(
+                &parser_context,
+                "width",
+                longhands::width::parse_declared,
+                push,
+            );
+            self.parse_svg_attribute(
+                &parser_context,
+                "height",
+                longhands::height::parse_declared,
+                push,
+            );
+        }
+        // <path>: https://svgwg.org/svg2-draft/paths.html#PathElement
+        if element.downcast::<SVGPathElement>().is_some() {
+            // The d CSS property only accepts `none` or `path(<string>)`,
+            // but the SVG presentation attribute uses raw path data (e.g. "M0,0 L1,1").
+            // Wrap the raw path data in `path("...")` so the CSS parser can handle it.
+            if let Some(value) = element.get_attr_val_for_layout(&ns!(), &local_name!("d")) {
+                if value.eq_ignore_ascii_case("none") {
+                    let mut parser = cssparser::Parser::new(value);
+                    if let Ok(property) =
+                        parser.parse_entirely(|i| longhands::d::parse_declared(&parser_context, i))
+                    {
+                        push(property);
+                    }
+                } else {
+                    let wrapped = format!("path(\"{}\")", value);
+                    let mut parser = cssparser::Parser::new(&wrapped);
+                    if let Ok(property) = parser.parse_entirely(|parse_input| {
+                        longhands::d::parse_declared(&parser_context, parse_input)
+                    }) {
+                        push(property);
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_svg_attribute<F>(
+        self,
+        parser_context: &ParserContext,
+        attr_name: &str,
+        parse: F,
+        push: &mut impl FnMut(PropertyDeclaration),
+    ) where
+        F: for<'i, 't> FnOnce(
+            &ParserContext,
+            &mut cssparser::Parser<'i>,
+        ) -> Result<PropertyDeclaration, style_traits::ParseError>,
+    {
+        let element = self.upcast::<Element>();
+        if let Some(value) = element.get_attr_val_for_layout(&ns!(), &LocalName::from(attr_name)) {
+            let mut parser = cssparser::Parser::new(value);
+            if let Ok(property) =
+                parser.parse_entirely(|parse_input| parse(parser_context, parse_input))
+            {
+                push(property);
+            }
+        }
     }
 }

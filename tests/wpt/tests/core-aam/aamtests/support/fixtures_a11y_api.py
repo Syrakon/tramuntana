@@ -3,13 +3,16 @@ from sys import platform
 
 
 def pid_from(capabilities):
-    # TODO: add support for Edge, Safari.
+    # TODO: add support for getting the PID from other browsers.
     if capabilities["browserName"] == "chrome":
         return capabilities["goog:processID"], "chrome"
     if capabilities["browserName"] == "firefox":
         return capabilities["moz:processID"], "firefox"
-    if capabilities["browserName"] == "servo":
-        return 0, "servo"
+    if "safari:processID" in capabilities:
+        return capabilities["safari:processID"], capabilities["browserName"]
+    if capabilities["browserName"] == "MicrosoftEdge":
+        return capabilities["goog:processID"], "edge"
+    return 0, capabilities["browserName"]
 
 
 @pytest.fixture
@@ -42,11 +45,14 @@ def axapi(session, default_timeout):
 
 
 @pytest.fixture
-def uia(session):
+def uia(session, default_timeout):
     if platform != "win32":
         pytest.skip("NOT_APPLICABLE")
 
-    # TODO: Make UiaWrapper and return it
+    from .uia_wrapper import UiaWrapper
+
+    pid, product_name = pid_from(session.capabilities)
+    return UiaWrapper(pid, product_name, default_timeout)
 
 
 @pytest.fixture

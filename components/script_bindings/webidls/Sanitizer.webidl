@@ -11,7 +11,7 @@ dictionary SetHTMLUnsafeOptions {
   (Sanitizer or SanitizerConfig or SanitizerPresets) sanitizer = {};
 };
 
-// https://wicg.github.io/sanitizer-api/#sanitizer
+// https://html.spec.whatwg.org/multipage/#sanitizer
 [Exposed=Window, Pref="dom_sanitizer_enabled"]
 interface Sanitizer {
   [Throws] constructor(optional (SanitizerConfig or SanitizerPresets) configuration = "default");
@@ -23,16 +23,19 @@ interface Sanitizer {
   boolean allowElement(SanitizerElementWithAttributes element);
   boolean removeElement(SanitizerElement element);
   boolean replaceElementWithChildren(SanitizerElement element);
+  boolean allowProcessingInstruction(SanitizerPI pi);
+  boolean removeProcessingInstruction(SanitizerPI pi);
   boolean allowAttribute(SanitizerAttribute attribute);
   boolean removeAttribute(SanitizerAttribute attribute);
   boolean setComments(boolean allow);
   boolean setDataAttributes(boolean allow);
+  boolean setJavascriptURLs(boolean allow);
 
   // Remove markup that executes script.
   boolean removeUnsafe();
 };
 
-// https://wicg.github.io/sanitizer-api/#config
+// https://html.spec.whatwg.org/multipage/#sanitizer-configuration
 dictionary SanitizerElementNamespace {
   required DOMString name;
   DOMString? _namespace = "http://www.w3.org/1999/xhtml";
@@ -44,13 +47,18 @@ dictionary SanitizerElementNamespaceWithAttributes : SanitizerElementNamespace {
   sequence<SanitizerAttribute> removeAttributes;
 };
 
-typedef (DOMString or SanitizerElementNamespace) SanitizerElement;
-typedef (DOMString or SanitizerElementNamespaceWithAttributes) SanitizerElementWithAttributes;
-
 dictionary SanitizerAttributeNamespace {
   required DOMString name;
   DOMString? _namespace = null;
 };
+
+dictionary SanitizerProcessingInstruction {
+  required DOMString target;
+};
+
+typedef (DOMString or SanitizerElementNamespace) SanitizerElement;
+typedef (DOMString or SanitizerElementNamespaceWithAttributes) SanitizerElementWithAttributes;
+typedef (DOMString or SanitizerProcessingInstruction) SanitizerPI;
 typedef (DOMString or SanitizerAttributeNamespace) SanitizerAttribute;
 
 dictionary SanitizerConfig {
@@ -58,10 +66,14 @@ dictionary SanitizerConfig {
   sequence<SanitizerElement> removeElements;
   sequence<SanitizerElement> replaceWithChildrenElements;
 
+  sequence<SanitizerPI> processingInstructions;
+  sequence<SanitizerPI> removeProcessingInstructions;
+
   sequence<SanitizerAttribute> attributes;
   sequence<SanitizerAttribute> removeAttributes;
 
   boolean comments;
   boolean dataAttributes;
+  boolean javascriptURLs;
 };
 

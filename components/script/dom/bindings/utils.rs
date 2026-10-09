@@ -7,13 +7,14 @@
 use std::cell::RefCell;
 use std::thread::LocalKey;
 
-use js::conversions::ToJSValConvertible;
-use js::glue::{IsWrapper, JSPrincipalsCallbacks, UnwrapObjectDynamic, UnwrapObjectStatic};
+use js::context::JSContext;
+use js::glue::{IsWrapper, JSPrincipalsCallbacks, UnwrapObjectStatic};
 use js::jsapi::{
-    CallArgs, DOMCallbacks, HandleObject as RawHandleObject, JS_FreezeObject, JSContext, JSObject,
+    CallArgs, DOMCallbacks, HandleObject as RawHandleObject, JSContext as RawJSContext, JSObject,
+    JSString, MutableHandle as RawMutableHandle,
 };
 use js::realm::CurrentRealm;
-use js::rust::{HandleObject, MutableHandleValue, get_object_class, is_dom_class};
+use js::rust::{HandleObject, get_object_class, is_dom_class};
 use script_bindings::interfaces::{DomHelpers, Interface};
 use script_bindings::reflector::{DomObject, DomObjectWrap, reflect_dom_object};
 use script_bindings::settings_stack::StackEntry;
@@ -24,14 +25,11 @@ use crate::dom::bindings::constructor::call_html_constructor;
 use crate::dom::bindings::conversions::DerivedFrom;
 use crate::dom::bindings::error::{Error, report_pending_exception, throw_dom_exception};
 use crate::dom::bindings::principals::PRINCIPALS_CALLBACKS;
-use crate::dom::bindings::proxyhandler::is_platform_object_same_origin;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::settings_stack;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::windowproxy::WindowProxyHandler;
-use crate::realms::InRealm;
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
-use crate::script_thread::ScriptThread;
+use crate::event_loop::script_thread::ScriptThread;
 
 #[derive(JSTraceable, MallocSizeOf)]
 /// Static data associated with a global object.
@@ -51,33 +49,6 @@ impl GlobalStaticData {
 }
 
 pub(crate) use script_bindings::utils::*;
-
-/// Returns a JSVal representing the frozen JavaScript array
-pub(crate) fn to_frozen_array<T: ToJSValConvertible>(
-    convertibles: &[T],
-    cx: SafeJSContext,
-    mut rval: MutableHandleValue,
-    can_gc: CanGc,
-) {
-    script_bindings::conversions::SafeToJSValConvertible::safe_to_jsval(
-        convertibles,
-        cx,
-        rval.reborrow(),
-        can_gc,
-    );
-
-    rooted!(in(*cx) let obj = rval.to_object());
-    unsafe { JS_FreezeObject(*cx, RawHandleObject::from(obj.handle())) };
-}
-
-/// Returns wether `obj` is a platform object using dynamic unwrap
-/// <https://heycam.github.io/webidl/#dfn-platform-object>
-#[expect(dead_code)]
-pub(crate) fn is_platform_object_dynamic(obj: *mut JSObject, cx: *mut JSContext) -> bool {
-    is_platform_object(obj, &|o| unsafe {
-        UnwrapObjectDynamic(o, cx, /* stopAtWindowProxy = */ false)
-    })
-}
 
 /// Returns wether `obj` is a platform object using static unwrap
 /// <https://heycam.github.io/webidl/#dfn-platform-object>
@@ -130,9 +101,27 @@ unsafe extern "C" fn instance_class_is_error(clasp: *const js::jsapi::JSClass) -
     root_interface == PrototypeList::ID::DOMException as u32
 }
 
+unsafe extern "C" fn extract_exception_info(
+    _cx: *mut RawJSContext,
+    _obj: RawHandleObject,
+    is_exception: *mut bool,
+    _file_name: RawMutableHandle<*mut JSString>,
+    _line_number: *mut u32,
+    _column_number: *mut u32,
+    _message: RawMutableHandle<*mut JSString>,
+) -> bool {
+    // This is dummy impl as done in JSShell: https://phabricator.services.mozilla.com/D257487
+    // TODO: https://github.com/servo/servo/issues/47619
+    unsafe {
+        *is_exception = false;
+    }
+    true
+}
+
 pub(crate) const DOM_CALLBACKS: DOMCallbacks = DOMCallbacks {
     instanceClassMatchesProto: Some(instance_class_has_proto_at_depth),
     instanceClassIsError: Some(instance_class_is_error),
+    extractExceptionInfo: Some(extract_exception_info),
 };
 
 /// Eagerly define all relevant WebIDL interface constructors on the
@@ -145,22 +134,21 @@ pub(crate) fn define_all_exposed_interfaces(cx: &mut CurrentRealm, global: &Glob
 
 impl DomHelpers<crate::DomTypeHolder> for crate::DomTypeHolder {
     fn throw_dom_exception(
-        cx: SafeJSContext,
+        cx: &mut JSContext,
         global: &<crate::DomTypeHolder as DomTypes>::GlobalScope,
         result: Error,
-        can_gc: CanGc,
     ) {
-        throw_dom_exception(cx, global, result, can_gc)
+        throw_dom_exception(cx, global, result)
     }
 
     fn call_html_constructor<
         T: DerivedFrom<<crate::DomTypeHolder as DomTypes>::Element> + DomObject,
     >(
-        cx: &mut js::context::JSContext,
+        cx: &mut JSContext,
         args: &CallArgs,
         global: &<crate::DomTypeHolder as DomTypes>::GlobalScope,
         proto_id: PrototypeList::ID,
-        creator: unsafe fn(&mut js::context::JSContext, HandleObject, *mut ProtoOrIfaceArray),
+        creator: unsafe fn(&mut JSContext, HandleObject, *mut ProtoOrIfaceArray),
     ) -> bool {
         call_html_constructor::<T>(cx, args, global, proto_id, creator)
     }
@@ -173,10 +161,6 @@ impl DomHelpers<crate::DomTypeHolder> for crate::DomTypeHolder {
         &PRINCIPALS_CALLBACKS
     }
 
-    fn is_platform_object_same_origin(cx: &CurrentRealm, obj: RawHandleObject) -> bool {
-        unsafe { is_platform_object_same_origin(cx, obj) }
-    }
-
     fn interface_map() -> &'static phf::Map<&'static [u8], Interface> {
         &InterfaceObjectMap::MAP
     }
@@ -184,19 +168,19 @@ impl DomHelpers<crate::DomTypeHolder> for crate::DomTypeHolder {
     fn push_new_element_queue() {
         ScriptThread::custom_element_reaction_stack().push_new_element_queue()
     }
-    fn pop_current_element_queue(cx: &mut js::context::JSContext) {
+    fn pop_current_element_queue(cx: &mut JSContext) {
         ScriptThread::custom_element_reaction_stack().pop_current_element_queue(cx)
     }
 
-    fn reflect_dom_object<T, U>(obj: Box<T>, global: &U, can_gc: CanGc) -> DomRoot<T>
+    fn reflect_dom_object_with_cx<T, U>(cx: &mut JSContext, obj: Box<T>, global: &U) -> DomRoot<T>
     where
         T: DomObject + DomObjectWrap<crate::DomTypeHolder>,
         U: DerivedFrom<GlobalScope>,
     {
-        reflect_dom_object(obj, global, can_gc)
+        reflect_dom_object(cx, obj, global)
     }
 
-    fn report_pending_exception(cx: SafeJSContext, realm: InRealm, can_gc: CanGc) {
-        report_pending_exception(cx, realm, can_gc)
+    fn report_pending_exception(cx: &mut CurrentRealm) {
+        report_pending_exception(cx)
     }
 }

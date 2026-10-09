@@ -7,11 +7,13 @@ use std::ops::Deref;
 
 use cssparser::color::OPAQUE;
 use html5ever::local_name;
-use js::context::JSContext;
+use js::context::{JSContext, NoGC};
+use script_bindings::codegen::GenericBindings::RangeBinding::RangeMethods;
 use script_bindings::inheritance::Castable;
 use style::attr::parse_legacy_color;
 use style::values::specified::box_::DisplayOutside;
 
+use crate::dom::Document;
 use crate::dom::abstractrange::bp_position;
 use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterDataMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
@@ -19,7 +21,7 @@ use crate::dom::bindings::codegen::Bindings::HTMLAnchorElementBinding::HTMLAncho
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::NodeTypeId;
-use crate::dom::bindings::root::{DomRoot, DomSlice};
+use crate::dom::bindings::root::{DomRoot, DomSlice, UnrootedDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::characterdata::CharacterData;
 use crate::dom::element::Element;
@@ -30,32 +32,55 @@ use crate::dom::html::htmlbrelement::HTMLBRElement;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::html::htmllielement::HTMLLIElement;
-use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
+use crate::dom::iterators::ShadowIncluding;
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::text::Text;
 
-pub(crate) enum NodeOrString {
+pub(crate) enum NodeOrString<'a> {
     String(String),
-    Node(DomRoot<Node>),
+    Node(UnrootedDom<'a, Node>),
 }
 
-impl NodeOrString {
-    fn name(&self) -> &str {
-        match self {
-            NodeOrString::String(str_) => str_,
-            NodeOrString::Node(node) => node
-                .downcast::<Element>()
-                .map(|element| element.local_name().as_ref())
-                .unwrap_or_default(),
-        }
+impl<'a> NodeOrString<'a> {
+    pub(crate) fn from_node(node: &Node, no_gc: &'a NoGC) -> NodeOrString<'a> {
+        NodeOrString::Node(UnrootedDom::from_ref(node, no_gc))
     }
 
-    fn as_node(&self) -> Option<DomRoot<Node>> {
+    fn as_node(&self) -> Option<UnrootedDom<'a, Node>> {
         match self {
             NodeOrString::String(_) => None,
             NodeOrString::Node(node) => Some(node.clone()),
         }
     }
 }
+
+// This is a macro instead of a method on `NodeOrString` since `UnrootedDom::downcast`
+// would result in `element` being a temporary referenced value. Therefore, it wouldn't
+// be possible to return its localname as `&str`. Instead, we need to compare immediately
+// when we have the element referenced, which is why we have to duplicate the `matches!`.
+macro_rules! node_or_string_matches_name(
+    ( $node_or_string:ident, $pattern:pat $(if $guard:expr)? $(,)? ) => (
+        match $node_or_string {
+            NodeOrString::String(ref str_) => matches!(str_.as_ref(), $pattern),
+            NodeOrString::Node(ref node) => UnrootedDom::downcast::<Element>(node.clone())
+                .map(|element| matches!(element.local_name().as_ref(), $pattern))
+                .unwrap_or_default(),
+        }
+    );
+);
+
+macro_rules! node_matches_local_name(
+    ( $node:ident, $pattern:pat $(if $guard:expr)? $(,)? ) => (
+        $node.downcast::<Element>().is_some_and(|element|
+            matches!(
+                *element.local_name(),
+                $pattern
+            )
+        )
+    );
+);
+
+pub(crate) use node_matches_local_name;
 
 /// <https://w3c.github.io/editing/docs/execCommand/#prohibited-paragraph-child-name>
 const PROHIBITED_PARAGRAPH_CHILD_NAMES: [&str; 47] = [
@@ -139,87 +164,76 @@ where
         .GetSelection(cx)
         .expect("Must always have a selection");
     let active_range = selection
-        .active_range()
+        .active_range(cx)
         .expect("Must always have an active range");
 
-    // Relevant only in the case where we have a single text node that is partially/fully selected.
-    // In that case, the spec algorithm would update the selection to the parent of the text node.
-    // However, this then breaks the algorithm to compute "effectively contained" nodes. To remedy
-    // that, we record the values here and reset them as part of step 2.
-    let end_offsets_if_previously_selected_single_text_node = if active_range.start_container() ==
-        active_range.end_container() &&
-        active_range.start_container().is::<Text>()
-    {
-        Some((active_range.start_offset(), active_range.end_offset()))
-    } else {
-        None
-    };
+    // Selection is currently implemented as a live range (not great!), which means that
+    // we need to record the old boundary point (container and offset) before actually
+    // performing the move operation and then apply the editing spec's range update
+    // algorithm to this original boundary point.
+    let start_container = active_range.start_container();
+    let start_offset = active_range.start_offset();
+    let end_container = active_range.end_container();
+    let end_offset = active_range.end_offset();
+
+    let should_adjust_start = !node.is_inclusive_ancestor_of(&start_container);
+    let should_adjust_end = !node.is_inclusive_ancestor_of(&end_container);
 
     if move_(cx).is_err() {
         unreachable!("Must always be able to move");
     }
 
-    // Step 2. If a boundary point's node is the same as or a descendant of node, leave it unchanged,
-    // so it moves to the new location.
-    //
-    // From the spec:
-    // > This is actually implicit, but I state it anyway for completeness.
-    //
-    // However, this is not actually implicit. The caveat here are text nodes that are
-    // partially/fully selected. In these cases, we shouldn't update the offsets to the new parent,
-    // but instead retain them on the original text node. Therefore, if that's the case,
-    // update them here and immediately return.
-    if let Some((previous_start_offset, previous_end_offset)) =
-        end_offsets_if_previously_selected_single_text_node
-    {
-        active_range.set_start(node, previous_start_offset);
-        active_range.set_end(node, previous_end_offset);
-        return;
-    }
-
     let new_parent = node.GetParentNode().expect("Must always have a new parent");
     let new_index = node.index();
 
-    let mut start_node = active_range.start_container();
-    let mut start_offset = active_range.start_offset();
-    let mut end_node = active_range.end_container();
-    let mut end_offset = active_range.end_offset();
-
-    // Step 3. If a boundary point's node is new parent and its offset is greater than new index, add one to its offset.
-    if start_node == new_parent && start_offset > new_index {
-        start_offset += 1;
-    }
-    if end_node == new_parent && end_offset > new_index {
-        end_offset += 1;
-    }
-
-    if let Some(old_parent) = old_parent {
-        // Step 4. If a boundary point's node is old parent and its offset is old index or old index + 1,
-        // set its node to new parent and add new index − old index to its offset.
-        if start_node == old_parent && (start_offset == old_index || start_offset == old_index + 1)
-        {
-            start_node = new_parent.clone();
-            start_offset += new_index;
-            start_offset -= old_index;
-        }
-        if end_node == old_parent && (end_offset == old_index || end_offset == old_index + 1) {
-            end_node = new_parent;
-            end_offset += new_index;
-            end_offset -= old_index;
+    let adjust_boundary_point = |mut container, mut offset, should_adjust: bool| {
+        // Step 2. If a boundary point's node is the same as or a descendant of node, leave it
+        // unchanged, so it moves to the new location.
+        //
+        // From the spec:
+        // > This is actually implicit, but I state it anyway for completeness.
+        //
+        // However, this does not seem to be implicit for text nodes that are partially/fully
+        // selected. In these cases, we shouldn't update the offsets to the new parent, but
+        // instead retain them on the original text node. Therefore, if that's the case,
+        // update them here and immediately return.
+        if !should_adjust {
+            return (container, offset);
         }
 
-        // Step 5. If a boundary point's node is old parent and its offset is greater than old index + 1,
-        // subtract one from its offset.
-        if start_node == old_parent && (start_offset > old_index + 1) {
-            start_offset -= 1;
+        // Step 3. If a boundary point's node is new parent and its offset is greater than new
+        // index, add one to its offset.
+        if container == new_parent && offset > new_index {
+            offset += 1;
         }
-        if end_node == old_parent && (end_offset > old_index + 1) {
-            end_offset -= 1;
-        }
-    }
 
-    active_range.set_start(&start_node, start_offset);
-    active_range.set_end(&end_node, end_offset);
+        if let Some(old_parent) = old_parent.as_ref() {
+            // Step 4. If a boundary point's node is old parent and its offset is old
+            // index or old index + 1, set its node to new parent and add new index −
+            // old index to its offset.
+            if container == *old_parent && (offset == old_index || offset == old_index + 1) {
+                container = new_parent.clone();
+                offset += new_index;
+                offset -= old_index;
+            }
+
+            // Step 5. If a boundary point's node is old parent and its offset is
+            // greater than old index + 1, subtract one from its offset.
+            if container == *old_parent && (offset > old_index + 1) {
+                offset -= 1;
+            }
+        }
+
+        (container, offset)
+    };
+
+    let (new_start_container, new_start_offset) =
+        adjust_boundary_point(start_container, start_offset, should_adjust_start);
+    let (new_end_container, new_end_offset) =
+        adjust_boundary_point(end_container, end_offset, should_adjust_end);
+
+    let _ = active_range.SetStart(cx.no_gc(), &new_start_container, new_start_offset);
+    let _ = active_range.SetEnd(cx.no_gc(), &new_end_container, new_end_offset);
 }
 
 /// <https://w3c.github.io/editing/docs/execCommand/#allowed-child>
@@ -227,8 +241,8 @@ pub(crate) fn is_allowed_child(child: NodeOrString, parent: NodeOrString) -> boo
     // Step 1. If parent is "colgroup", "table", "tbody", "tfoot", "thead", "tr",
     // or an HTML element with local name equal to one of those,
     // and child is a Text node whose data does not consist solely of space characters, return false.
-    if matches!(
-        parent.name(),
+    if node_or_string_matches_name!(
+        parent,
         "colgroup" | "table" | "tbody" | "tfoot" | "thead" | "tr"
     ) && child.as_node().is_some_and(|node| {
         // Note: cannot use `.and_then` here, since `downcast` would outlive its reference
@@ -239,7 +253,7 @@ pub(crate) fn is_allowed_child(child: NodeOrString, parent: NodeOrString) -> boo
     }
     // Step 2. If parent is "script", "style", "plaintext", or "xmp",
     // or an HTML element with local name equal to one of those, and child is not a Text node, return false.
-    if matches!(parent.name(), "script" | "style" | "plaintext" | "xmp") &&
+    if node_or_string_matches_name!(parent, "script" | "style" | "plaintext" | "xmp") &&
         child.as_node().is_none_or(|node| !node.is::<Text>())
     {
         return false;
@@ -415,14 +429,16 @@ pub(crate) fn split_the_parent<'a>(cx: &mut JSContext, node_list: &'a [&'a Node]
         .children()
         .next()
         .is_some_and(|first_child| node_list.contains(&first_child.deref()));
-    let follows_line_break = first_child_is_in_node_list && original_parent.follows_a_line_break();
+    let follows_line_break =
+        first_child_is_in_node_list && original_parent.follows_a_line_break(cx.no_gc());
     // Step 5. If the last child of original parent is in node list, and original parent precedes a line break,
     // set precedes line break to true. Otherwise, set precedes line break to false.
     let last_child_is_in_node_list = original_parent
         .children()
         .last()
         .is_some_and(|last_child| node_list.contains(&last_child.deref()));
-    let precedes_line_break = last_child_is_in_node_list && original_parent.precedes_a_line_break();
+    let precedes_line_break =
+        last_child_is_in_node_list && original_parent.precedes_a_line_break(cx.no_gc());
     // Step 6. If the first child of original parent is not in node list, but its last child is:
     if !first_child_is_in_node_list && last_child_is_in_node_list {
         // Step 6.1. For each node in node list, in reverse order,
@@ -437,7 +453,7 @@ pub(crate) fn split_the_parent<'a>(cx: &mut JSContext, node_list: &'a [&'a Node]
         // call createElement("br") on the context object and insert the result immediately after the last member of node list.
         if precedes_line_break &&
             let Some(last) = node_list.last() &&
-            !last.precedes_a_line_break()
+            !last.precedes_a_line_break(cx.no_gc())
         {
             let br = context_object.create_element(cx, "br");
             if last
@@ -455,7 +471,7 @@ pub(crate) fn split_the_parent<'a>(cx: &mut JSContext, node_list: &'a [&'a Node]
         return;
     }
     // Step 7. If the first child of original parent is not in node list:
-    if first_child_is_in_node_list {
+    if !first_child_is_in_node_list {
         // Step 7.1. Let cloned parent be the result of calling cloneNode(false) on original parent.
         let Ok(cloned_parent) = original_parent.CloneNode(cx, false) else {
             unreachable!("Must always be able to clone node");
@@ -498,7 +514,7 @@ pub(crate) fn split_the_parent<'a>(cx: &mut JSContext, node_list: &'a [&'a Node]
     // call createElement("br") on the context object and insert the result immediately before the first member of node list.
     if follows_line_break &&
         let Some(first) = node_list.first() &&
-        !first.follows_a_line_break()
+        !first.follows_a_line_break(cx.no_gc())
     {
         let br = context_object.create_element(cx, "br");
         if first
@@ -532,7 +548,7 @@ pub(crate) fn split_the_parent<'a>(cx: &mut JSContext, node_list: &'a [&'a Node]
         // call createElement("br") on the context object and insert the result immediately after the last member of node list.
         if precedes_line_break &&
             let Some(last) = node_list.last() &&
-            !last.precedes_a_line_break()
+            !last.precedes_a_line_break(cx.no_gc())
         {
             let br = context_object.create_element(cx, "br");
             if last
@@ -559,7 +575,7 @@ pub(crate) fn split_the_parent<'a>(cx: &mut JSContext, node_list: &'a [&'a Node]
 }
 
 /// <https://w3c.github.io/editing/docs/execCommand/#wrap>
-fn wrap_node_list<SiblingCriteria, NewParentInstructions>(
+pub(crate) fn wrap_node_list<SiblingCriteria, NewParentInstructions>(
     cx: &mut JSContext,
     node_list: Vec<DomRoot<Node>>,
     sibling_criteria: SiblingCriteria,
@@ -567,13 +583,13 @@ fn wrap_node_list<SiblingCriteria, NewParentInstructions>(
 ) -> Option<DomRoot<Node>>
 where
     SiblingCriteria: Fn(&Node) -> bool,
-    NewParentInstructions: Fn() -> Option<DomRoot<Node>>,
+    NewParentInstructions: Fn(&mut JSContext) -> Option<DomRoot<Node>>,
 {
     // Step 1. If every member of node list is invisible,
     // and none is a br, return null and abort these steps.
     if node_list
         .iter()
-        .all(|node| node.is_invisible() && !node.is::<HTMLBRElement>())
+        .all(|node| node.is_invisible(cx.no_gc()) && !node.is::<HTMLBRElement>())
     {
         return None;
     }
@@ -593,7 +609,7 @@ where
     // Step 4. While node list's first member's previousSibling is invisible, prepend it to node list.
     while let Some(previous_of_first) = node_list.first().and_then(|last| last.GetPreviousSibling())
     {
-        if previous_of_first.is_invisible() {
+        if previous_of_first.is_invisible(cx.no_gc()) {
             node_list.insert(0, previous_of_first);
             continue;
         }
@@ -601,7 +617,7 @@ where
     }
     // Step 5. While node list's last member's nextSibling is invisible, append it to node list.
     while let Some(next_of_last) = node_list.last().and_then(|last| last.GetNextSibling()) {
-        if next_of_last.is_invisible() {
+        if next_of_last.is_invisible(cx.no_gc()) {
             node_list.push(next_of_last);
             continue;
         }
@@ -627,7 +643,7 @@ where
     });
     // Step 8. Otherwise, run new parent instructions, and let new parent be the result.
     // Step 9. If new parent is null, abort these steps and return null.
-    let new_parent = new_parent.or_else(new_parent_instructions)?;
+    let new_parent = new_parent.or_else(|| new_parent_instructions(cx))?;
     // Step 11. Let original parent be the parent of the first member of node list.
     let first_in_node_list = node_list
         .first()
@@ -651,26 +667,26 @@ where
         if let Some(range) = first_in_node_list
             .owner_document()
             .GetSelection(cx)
-            .and_then(|selection| selection.active_range())
+            .and_then(|selection| selection.active_range(cx))
         {
             let parent_of_new_parent = new_parent.GetParentNode().expect("Must have a parent");
             let start_container = range.start_container();
             let start_offset = range.start_offset();
 
             if start_container == parent_of_new_parent && start_offset == new_parent.index() {
-                range.set_start(&start_container, start_offset + 1);
+                let _ = range.SetStart(cx.no_gc(), &start_container, start_offset + 1);
             }
 
             let end_container = range.end_container();
             let end_offset = range.end_offset();
 
             if end_container == parent_of_new_parent && end_offset == new_parent.index() {
-                range.set_end(&end_container, end_offset + 1);
+                let _ = range.SetEnd(cx.no_gc(), &end_container, end_offset + 1);
             }
         }
     }
     // Step 12. If new parent is before the first member of node list in tree order:
-    if new_parent.is_before(first_in_node_list) {
+    if new_parent.is_before(cx.no_gc(), first_in_node_list) {
         // Step 12.1. If new parent is not an inline node, but the last visible child of new parent
         // and the first visible member of node list are both inline nodes,
         // and the last child of new parent is not a br,
@@ -679,11 +695,11 @@ where
         if !new_parent.is_inline_node() &&
             new_parent
                 .rev_children()
-                .find(|child| child.is_visible())
+                .find(|child| child.is_visible(cx.no_gc()))
                 .is_some_and(|child| child.is_inline_node()) &&
             node_list
                 .iter()
-                .find(|node| node.is_visible())
+                .find(|node| node.is_visible(cx.no_gc()))
                 .is_some_and(|node| node.is_inline_node()) &&
             new_parent
                 .children_unrooted(cx.no_gc())
@@ -709,12 +725,12 @@ where
         if !new_parent.is_inline_node() &&
             new_parent
                 .children_unrooted(cx.no_gc())
-                .find(|child| child.is_visible())
+                .find(|child| child.is_visible(cx.no_gc()))
                 .is_some_and(|child| child.is_inline_node()) &&
             node_list
                 .iter()
                 .rev()
-                .find(|node| node.is_visible())
+                .find(|node| node.is_visible(cx.no_gc()))
                 .is_some_and(|node| node.is_inline_node()) &&
             node_list
                 .last()
@@ -1138,7 +1154,7 @@ impl Node {
         };
         // Step 4. If node is an allowed child of "span":
         if is_allowed_child(
-            NodeOrString::Node(DomRoot::from_ref(self)),
+            NodeOrString::from_node(self, cx.no_gc()),
             NodeOrString::String("span".to_owned()),
         ) {
             // Step 4.1. Reorder modifiable descendants of node's previousSibling.
@@ -1172,11 +1188,11 @@ impl Node {
                                 )
                         })
                 },
-                || None,
+                |_| None,
             );
         }
         // Step 5. If node is invisible, abort this algorithm.
-        if self.is_invisible() {
+        if self.is_invisible(cx.no_gc()) {
             return;
         }
         // Step 6. If the effective command value of command is loosely equivalent to new value on node, abort this algorithm.
@@ -1188,7 +1204,7 @@ impl Node {
         }
         // Step 7. If node is not an allowed child of "span":
         if !is_allowed_child(
-            NodeOrString::Node(DomRoot::from_ref(self)),
+            NodeOrString::from_node(self, cx.no_gc()),
             NodeOrString::String("span".to_owned()),
         ) {
             // Step 7.1. Let children be all children of node, omitting any that are Elements whose
@@ -1298,12 +1314,10 @@ impl Node {
                 while let Some(current_ancestor) = ancestor {
                     // Step 11.4.1. If ancestor is an a, set the tag name of ancestor to "span", and let ancestor be the result.
                     let current_ancestor = if current_ancestor.is::<HTMLAnchorElement>() {
-                        DomRoot::upcast(
-                            current_ancestor
-                                .downcast::<Element>()
-                                .expect("Must always be an element")
-                                .set_the_tag_name(cx, "span"),
-                        )
+                        current_ancestor
+                            .downcast::<Element>()
+                            .expect("Must always be an element")
+                            .set_the_tag_name(cx, "span")
                     } else {
                         current_ancestor
                     };
@@ -1331,7 +1345,7 @@ impl Node {
 
                 if size > 0 {
                     let new_font_element = document.create_element(cx, "font");
-                    new_font_element.set_int_attribute(cx, &local_name!("size"), size);
+                    new_font_element.set_attribute(cx, &local_name!("size"), size.into());
                     new_parent = Some(new_font_element);
                 }
             },
@@ -1503,7 +1517,7 @@ impl Node {
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#visible>
-    pub(crate) fn is_visible(&self) -> bool {
+    pub(crate) fn is_visible(&self, no_gc: &NoGC) -> bool {
         for parent in self.inclusive_ancestors(ShadowIncluding::No) {
             // > excluding any node with an inclusive ancestor Element whose "display" property has resolved value "none".
             if parent
@@ -1521,7 +1535,7 @@ impl Node {
         // > or a Text node that is not a collapsed whitespace node,
         if self
             .downcast::<Text>()
-            .is_some_and(|text| !text.is_collapsed_whitespace_node())
+            .is_some_and(|text| !text.is_collapsed_whitespace_node(no_gc))
         {
             return true;
         }
@@ -1536,7 +1550,7 @@ impl Node {
             return true;
         }
         for child in self.children() {
-            if child.is_visible() {
+            if child.is_visible(no_gc) {
                 return true;
             }
         }
@@ -1544,33 +1558,49 @@ impl Node {
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#invisible>
-    pub(crate) fn is_invisible(&self) -> bool {
+    pub(crate) fn is_invisible(&self, no_gc: &NoGC) -> bool {
         // > Something is invisible if it is a node that is not visible.
-        !self.is_visible()
+        !self.is_visible(no_gc)
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#formattable-node>
-    pub(crate) fn is_formattable(&self) -> bool {
+    pub(crate) fn is_formattable(&self, no_gc: &NoGC) -> bool {
         // > A formattable node is an editable visible node that is either a Text node, an img, or a br.
         self.is_editable() &&
-            self.is_visible() &&
+            self.is_visible(no_gc) &&
             (self.is::<Text>() || self.is::<HTMLImageElement>() || self.is::<HTMLBRElement>())
     }
 
+    /// <https://w3c.github.io/editing/docs/execCommand/#single-line-container>
+    pub(crate) fn is_single_line_container(&self) -> bool {
+        // > A single-line container is either a non-list single-line container,
+        // > or an HTML element with local name "li", "dt", or "dd".
+        let Some(element) = self.downcast::<Element>() else {
+            return false;
+        };
+        element.is_non_list_single_line_container() ||
+            matches!(
+                *element.local_name(),
+                local_name!("li") | local_name!("dt") | local_name!("dd")
+            )
+    }
+
     /// <https://w3c.github.io/editing/docs/execCommand/#block-start-point>
-    fn is_block_start_point(&self, offset: usize) -> bool {
+    pub(crate) fn is_block_start_point(&self, no_gc: &NoGC, offset: usize) -> bool {
         // > A boundary point (node, offset) is a block start point if either node's parent is null and offset is zero;
         if offset == 0 {
             return self.GetParentNode().is_none();
         }
         // > or node has a child with index offset − 1, and that child is either a visible block node or a visible br.
-        self.children().nth(offset - 1).is_some_and(|child| {
-            child.is_visible() && (child.is_block_node() || child.is::<HTMLBRElement>())
-        })
+        self.children_unrooted(no_gc)
+            .nth(offset - 1)
+            .is_some_and(|child| {
+                child.is_visible(no_gc) && (child.is_block_node() || child.is::<HTMLBRElement>())
+            })
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#block-end-point>
-    fn is_block_end_point(&self, offset: u32) -> bool {
+    pub(crate) fn is_block_end_point(&self, offset: u32, no_gc: &NoGC) -> bool {
         // > A boundary point (node, offset) is a block end point if either node's parent is null and offset is node's length;
         if self.GetParentNode().is_none() && offset == self.len() {
             return true;
@@ -1578,17 +1608,141 @@ impl Node {
         // > or node has a child with index offset, and that child is a visible block node.
         self.children()
             .nth(offset as usize)
-            .is_some_and(|child| child.is_visible() && child.is_block_node())
+            .is_some_and(|child| child.is_visible(no_gc) && child.is_block_node())
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#block-boundary-point>
-    fn is_block_boundary_point(&self, offset: u32) -> bool {
+    pub(crate) fn is_block_boundary_point(&self, no_gc: &NoGC, offset: u32) -> bool {
         // > A boundary point is a block boundary point if it is either a block start point or a block end point.
-        self.is_block_start_point(offset as usize) || self.is_block_end_point(offset)
+        self.is_block_start_point(no_gc, offset as usize) || self.is_block_end_point(offset, no_gc)
+    }
+
+    pub(crate) fn is_no_allowed_child_in_same_editing_host(&self, no_gc: &NoGC) -> bool {
+        // > If node is not an allowed child of any of its ancestors in the same editing host
+        let Some(editing_host) = self.editing_host_of() else {
+            return false;
+        };
+        let self_unrooted = UnrootedDom::from_ref(self, no_gc);
+        self.ancestors_unrooted(no_gc)
+            .take_while(|ancestor| ancestor.editing_host_of().as_ref() == Some(&editing_host))
+            .all(|ancestor| {
+                !is_allowed_child(
+                    NodeOrString::Node(self_unrooted.clone()),
+                    NodeOrString::Node(ancestor),
+                )
+            })
+    }
+
+    /// <https://w3c.github.io/editing/docs/execCommand/#prohibited-paragraph-child>
+    pub(crate) fn is_prohibited_paragraph_child(&self) -> bool {
+        // > A prohibited paragraph child is an HTML element whose local name is a prohibited paragraph child name.
+        let Some(node_as_element) = self.downcast::<HTMLElement>() else {
+            return false;
+        };
+        PROHIBITED_PARAGRAPH_CHILD_NAMES.contains(&node_as_element.local_name())
+    }
+
+    /// <https://w3c.github.io/editing/docs/execCommand/#fix-disallowed-ancestors>
+    pub(crate) fn fix_disallowed_ancestors(&self, cx: &mut JSContext, context_object: &Document) {
+        // Step 1. If node is not editable, abort these steps.
+        if !self.is_editable() {
+            return;
+        }
+        // Step 2. If node is not an allowed child of any of its ancestors in the same editing host:
+        if self.is_no_allowed_child_in_same_editing_host(cx.no_gc()) {
+            // Step 2.1. If node is a dd or dt, wrap the one-node list consisting of node,
+            // with sibling criteria returning true for any dl with no attributes and false otherwise,
+            // and new parent instructions returning
+            // the result of calling createElement("dl") on the context object.
+            // Then abort these steps.
+            if node_matches_local_name!(self, local_name!("dd") | local_name!("dt")) {
+                wrap_node_list(
+                    cx,
+                    vec![DomRoot::from_ref(self)],
+                    |sibling| {
+                        sibling
+                            .downcast::<Element>()
+                            .is_some_and(|sibling_element| {
+                                let attrs = sibling_element.attrs().borrow();
+                                sibling_element.local_name() == &local_name!("dl") &&
+                                    attrs.is_empty()
+                            })
+                    },
+                    |cx| Some(DomRoot::upcast(context_object.create_element(cx, "dl"))),
+                );
+                return;
+            }
+            // Step 2.2. If "p" is not an allowed child of the editing host of node,
+            // abort these steps.
+            if let Some(editing_host) = self.editing_host_of() &&
+                !is_allowed_child(
+                    NodeOrString::String("p".to_owned()),
+                    NodeOrString::from_node(&editing_host, cx.no_gc()),
+                )
+            {
+                return;
+            }
+            // Step 2.3. If node is not a prohibited paragraph child, abort these steps.
+            if !self.is_prohibited_paragraph_child() {
+                return;
+            }
+            // Step 2.4. Set the tag name of node to the default single-line container name,
+            // and let node be the result.
+            let node = self
+                .downcast::<Element>()
+                .expect("Must always be an element")
+                .set_the_tag_name(
+                    cx,
+                    context_object.default_single_line_container_name().str(),
+                );
+            // Step 2.5. Fix disallowed ancestors of node.
+            //
+            // NOTE: We should only do this if we actually changed node. If node didn't change
+            // (for example it was already the correct tag), then we would infinitely recurse
+            // here. Therefore, we should check if we changed the node and only then do it
+            // again.
+            if *node != *self {
+                node.fix_disallowed_ancestors(cx, context_object);
+            }
+            // Step 2.6. Let children be node's children.
+            let children = node.children().collect::<Vec<DomRoot<Node>>>();
+            // Step 2.7. For each child in children, if child is a prohibited paragraph child:
+            for child in children {
+                if child.is_prohibited_paragraph_child() {
+                    // Step 2.7.1. Record the values of the one-node list consisting of child,
+                    // and let values be the result.
+                    let values = record_the_values(vec![child.clone()]);
+                    // Step 2.7.2. Split the parent of the one-node list consisting of child.
+                    split_the_parent(cx, &[&child]);
+                    // Step 2.7.3. Restore the values from values.
+                    restore_the_values(cx, values);
+                }
+            }
+            // Step 2.8. Abort these steps.
+            return;
+        }
+        // Step 3. Record the values of the one-node list consisting of node, and let values be the result.
+        let values = record_the_values(vec![DomRoot::from_ref(self)]);
+        // Step 4. While node is not an allowed child of its parent,
+        // split the parent of the one-node list consisting of node.
+        loop {
+            let Some(parent) = self.GetParentNode() else {
+                break;
+            };
+            if is_allowed_child(
+                NodeOrString::from_node(self, cx.no_gc()),
+                NodeOrString::from_node(&parent, cx.no_gc()),
+            ) {
+                break;
+            }
+            split_the_parent(cx, &[self]);
+        }
+        // Step 5. Restore the values from values.
+        restore_the_values(cx, values);
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#collapsed-block-prop>
-    pub(crate) fn is_collapsed_block_prop(&self) -> bool {
+    pub(crate) fn is_collapsed_block_prop(&self, no_gc: &NoGC) -> bool {
         // > A collapsed block prop is either a collapsed line break that is not an extraneous line break,
 
         // TODO: Check for collapsed line break
@@ -1606,12 +1760,12 @@ impl Node {
             return false;
         }
         let mut at_least_one_collapsed_block_prop = false;
-        for child in self.children() {
-            if child.is_collapsed_block_prop() {
+        for child in self.children_unrooted(no_gc) {
+            if child.is_collapsed_block_prop(no_gc) {
                 at_least_one_collapsed_block_prop = true;
                 continue;
             }
-            if child.is_invisible() {
+            if child.is_invisible(no_gc) {
                 continue;
             }
 
@@ -1622,12 +1776,12 @@ impl Node {
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#follows-a-line-break>
-    fn follows_a_line_break(&self) -> bool {
+    fn follows_a_line_break(&self, no_gc: &NoGC) -> bool {
         // Step 1. Let offset be zero.
         let mut offset = 0;
         // Step 2. While (node, offset) is not a block boundary point:
         let mut node = DomRoot::from_ref(self);
-        while !node.is_block_boundary_point(offset) {
+        while !node.is_block_boundary_point(no_gc, offset) {
             // Step 2.2. If offset is zero or node has no children, set offset to node's index, then set node to its parent.
             if offset == 0 || node.children_count() == 0 {
                 offset = node.index();
@@ -1639,7 +1793,7 @@ impl Node {
             let Some(child) = child else {
                 return false;
             };
-            if child.is_visible() {
+            if child.is_visible(no_gc) {
                 return false;
             }
             // Step 2.3. Otherwise, set node to its child with index offset minus one, then set offset to node's length.
@@ -1651,17 +1805,17 @@ impl Node {
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#precedes-a-line-break>
-    fn precedes_a_line_break(&self) -> bool {
+    fn precedes_a_line_break(&self, no_gc: &NoGC) -> bool {
         let mut node = DomRoot::from_ref(self);
         // Step 1. Let offset be node's length.
         let mut offset = node.len();
         // Step 2. While (node, offset) is not a block boundary point:
-        while !node.is_block_boundary_point(offset) {
+        while !node.is_block_boundary_point(no_gc, offset) {
             // Step 2.1. If node has a visible child with index offset, return false.
             if node
                 .children()
                 .nth(offset as usize)
-                .is_some_and(|child| child.is_visible())
+                .is_some_and(|child| child.is_visible(no_gc))
             {
                 return false;
             }
@@ -1736,7 +1890,12 @@ impl Node {
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#canonicalize-whitespace>
-    pub(crate) fn canonicalize_whitespace(&self, offset: u32, fix_collapsed_space: bool) {
+    pub(crate) fn canonicalize_whitespace(
+        &self,
+        cx: &mut JSContext,
+        offset: u32,
+        fix_collapsed_space: bool,
+    ) {
         // Step 1. If node is neither editable nor an editing host, abort these steps.
         if !self.is_editable_or_editing_host() {
             return;
@@ -1762,7 +1921,7 @@ impl Node {
             // and start node's parent is in the same editing host, set start offset to start node's index,
             // then set start node to its parent.
             if start_offset == 0 &&
-                !start_node.follows_a_line_break() &&
+                !start_node.follows_a_line_break(cx.no_gc()) &&
                 let Some(parent) = start_node.GetParentNode() &&
                 parent.same_editing_host(&start_node)
             {
@@ -1792,7 +1951,7 @@ impl Node {
         // Step 5. Let length equal zero.
         let mut length = 0;
         // Step 6. Let collapse spaces be true if start offset is zero and start node follows a line break, otherwise false.
-        let mut collapse_spaces = start_offset == 0 && start_node.follows_a_line_break();
+        let mut collapse_spaces = start_offset == 0 && start_node.follows_a_line_break(cx.no_gc());
         // Step 7. Repeat the following steps:
         loop {
             // Step 7.1. If end node has a child in the same editing host with index end offset,
@@ -1808,13 +1967,13 @@ impl Node {
             // and end node does not precede a line break
             // and end node's parent is in the same editing host,
             // set end offset to one plus end node's index, then set end node to its parent.
-            if end_offset == end_node.len() && !end_node.precedes_a_line_break() {
-                if let Some(parent) = end_node.GetParentNode() &&
-                    parent.same_editing_host(&end_node)
-                {
-                    end_offset = 1 + end_node.index();
-                    end_node = parent;
-                }
+            if end_offset == end_node.len() &&
+                !end_node.precedes_a_line_break(cx.no_gc()) &&
+                let Some(parent) = end_node.GetParentNode() &&
+                parent.same_editing_host(&end_node)
+            {
+                end_offset = 1 + end_node.index();
+                end_node = parent;
                 continue;
             }
             // Step 7.3. Otherwise, if end node is a Text node and its parent's resolved value for "white-space"
@@ -1838,7 +1997,7 @@ impl Node {
                 if fix_collapsed_space && collapse_spaces && has_space_at_offset {
                     if text
                         .upcast::<CharacterData>()
-                        .DeleteData(end_offset, 1)
+                        .DeleteData(cx, end_offset, 1)
                         .is_err()
                     {
                         unreachable!("Invalid deletion for character at end offset");
@@ -1864,8 +2023,8 @@ impl Node {
         // Step 8. If fix collapsed space is true, then while (start node, start offset)
         // is before (end node, end offset):
         if fix_collapsed_space {
-            while bp_position(&start_node, start_offset, &end_node, end_offset) ==
-                Some(Ordering::Less)
+            while bp_position(cx.no_gc(), &start_node, start_offset, &end_node, end_offset) ==
+                Ordering::Less
             {
                 // Step 8.1. If end node has a child in the same editing host with index end offset − 1,
                 // set end node to that child, then set end offset to end node's length.
@@ -1896,7 +2055,7 @@ impl Node {
                         text.data().len() as u32,
                         &[&'\u{0020}'],
                     ) &&
-                    end_node.precedes_a_line_break()
+                    end_node.precedes_a_line_break(cx.no_gc())
                 {
                     // Step 8.3.1. Subtract one from end offset.
                     end_offset -= 1;
@@ -1905,7 +2064,7 @@ impl Node {
                     // Step 8.3.3. Call deleteData(end offset, 1) on end node.
                     if text
                         .upcast::<CharacterData>()
-                        .DeleteData(end_offset, 1)
+                        .DeleteData(cx, end_offset, 1)
                         .is_err()
                     {
                         unreachable!("Invalid deletion for character at end offset");
@@ -1921,12 +2080,13 @@ impl Node {
         // non-breaking end is true if end offset is end node's length and end node precedes a line break, and false otherwise.
         let replacement_whitespace = Node::canonical_space_sequence(
             length,
-            start_offset == 0 && start_node.follows_a_line_break(),
-            end_offset == end_node.len() && end_node.precedes_a_line_break(),
+            start_offset == 0 && start_node.follows_a_line_break(cx.no_gc()),
+            end_offset == end_node.len() && end_node.precedes_a_line_break(cx.no_gc()),
         );
         let mut replacement_whitespace_chars = replacement_whitespace.chars();
         // Step 10. While (start node, start offset) is before (end node, end offset):
-        while bp_position(&start_node, start_offset, &end_node, end_offset) == Some(Ordering::Less)
+        while bp_position(cx.no_gc(), &start_node, start_offset, &end_node, end_offset) ==
+            Ordering::Less
         {
             // Step 10.1. If start node has a child with index start offset, set start node to that child, then set start offset to zero.
             if let Some(child) = start_node.children().nth(start_offset as usize) {
@@ -1954,13 +2114,13 @@ impl Node {
                     let character_data = start_node_as_text.upcast::<CharacterData>();
                     // Step 10.3.2.1. Call insertData(start offset, element) on start node.
                     if character_data
-                        .InsertData(start_offset, element.to_string().into())
+                        .InsertData(cx, start_offset, element.to_string().into())
                         .is_err()
                     {
                         unreachable!("Invalid insertion for character at start offset");
                     }
                     // Step 10.3.2.2. Call deleteData(start offset + 1, 1) on start node.
-                    if character_data.DeleteData(start_offset + 1, 1).is_err() {
+                    if character_data.DeleteData(cx, start_offset + 1, 1).is_err() {
                         unreachable!("Invalid deletion for character at start offset + 1");
                     }
                 }
@@ -1985,7 +2145,7 @@ impl Node {
         // Step 4. While ref is invisible but not an extraneous line break,
         // and ref does not equal node's parent, set ref to the node before it in tree order.
         loop {
-            if ref_.is_invisible() &&
+            if ref_.is_invisible(cx.no_gc()) &&
                 ref_.downcast::<HTMLBRElement>()
                     .is_none_or(|br| !br.is_extraneous_line_break()) &&
                 let Some(parent) = parent.as_ref() &&
@@ -2020,7 +2180,7 @@ impl Node {
         // Step 3. While ref is invisible but not an extraneous line break, and ref does not equal node,
         // set ref to the node before it in tree order.
         loop {
-            if ref_.is_invisible() &&
+            if ref_.is_invisible(cx.no_gc()) &&
                 *ref_ != *self &&
                 ref_.downcast::<HTMLBRElement>()
                     .is_none_or(|br| !br.is_extraneous_line_break()) &&
@@ -2043,7 +2203,7 @@ impl Node {
             loop {
                 if let Some(parent) = ref_.GetParentNode() &&
                     parent.is_editable() &&
-                    parent.is_invisible()
+                    parent.is_invisible(cx.no_gc())
                 {
                     ref_ = parent;
                     continue;
@@ -2097,11 +2257,11 @@ impl Node {
                         node.downcast::<HTMLAnchorElement>().and_then(|anchor| {
                             anchor
                                 .upcast::<Element>()
-                                .get_attribute(&local_name!("href"))
+                                .get_attribute_string_value(&local_name!("href"))
                         })
                     {
                         // Step 3.3. Return the value of node's href attribute.
-                        return Some(DOMString::from(&**anchor_value.value()));
+                        return Some(anchor_value.into());
                     }
                     current_node = node.GetParentNode();
                 }
@@ -2122,7 +2282,7 @@ impl Node {
                     }
                     current_element = element.upcast::<Node>().GetParentElement();
                 }
-                Some("rgba(0, 0, 0, 0)".into())
+                Some(DOMString::from_static("rgba(0, 0, 0, 0)"))
             },
             // Step 5. If command is "subscript" or "superscript":
             CommandName::Subscript | CommandName::Superscript => {
@@ -2151,11 +2311,11 @@ impl Node {
                 Some(match (affected_by_subscript, affected_by_superscript) {
                     // Step 5.3. If affected by subscript and affected by superscript are both true,
                     // return the string "mixed".
-                    (true, true) => "mixed".into(),
+                    (true, true) => DOMString::from_static("mixed"),
                     // Step 5.4. If affected by subscript is true, return "subscript".
-                    (true, false) => "subscript".into(),
+                    (true, false) => DOMString::from_static("subscript"),
                     // Step 5.5. If affected by superscript is true, return "superscript".
-                    (false, true) => "superscript".into(),
+                    (false, true) => DOMString::from_static("superscript"),
                     // Step 5.6. Return null.
                     (false, false) => return None,
                 })
@@ -2163,27 +2323,29 @@ impl Node {
             // Step 6. If command is "strikethrough",
             // and the "text-decoration" property of node or any of its ancestors has resolved value containing "line-through",
             // return "line-through". Otherwise, return null.
-            CommandName::Strikethrough => Some("line-through".into()).filter(|_| {
-                self.inclusive_ancestors(ShadowIncluding::No).any(|node| {
+            CommandName::Strikethrough => self
+                .inclusive_ancestors(ShadowIncluding::No)
+                .any(|node| {
                     node.downcast::<Element>()
                         .and_then(|element| {
                             CssPropertyName::TextDecorationLine.resolved_value_for_node(element)
                         })
                         .is_some_and(|property| property.contains("line-through"))
                 })
-            }),
+                .then_some(DOMString::from_static("line-through")),
             // Step 7. If command is "underline",
             // and the "text-decoration" property of node or any of its ancestors has resolved value containing "underline",
             // return "underline". Otherwise, return null.
-            CommandName::Underline => Some("underline".into()).filter(|_| {
-                self.inclusive_ancestors(ShadowIncluding::No).any(|node| {
+            CommandName::Underline => self
+                .inclusive_ancestors(ShadowIncluding::No)
+                .any(|node| {
                     node.downcast::<Element>()
                         .and_then(|element| {
                             CssPropertyName::TextDecorationLine.resolved_value_for_node(element)
                         })
                         .is_some_and(|property| property.contains("underline"))
                 })
-            }),
+                .then_some(DOMString::from_static("underline")),
             // Step 8. Return the resolved value for node of the relevant CSS property for command.
             _ => command.resolved_value_for_node(element),
         }

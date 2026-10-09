@@ -1,30 +1,44 @@
-/*
-https://html.spec.whatwg.org/multipage/#form-controls
-*/
-
 @namespace url(http://www.w3.org/1999/xhtml);
 
-[hidden], area, base, basefont, datalist, head, link, menu[type=popup i], meta,
-noembed, noframes, param, rp, script, source, style, template, track, title {
+/* https://html.spec.whatwg.org/multipage#hidden-elements */
+area, base, basefont, datalist, head, link, meta, noembed,
+noframes, param, rp, script, style, template, title {
+  display: none;
+}
+
+/* The final `not()` here contains some table parts that aren't in the specification.
+   This is necessary because this rule would otherwise override the specified
+   `visibility: collapse` rule specified in the table section for these parts when hidden.
+   Adding them here prevents that issue. See: <https://github.com/whatwg/html/issues/12589> */
+[hidden]:not([hidden=until-found i]):not(embed, colgroup, col, thead, tbody, tfoot, tr) {
+  display: none;
+}
+
+/* TODO: This should be `content-visibility: hidden`, once Servo supports that feature */
+[hidden=until-found i]:not(embed, colgroup, col, thead, tbody, tfoot, tr) {
   display: none;
 }
 
 embed[hidden] { display: inline; height: 0; width: 0; }
-
-/* FIXME: only if scripting is enabled */
-noscript { display: none !important; }
-
 input[type=hidden i] { display: none !important; }
 
+/* TODO: This should be guarded by `@media (scripting)` once Servo supports that feature. */
+noscript { display: none !important; }
 
+menu[type=popup i] {
+    display: none;
+}
+
+/* https://html.spec.whatwg.org/multipage/rendering.html#the-page */
 html, body { display: block; }
 
+/* > For each property in the table below, given a body element, the first attribute that
+ * > exists maps to the pixel length property on the body element. If none of the attributes for
+ * > a property are found, or if the value of the attribute that was found cannot be parsed
+ * > successfully, then a default value of 8px is expected to be used for that property instead. */
 body { margin: 8px; }
 
-/*
-https://html.spec.whatwg.org/multipage/#flow-content-3
-*/
-
+/* https://html.spec.whatwg.org/multipage/#flow-content-3 */
 address, blockquote, center, div, figure, figcaption, footer, form, header, hr,
 legend, listing, main, p, plaintext, pre, summary, xmp {
   display: block;
@@ -50,8 +64,8 @@ dialog {
   margin: auto;
   border: solid;
   padding: 1em;
-  background-color: white; /* FIXME: should be Canvas */
-  color: black; /* FIXME: should be CanvasText */
+  background-color: Canvas;
+  color: CanvasText;
 }
 dialog:modal {
   position: fixed;
@@ -83,7 +97,7 @@ rt { display: ruby-text; }
  * disables style sharing, so we want to apply pseudo-class selectors to as few elements as
  * possible.
  */
-a:link, area:link, link:link { color: #0000EE; }
+a:link, area:link, link:link { color: LinkText; }
 a:visited, area:visited, link:visited { color: #551A8B; }
 a:link, a:visited,
 area:link, area:visited,
@@ -117,7 +131,6 @@ q::after { content: close-quote; }
 br::before { content: "\A"; white-space: pre }
 
 nobr { white-space: nowrap; }
-wbr { display-outside: break-opportunity; } /* this also has bidi implications */
 nobr wbr { white-space: normal; }
 
 
@@ -216,33 +229,12 @@ h4 { margin-top: 1.33em; margin-bottom: 1.33em; font-size: 1.00em; font-weight: 
 h5 { margin-top: 1.67em; margin-bottom: 1.67em; font-size: 0.83em; font-weight: bold; }
 h6 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; font-weight: bold; }
 
-:matches(article, aside, nav, section) h1 { margin-top: 0.83em; margin-bottom: 0.83em; font-size: 1.50em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) h1 { margin-top: 1.00em; margin-bottom: 1.00em; font-size: 1.17em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) h1 { margin-top: 1.33em; margin-bottom: 1.33em; font-size: 1.00em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) h1 { margin-top: 1.67em; margin-bottom: 1.67em; font-size: 0.83em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) h1 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; }
-
-:matches(article, aside, nav, section) hgroup > h1 ~ h2 { margin-top: 1.00em; margin-bottom: 1.00em; font-size: 1.17em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) hgroup > h1 ~ h2 { margin-top: 1.33em; margin-bottom: 1.33em; font-size: 1.00em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) hgroup > h1 ~ h2 { margin-top: 1.67em; margin-bottom: 1.67em; font-size: 0.83em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) hgroup > h1 ~ h2 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; }
-
-:matches(article, aside, nav, section) hgroup > h1 ~ h3 { margin-top: 1.33em; margin-bottom: 1.33em; font-size: 1.00em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) hgroup > h1 ~ h3 { margin-top: 1.67em; margin-bottom: 1.67em; font-size: 0.83em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) :matches(article, aside, nav, section) hgroup > h1 ~ h3 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; }
-
-:matches(article, aside, nav, section) hgroup > h1 ~ h4 { margin-top: 1.67em; margin-bottom: 1.67em; font-size: 0.83em; }
-:matches(article, aside, nav, section) :matches(article, aside, nav, section) hgroup > h1 ~ h4 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; }
-
-:matches(article, aside, nav, section) hgroup > h1 ~ h5 { margin-top: 2.33em; margin-bottom: 2.33em; font-size: 0.67em; }
-
-
 dir, dd, dl, dt, menu, ol, ul { display: block; }
 li { display: list-item; text-align: match-parent; }
 
 dir, dl, menu, ol, ul { margin-top: 1em; margin-bottom: 1em; }
 
-:matches(dir, dl, menu, ol, ul) :matches(dir, dl, menu, ol, ul) {
+:is(dir, dl, menu, ol, ul) :is(dir, dl, menu, ol, ul) {
   margin-top: 0; margin-bottom: 0;
 }
 
@@ -253,11 +245,11 @@ ol { list-style-type: decimal; }
 
 dir, menu, ul { list-style-type: disc; }
 
-:matches(dir, menu, ol, ul) :matches(dir, menu, ul) {
+:is(dir, menu, ol, ul) :is(dir, menu, ul) {
   list-style-type: circle;
 }
 
-:matches(dir, menu, ol, ul) :matches(dir, menu, ol, ul) :matches(dir, menu, ul) {
+:is(dir, menu, ol, ul) :is(dir, menu, ol, ul) :is(dir, menu, ul) {
   list-style-type: square;
 }
 
@@ -276,7 +268,7 @@ tr, tr[hidden] { display: table-row; }
 td, th, td[hidden], th[hidden] { display: table-cell; }
 
 colgroup[hidden], col[hidden], thead[hidden], tbody[hidden],
-tfoot[hidden], tr[hidden], td[hidden], th[hidden] {
+tfoot[hidden], tr[hidden] {
   visibility: collapse;
 }
 
@@ -298,27 +290,22 @@ tr, td, th { vertical-align: inherit; }
 
 table, td, th { border-color: gray; }
 thead, tbody, tfoot, tr { border-color: inherit; }
-table:matches(
+table:is(
   [rules=none i], [rules=groups i], [rules=rows i],
   [rules=cols i], [rules=all i],
   [frame=void i], [frame=above i], [frame=below i],
   [frame=hsides i], [frame=lhs i], [frame=rhs i],
   [frame=vsides i], [frame=box i], [frame=border i]
 ),
-table:matches(
+table:is(
   [rules=none i], [rules=groups i], [rules=rows i],
   [rules=cols i], [rules=all i]
-) > tr > :matches(td, th),
-table:matches(
+) > tr > :is(td, th),
+table:is(
   [rules=none i], [rules=groups i], [rules=rows i],
   [rules=cols i], [rules=all i]
-) > :matches(thead, tbody, tfoot) > tr > :matches(td, th) {
+) > :is(thead, tbody, tfoot) > tr > :is(td, th) {
   border-color: black;
-}
-
-
-:matches(table, thead, tbody, tfoot, tr) > form {
-  display: none !important;
 }
 
 input:not([type=image i], [type=range i], [type=checkbox i], [type=radio i]) {
@@ -451,4 +438,12 @@ marquee {
   inline-size: stretch;
   vertical-align: text-bottom;
   white-space: nowrap;
+}
+
+/* https://drafts.csswg.org/css-ui-4/#content-selection */
+button, meter, progress, select,
+/* https://github.com/w3c/csswg-drafts/issues/9709#issuecomment-2041439088 */
+input:is([type=color], [type=range], [type=reset], [type=button], [type=submit])
+{
+  user-select: none;
 }

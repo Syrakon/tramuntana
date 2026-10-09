@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use profile_traits::generic_channel;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::GenericSender;
@@ -15,7 +16,6 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 // https://webbluetoothcg.github.io/web-bluetooth/tests#test-runner
 #[dom_struct]
@@ -30,8 +30,8 @@ impl TestRunner {
         }
     }
 
-    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<TestRunner> {
-        reflect_dom_object(Box::new(TestRunner::new_inherited()), global, can_gc)
+    pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<TestRunner> {
+        reflect_dom_object(cx, Box::new(TestRunner::new_inherited()), global)
     }
 
     fn get_bluetooth_thread(&self) -> GenericSender<BluetoothRequest> {

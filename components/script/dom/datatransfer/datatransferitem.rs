@@ -8,19 +8,25 @@ use std::rc::Rc;
 use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
-use crate::dom::bindings::callback::ExceptionHandling;
+use crate::dom::bindings::callback::{ExceptionHandling, RootedCallback, TracedCallback};
 use crate::dom::bindings::codegen::Bindings::DataTransferItemBinding::{
     DataTransferItemMethods, FunctionStringCallback,
 };
+use crate::dom::bindings::codegen::Bindings::FileBinding::FileMethods;
+use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::file::File;
+use crate::dom::filesystem::FileSystem;
+use crate::dom::filesystemdirectoryentry::FileSystemDirectoryEntry;
+use crate::dom::filesystementry::FileSystemEntry;
+use crate::dom::filesystemfileentry::FileSystemFileEntry;
 use crate::dom::globalscope::GlobalScope;
-use crate::drag_data_store::{DragDataStore, Kind, Mode};
+use crate::drag::drag_data_store::{DragDataStore, Kind, Mode};
 
 #[dom_struct]
 pub(crate) struct DataTransferItem {
@@ -34,10 +40,10 @@ pub(crate) struct DataTransferItem {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct PendingStringCallback {
     id: usize,
-    #[conditional_malloc_size_of]
-    callback: Rc<FunctionStringCallback>,
+    callback: TracedCallback<FunctionStringCallback>,
 }
 
 impl DataTransferItem {
@@ -57,10 +63,10 @@ impl DataTransferItem {
         data_store: Rc<RefCell<Option<DragDataStore>>>,
         id: u16,
     ) -> DomRoot<DataTransferItem> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(DataTransferItem::new_inherited(data_store, id)),
             global,
-            cx,
         )
     }
 
@@ -86,8 +92,8 @@ impl DataTransferItemMethods<crate::DomTypeHolder> for DataTransferItem {
     fn Kind(&self) -> DOMString {
         self.item_kind()
             .map_or(DOMString::new(), |item| match *item {
-                Kind::Text { .. } => DOMString::from("string"),
-                Kind::File { .. } => DOMString::from("file"),
+                Kind::Text { .. } => DOMString::from_static("string"),
+                Kind::File { .. } => DOMString::from_static("file"),
             })
     }
 
@@ -98,7 +104,7 @@ impl DataTransferItemMethods<crate::DomTypeHolder> for DataTransferItem {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-datatransferitem-getasstring>
-    fn GetAsString(&self, callback: Option<Rc<FunctionStringCallback>>) {
+    fn GetAsString(&self, callback: Option<RootedCallback<FunctionStringCallback>>) {
         // Step 1 If the callback is null, return.
         let Some(callback) = callback else {
             return;
@@ -112,8 +118,12 @@ impl DataTransferItemMethods<crate::DomTypeHolder> for DataTransferItem {
         // Step 3 If the drag data item kind is not text, then return.
         if let Some(string) = self.item_kind().and_then(|item| item.as_string()) {
             let id = self.next_callback.get();
-            let pending_callback = PendingStringCallback { id, callback };
-            self.pending_callbacks.borrow_mut().push(pending_callback);
+            self.pending_callbacks
+                .borrow_mut()
+                .push(PendingStringCallback {
+                    id,
+                    callback: callback.to_traced(),
+                });
 
             self.next_callback.set(id + 1);
             let this = Trusted::new(self);
@@ -124,9 +134,14 @@ impl DataTransferItemMethods<crate::DomTypeHolder> for DataTransferItem {
                 .task_manager()
                 .dom_manipulation_task_source()
                 .queue(task!(invoke_callback: move |cx| {
-                    let maybe_index = this.root().pending_callbacks.borrow().iter().position(|val| val.id == id);
+                    let this = this.root();
+                    let maybe_index = this.pending_callbacks.borrow().iter().position(|val| val.id == id);
                     if let Some(index) = maybe_index {
-                        let callback = this.root().pending_callbacks.borrow_mut().swap_remove(index).callback;
+                        rooted!(&in(cx) let callback = this
+                            .pending_callbacks
+                            .safe_borrow_mut(cx.no_gc())
+                            .swap_remove(index)
+                            .callback);
                         let _ = callback.Call__(cx, DOMString::from(string), ExceptionHandling::Report);
                     }
                 }));
@@ -143,7 +158,52 @@ impl DataTransferItemMethods<crate::DomTypeHolder> for DataTransferItem {
         // Step 2 If the drag data item kind is not File, then return null.
         // Step 3 Return a new File object representing the actual data
         // of the item represented by the DataTransferItem object.
-        self.item_kind()
-            .and_then(|item| item.as_file(cx, &self.global()))
+        self.item_kind()?.as_file(cx, &self.global())
+    }
+
+    /// <https://wicg.github.io/entries-api/#dom-datatransferitem-webkitgetasentry>
+    fn WebkitGetAsEntry(&self, cx: &mut JSContext) -> Option<DomRoot<FileSystemEntry>> {
+        // Step 1. Let store be this’s DataTransfer object’s drag data store.
+        // Step 2. If store’s drag data store mode is not read/write mode or read-only mode,
+        // return null and abort these steps.
+        if !self.can_read() {
+            return None;
+        }
+        let global = self.global();
+        // Step 3. Let item be the item in store’s drag data store item list that this represents.
+        // Step 4. If item’s kind is not `File`, then return null and abort these steps.
+        let file = self.item_kind()?.as_file(cx, &global)?;
+
+        // Step 5: Return a new FileSystemEntry object representing the entry.
+        let name = file.Name().to_string();
+
+        let file_entry = FileSystemFileEntry::new(
+            cx,
+            &global,
+            USVString::from(name.clone()),
+            USVString::from(format!("/{}", name)),
+            &file,
+        );
+
+        let root = FileSystemDirectoryEntry::new(
+            cx,
+            &global,
+            USVString::default(),
+            USVString::from(String::from("/")),
+        );
+
+        root.push_child(file_entry.upcast::<FileSystemEntry>());
+
+        let fs = FileSystem::new(
+            cx,
+            &global,
+            USVString::from(String::from("filesystem")),
+            &root,
+        );
+
+        root.set_filesystem(&fs);
+        file_entry.set_filesystem(&fs);
+
+        Some(DomRoot::upcast::<FileSystemEntry>(file_entry))
     }
 }

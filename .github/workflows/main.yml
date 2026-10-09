@@ -20,7 +20,7 @@ jobs:
     outputs:
       configuration: ${{ steps.configuration.outputs.result }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
           sparse-checkout: |
@@ -36,7 +36,7 @@ jobs:
         run: |
           {
             echo 'result<<EOF'
-            python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full macos bencher production-bencher coverage' || 'fail-fast full' }}
+            python ./python/servo/try_parser.py ${{ github.event_name == 'pull_request' && 'linux-unit-tests lint' || github.event_name == 'push' && 'full macos-arm-capi bencher production-bencher coverage' || 'fail-fast full' }}
             echo EOF
            } >> $GITHUB_OUTPUT
 
@@ -55,12 +55,14 @@ jobs:
       wpt: ${{ matrix.wpt }}
       profile: ${{ matrix.profile }}
       unit-tests: ${{ matrix.unit_tests }}
+      devtools-tests: ${{ matrix.devtools_tests }}
       build-libservo: ${{ matrix.build_libservo }}
       wpt-args: ${{ matrix.wpt_args }}
       build-args: ${{ matrix.build_args }}
       number-of-wpt-chunks: ${{ matrix.number_of_wpt_chunks }}
       bencher: ${{ matrix.bencher }}
       coverage: ${{ matrix.coverage }}
+      capi: ${{ matrix.capi }}
 
   build-result:
     name: Result

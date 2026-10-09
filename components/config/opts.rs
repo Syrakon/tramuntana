@@ -10,6 +10,7 @@ use std::default::Default;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use num_enum::TryFromPrimitive;
 use serde::{Deserialize, Serialize};
 use strum::{
     AsRefStr, Display as EnumDisplay, EnumCount, EnumIter, EnumMessage, EnumString,
@@ -74,6 +75,10 @@ pub struct Opts {
     /// Path to PEM encoded SSL CA certificate store.
     pub certificate_path: Option<String>,
 
+    /// Path to a hosts file (like `/etc/hosts`).
+    /// Ignored if the `HOST_FILE` environment variable is set.
+    pub host_file: Option<PathBuf>,
+
     /// Whether or not to completely ignore SSL certificate validation errors.
     /// TODO: We should see if we can eliminate the need for this by fixing
     /// <https://github.com/servo/servo/issues/30080>.
@@ -90,6 +95,7 @@ pub struct Opts {
 }
 
 /// The set of diagnostic options that can be enabled in Servo.
+#[repr(i32)]
 #[derive(
     AsRefStr,
     Copy,
@@ -101,6 +107,7 @@ pub struct Opts {
     EnumMessage,
     EnumString,
     PartialEq,
+    TryFromPrimitive,
 )]
 pub enum DiagnosticsLoggingOption {
     /// Log the DOM after each restyle
@@ -146,6 +153,10 @@ pub enum DiagnosticsLoggingOption {
     /// Log Progressive Web Metrics
     #[strum(to_string = "progressive-web-metrics")]
     ProgressiveWebMetrics,
+
+    /// Log the accessibility tree
+    #[strum(to_string = "accessibility-tree")]
+    AccessibilityTree,
 }
 
 impl DiagnosticsLoggingOption {
@@ -251,6 +262,7 @@ impl Default for Opts {
             temporary_storage: false,
             shaders_path: None,
             certificate_path: None,
+            host_file: None,
             ignore_certificate_errors: false,
             unminify_js: false,
             local_script_source: None,

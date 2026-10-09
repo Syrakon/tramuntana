@@ -16,23 +16,24 @@ path = "lib.rs"
 [features]
 glx = ["servo-media-gstreamer-render-unix/gl-x11"]
 wayland = ["servo-media-gstreamer-render-unix/gl-wayland"]
+v1_28 = ["gstreamer/v1_28"]
 
 [dependencies]
 byte-slice-cast = { workspace = true }
+data-url = { workspace = true }
 glib = { workspace = true }
 glib-sys = { workspace = true }
 gstreamer = { workspace = true }
 gstreamer-app = { workspace = true }
 gstreamer-audio = { workspace = true }
-gstreamer-video = { workspace = true }
 gstreamer-base = { workspace = true }
 gstreamer-play = { workspace = true }
-gstreamer-webrtc = { workspace = true }
 gstreamer-sdp = { workspace = true }
 gstreamer-sys = { workspace = true }
-ipc-channel = { workspace = true }
+gstreamer-video = { workspace = true }
+gstreamer-webrtc = { workspace = true }
 log = { workspace = true }
-mime = { workspace = true }
+servo-base = { workspace = true }
 servo-media = { workspace = true }
 servo-media-audio = { workspace = true }
 servo-media-gstreamer-render = { workspace = true }
@@ -49,3 +50,6 @@ servo-media-gstreamer-render-unix = { workspace = true, features = [
 
 [target.'cfg(target_os = "android")'.dependencies]
 servo-media-gstreamer-render-android = { workspace = true }
+
+[lints]
+workspace = true

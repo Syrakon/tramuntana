@@ -17,27 +17,23 @@ use pixels::{SharedSnapshot, Snapshot, SnapshotAlphaMode, SnapshotPixelFormat};
 use rustc_hash::FxHashMap;
 use servo_base::Epoch;
 use servo_base::generic_channel::GenericSender;
+use webgpu_traits::id::{
+    self, BufferId, CommandBufferId, CommandEncoderId, DeviceId, QueueId, TextureId,
+};
 use webgpu_traits::{
-    ContextConfiguration, PRESENTATION_BUFFER_COUNT, PendingTexture, WebGPUContextId, WebGPUMsg,
+    BufferDescriptor, BufferUsages, CommandBufferDescriptor, CommandEncoderDescriptor,
+    ContextConfiguration, Extent3d, HostMap, Origin3d, PRESENTATION_BUFFER_COUNT, PendingTexture,
+    TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
+    WebGPUContextId, WebGPUMsg,
 };
 use webrender_api::units::DeviceIntSize;
 use webrender_api::{
     ExternalImageData, ExternalImageId, ExternalImageType, ImageDescriptor, ImageDescriptorFlags,
     ImageFormat, ImageKey,
 };
-use wgpu_core::device::HostMap;
 use wgpu_core::global::Global;
-use wgpu_core::id::{
-    self, BufferId, CommandBufferId, CommandEncoderId, DeviceId, QueueId, TextureId,
-};
-use wgpu_core::resource::{
-    BufferAccessError, BufferDescriptor, BufferMapOperation, CreateBufferError,
-};
-use wgpu_types::{
-    BufferUsages, COPY_BYTES_PER_ROW_ALIGNMENT, CommandBufferDescriptor, CommandEncoderDescriptor,
-    Extent3d, Origin3d, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo,
-    TextureAspect,
-};
+use wgpu_core::resource::{BufferAccessError, BufferMapOperation, CreateBufferError};
+use wgpu_types::COPY_BYTES_PER_ROW_ALIGNMENT;
 
 pub type WebGpuExternalImageMap = Arc<Mutex<FxHashMap<WebGPUContextId, ContextData>>>;
 
@@ -194,6 +190,7 @@ impl StagingBuffer {
         &mut self,
         texture_id: TextureId,
         encoder_id: CommandEncoderId,
+        command_buffer_id: CommandBufferId,
         config: &ContextConfiguration,
     ) -> Result<CommandBufferId, Box<dyn std::error::Error>> {
         self.ensure_available(config)?;
@@ -235,10 +232,12 @@ impl StagingBuffer {
             &buffer_info,
             &copy_size,
         )?;
-        let (command_buffer_id, error) = self
-            .global
-            .command_encoder_finish(encoder_id, &CommandBufferDescriptor::default());
-        if let Some(error) = error {
+        let (command_buffer_id, error) = self.global.command_encoder_finish(
+            encoder_id,
+            &CommandBufferDescriptor::default(),
+            Some(command_buffer_id),
+        );
+        if let Some((_, error)) = error {
             return Err(error.into());
         };
         Ok(command_buffer_id)
@@ -572,6 +571,7 @@ impl crate::WGPU {
         if let Some(PendingTexture {
             texture_id,
             encoder_id,
+            command_buffer_id,
             configuration,
         }) = pending_texture
         {
@@ -591,6 +591,7 @@ impl crate::WGPU {
             self.texture_download(
                 texture_id,
                 encoder_id,
+                command_buffer_id,
                 staging_buffer,
                 configuration,
                 move |staging_buffer| {
@@ -651,6 +652,7 @@ impl crate::WGPU {
         let Some(PendingTexture {
             texture_id,
             encoder_id,
+            command_buffer_id,
             configuration,
         }) = pending_texture
         else {
@@ -687,6 +689,7 @@ impl crate::WGPU {
         self.texture_download(
             texture_id,
             encoder_id,
+            command_buffer_id,
             staging_buffer,
             configuration,
             move |staging_buffer| {
@@ -722,13 +725,17 @@ impl crate::WGPU {
         &self,
         texture_id: TextureId,
         encoder_id: CommandEncoderId,
+        command_buffer_id: CommandBufferId,
         mut staging_buffer: StagingBuffer,
         config: ContextConfiguration,
         callback: impl FnOnce(StagingBuffer) + Send + 'static,
     ) {
-        let Ok(command_buffer_id) =
-            staging_buffer.prepare_load_texture_command_buffer(texture_id, encoder_id, &config)
-        else {
+        let Ok(command_buffer_id) = staging_buffer.prepare_load_texture_command_buffer(
+            texture_id,
+            encoder_id,
+            command_buffer_id,
+            &config,
+        ) else {
             return callback(staging_buffer);
         };
         let StagingBufferState::Available(buffer) = &staging_buffer.state else {

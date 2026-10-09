@@ -17,7 +17,6 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::HashMapTracedValues;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct StylePropertyMapReadOnly {
@@ -37,9 +36,9 @@ impl StylePropertyMapReadOnly {
     }
 
     pub(crate) fn from_iter<Entries>(
+        cx: &mut js::context::JSContext,
         global: &GlobalScope,
         entries: Entries,
-        can_gc: CanGc,
     ) -> DomRoot<StylePropertyMapReadOnly>
     where
         Entries: IntoIterator<Item = (Atom, String)>,
@@ -51,15 +50,15 @@ impl StylePropertyMapReadOnly {
         keys.reserve(lo);
         values.reserve(lo);
         for (key, value) in iter {
-            let value = CSSStyleValue::new(global, value, can_gc);
+            let value = CSSStyleValue::new(cx, global, value);
             keys.push(key);
             values.push(Dom::from_ref(&*value));
         }
         let iter = keys.into_iter().zip(values.iter().cloned());
         reflect_dom_object(
+            cx,
             Box::new(StylePropertyMapReadOnly::new_inherited(iter)),
             global,
-            can_gc,
         )
     }
 }

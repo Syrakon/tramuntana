@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::os::raw::{c_char, c_int, c_void};
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
@@ -26,12 +27,12 @@ use raw_window_handle::{
 pub use servo::MediaSessionPlaybackState;
 use servo::{
     self, DevicePixel, EventLoopWaker, InputMethodControl, LoadStatus, MediaSessionActionType,
-    MouseButton, PrefValue,
+    SelectElement, WebViewId,
 };
 
 use super::app::{App, AppInitOptions};
 use super::host_trait::HostTrait;
-use crate::prefs::{ArgumentParsingResult, EXPERIMENTAL_PREFS, parse_command_line_arguments};
+use crate::prefs::{ArgumentParsingResult, parse_command_line_arguments};
 
 thread_local! {
     pub static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
@@ -41,17 +42,6 @@ static CALLBACK_OBJECT: OnceLock<Global<JObject<'static>>> = OnceLock::new();
 
 fn callback_ref() -> &'static JObject<'static> {
     CALLBACK_OBJECT.get().expect("Servo init failed").as_ref()
-}
-
-struct InitOptions {
-    args: Vec<String>,
-    url: Option<String>,
-    viewport_rect: Rect<i32, DevicePixel>,
-    density: f32,
-    #[cfg(feature = "webxr")]
-    xr_discovery: Option<servo::webxr::Discovery>,
-    window_handle: RawWindowHandle,
-    display_handle: RawDisplayHandle,
 }
 
 struct HostCallbacks {
@@ -81,64 +71,81 @@ where
     });
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_version<'local>(
-    mut env: EnvUnowned<'local>,
-    _class: JClass<'local>,
-) -> JString<'local> {
-    let version = crate::VERSION;
-    env.with_env(|env| -> jni::errors::Result<_> { env.new_string(version) })
-        .resolve::<ThrowRuntimeExAndDefault>()
-}
-
 /// Initialize Servo. At that point, we need a valid GL context. In the future, this will
 /// be done in multiple steps.
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
-    _activity: JObject<'local>,
-    opts: JObject<'local>,
+    context: JObject<'local>,
+    args: JString<'local>,
+    url: JString<'local>,
+    logStr: JString<'local>,
+    experimental_mode: jboolean,
     callbacks_obj: JObject<'local>,
-    surface: JObject<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<_> {
-        let (init_opts, log, log_str, _gst_debug_str) = get_options(env, &opts, &surface)?;
+        let args = JString::cast_local(env, args)?.try_to_string(env).ok();
+        let url = JString::cast_local(env, url)?.try_to_string(env).ok();
+        let log_str = JString::cast_local(env, logStr)?.try_to_string(env).ok();
 
-        if log {
-            // Note: Android debug logs are stripped from a release build.
-            // debug!() will only show in a debug build. Use info!() if logs
-            // should show up in adb logcat with a release build.
-            let filters = [
-                "servo",
-                "servoshell",
-                "servoshell::egl:gl_glue",
-                // Show redirected stdout / stderr by default
-                "servoshell::egl::log",
-                // Show JS errors by default.
-                "script::dom::bindings::error",
-                // Show GL errors by default.
-                "servo_canvas::webgl_thread",
-                "paint::paint",
-                "servo_constellation::constellation",
-            ];
-            let mut filter_builder = FilterBuilder::new();
-            for &module in &filters {
+        let mut args: Vec<String> = args
+            .and_then(|args| {
+                serde_json::from_str(&args)
+                    .inspect_err(|_| {
+                        error!(
+                            "Invalid arguments. Servo arguments must be formatted as a JSON array"
+                        )
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
+
+        if experimental_mode {
+            args.push("--enable-experimental-web-platform-features".to_owned());
+        }
+
+        // Note: Android debug logs are stripped from a release build.
+        // debug!() will only show in a debug build. Use info!() if logs
+        // should show up in adb logcat with a release build.
+        let filters = [
+            "servo",
+            "servoshell",
+            "servoshell::egl:gl_glue",
+            // Show redirected stdout / stderr by default
+            "servoshell::egl::log",
+            // Show JS errors by default.
+            "script::dom::bindings::error",
+            // Show GL errors by default.
+            "servo_canvas::webgl_thread",
+            "paint::paint",
+            "servo_constellation::constellation",
+        ];
+        let mut filter_builder = FilterBuilder::new();
+        for &module in &filters {
+            filter_builder.filter_module(module, log::LevelFilter::Debug);
+        }
+        if let Some(log_str) = log_str {
+            for module in log_str.split(',') {
                 filter_builder.filter_module(module, log::LevelFilter::Debug);
             }
-            if let Some(log_str) = log_str {
-                for module in log_str.split(',') {
-                    filter_builder.filter_module(module, log::LevelFilter::Debug);
-                }
-            }
-
-            android_logger::init_once(
-                Config::default()
-                    .with_max_level(log::LevelFilter::Debug)
-                    .with_filter(filter_builder.build())
-                    .with_tag("servoshell"),
-            )
         }
+
+        android_logger::init_once(
+            Config::default()
+                .with_max_level(log::LevelFilter::Debug)
+                .with_filter(filter_builder.build())
+                .with_tag("servoshell"),
+        );
+
+        // In production mode we don't redirect stdout / stderr, so any
+        // panic messages would be lost without this hook.
+        std::panic::set_hook(Box::new(|info| {
+            let current_thread = std::thread::current();
+            let thread_name = current_thread.name().unwrap_or("<unnamed>");
+            error!("Panic in Rust code (thread: {thread_name}):");
+            error!("{info}");
+        }));
 
         info!("init");
 
@@ -162,8 +169,12 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
 
         crate::init_crypto();
 
+        if let Err(error) = set_default_config_dir(env, &context) {
+            error!("Failed to determine Android config directory: {error:?}");
+        }
+
         let (opts, mut preferences, servoshell_preferences) =
-            match parse_command_line_arguments(init_opts.args.as_slice()) {
+            match parse_command_line_arguments(args.as_slice()) {
                 ArgumentParsingResult::ContentProcess(..) => {
                     unreachable!("Android does not have support for multiprocess yet.")
                 },
@@ -180,34 +191,57 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
 
         crate::init_tracing(servoshell_preferences.tracing_filter.as_deref());
 
-        let (display_handle, window_handle) = unsafe {
-            (
-                DisplayHandle::borrow_raw(init_opts.display_handle),
-                WindowHandle::borrow_raw(init_opts.window_handle),
-            )
-        };
-
-        let hidpi_scale_factor = Scale::new(init_opts.density);
-
         APP.with(|app| {
             let new_app = App::new(AppInitOptions {
                 host,
                 event_loop_waker,
-                initial_url: init_opts.url,
+                initial_url: url,
                 opts,
                 preferences,
                 servoshell_preferences,
                 #[cfg(feature = "webxr")]
-                xr_discovery: init_opts.xr_discovery,
+                xr_discovery: None,
             });
-            new_app.add_platform_window(
+            *app.borrow_mut() = Some(new_app);
+        });
+        Ok(())
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_org_servo_servoview_JNIServo_addPlatformWindow<'local>(
+    mut env: EnvUnowned<'local>,
+    _: JClass<'local>,
+    size: JObject<'local>,
+    density: jfloat,
+    surface: JObject<'local>,
+) {
+    env.with_env(|env| -> jni::errors::Result<_> {
+        let viewport_rect = jni_coordinate_to_rust_viewport_rect(env, &size)?;
+
+        let (display_handle, window_handle) = display_and_window_handle(env, &surface);
+
+        let (display_handle, window_handle) = unsafe {
+            (
+                DisplayHandle::borrow_raw(display_handle),
+                WindowHandle::borrow_raw(window_handle),
+            )
+        };
+
+        call(env, |app| {
+            let hidpi_scale_factor = Scale::new(
+                app.servoshell_preferences()
+                    .device_pixel_ratio_override
+                    .unwrap_or(density),
+            );
+            app.add_platform_window(
                 display_handle,
                 window_handle,
-                init_opts.viewport_rect,
+                viewport_rect,
                 hidpi_scale_factor,
                 None,
-            );
-            *app.borrow_mut() = Some(new_app);
+            )
         });
         Ok(())
     })
@@ -223,9 +257,7 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_setExperimentalMode<'local>(
     debug!("setExperimentalMode {enable}");
     env.with_env(|env| -> jni::errors::Result<_> {
         call(env, |s| {
-            for pref in EXPERIMENTAL_PREFS {
-                s.servo().set_preference(pref, PrefValue::Bool(enable));
-            }
+            s.state.set_experimental_preferences_enabled(enable)
         });
         Ok(())
     })
@@ -236,10 +268,10 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_setExperimentalMode<'local>(
 pub extern "C" fn Java_org_servo_servoview_JNIServo_resize<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
-    coordinates: JObject<'local>,
+    size: JObject<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<_> {
-        let viewport_rect = jni_coordinate_to_rust_viewport_rect(env, &coordinates)?;
+        let viewport_rect = jni_coordinate_to_rust_viewport_rect(env, &size)?;
         debug!("resize {viewport_rect:#?}");
         call(env, |s| s.resize(viewport_rect));
         Ok(())
@@ -321,23 +353,6 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_goForward<'local>(
     env.with_env(|env| -> jni::errors::Result<_> {
         debug!("goForward");
         call(env, |s| s.go_forward());
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_scroll<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    dx: jint,
-    dy: jint,
-    x: jint,
-    y: jint,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("scroll");
-        call(env, |s| s.scroll(dx as f32, dy as f32, x as f32, y as f32));
         Ok(())
     })
     .resolve::<ThrowRuntimeExAndDefault>()
@@ -503,72 +518,6 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_touchCancel<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoomStart<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    factor: jfloat,
-    x: jfloat,
-    y: jfloat,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("pinchZoomStart");
-        call(env, |s| s.pinchzoom_start(factor, x, y));
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoom<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    factor: jfloat,
-    x: jfloat,
-    y: jfloat,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("pinchZoom");
-        call(env, |s| s.pinchzoom(factor, x, y));
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_pinchZoomEnd<'local>(
-    mut env: EnvUnowned<'local>,
-    _: JClass<'local>,
-    factor: jfloat,
-    x: jfloat,
-    y: jfloat,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("pinchZoomEnd");
-        call(env, |s| s.pinchzoom_end(factor, x, y));
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn Java_org_servo_servoview_JNIServo_click(
-    mut env: EnvUnowned,
-    _: JClass,
-    x: jfloat,
-    y: jfloat,
-) {
-    env.with_env(|env| -> jni::errors::Result<_> {
-        debug!("click");
-        call(env, |s| {
-            s.mouse_down(x, y, MouseButton::Left);
-            s.mouse_up(x, y, MouseButton::Left);
-        });
-        Ok(())
-    })
-    .resolve::<ThrowRuntimeExAndDefault>()
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn Java_org_servo_servoview_JNIServo_pausePainting(
     mut env: EnvUnowned,
     _: JClass<'_>,
@@ -586,11 +535,11 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_resumePainting<'local>(
     mut env: EnvUnowned<'local>,
     _: JClass<'local>,
     surface: JObject<'local>,
-    coordinates: JObject<'local>,
+    size: JObject<'local>,
 ) {
     env.with_env(|env| -> jni::errors::Result<_> {
         debug!("resumePainting");
-        let viewport_rect = jni_coordinate_to_rust_viewport_rect(env, &coordinates)?;
+        let viewport_rect = jni_coordinate_to_rust_viewport_rect(env, &size)?;
         let (_, window_handle) = display_and_window_handle(env, &surface);
 
         call(env, |s| {
@@ -854,6 +803,8 @@ impl HostTrait for HostCallbacks {
             .unwrap();
     }
 
+    fn on_show_select_element(&self, _webview_id: WebViewId, _prompt: SelectElement) {}
+
     fn on_panic(&self, _reason: String, _backtrace: Option<String>) {}
 }
 
@@ -886,86 +837,49 @@ fn new_string_as_jvalue<'local>(
 
 fn jni_coordinate_to_rust_viewport_rect<'local>(
     env: &mut Env<'local>,
-    obj: &JObject<'local>,
+    size: &JObject<'local>,
 ) -> Result<Rect<i32, DevicePixel>, Error> {
-    let x = env.get_field(obj, jni_str!("x"), jni_sig!("I"))?.i()?;
-    let y = env.get_field(obj, jni_str!("y"), jni_sig!("I"))?.i()?;
+    let width = env
+        .call_method(size, jni_str!("getWidth"), jni_sig!("()I"), &[])?
+        .i()?;
+    let height = env
+        .call_method(size, jni_str!("getHeight"), jni_sig!("()I"), &[])?
+        .i()?;
 
-    let width = env.get_field(obj, jni_str!("width"), jni_sig!("I"))?.i()?;
-    let height = env.get_field(obj, jni_str!("height"), jni_sig!("I"))?.i()?;
-
-    Ok(Rect::new(Point2D::new(x, y), Size2D::new(width, height)))
+    Ok(Rect::new(Point2D::origin(), Size2D::new(width, height)))
 }
 
-fn get_field_as_string<'local>(
+fn set_default_config_dir<'local>(
     env: &mut Env<'local>,
-    obj: &JObject<'local>,
-    field: &JNIStr,
-) -> Result<String, Error> {
-    let string_value = env
-        .get_field(obj, field, jni_sig!("Ljava/lang/String;"))?
-        .l()?;
-    JString::cast_local(env, string_value)?.try_to_string(env)
-}
-
-fn get_options<'local>(
-    env: &mut Env<'local>,
-    opts: &JObject<'local>,
-    surface: &JObject<'local>,
-) -> Result<(InitOptions, bool, Option<String>, Option<String>), Error> {
-    let args = get_field_as_string(env, opts, jni_str!("args")).ok();
-    let url = get_field_as_string(env, opts, jni_str!("url")).ok();
-    let log_str = get_field_as_string(env, opts, jni_str!("logStr")).ok();
-    let gst_debug_str = get_field_as_string(env, opts, jni_str!("gstDebugStr")).ok();
-
-    let experimental_mode = env
-        .get_field(opts, jni_str!("experimentalMode"), jni_sig!("Z"))?
-        .z()?;
-
-    let density = env
-        .get_field(opts, jni_str!("density"), jni_sig!("F"))?
-        .f()?;
-
-    let log = env
-        .get_field(opts, jni_str!("enableLogs"), jni_sig!("Z"))?
-        .z()?;
-
-    let coordinates = env
-        .get_field(
-            opts,
-            jni_str!("coordinates"),
-            jni_sig!("Lorg/servo/servoview/JNIServo$ServoCoordinates;"),
+    context: &JObject<'local>,
+) -> Result<(), Error> {
+    let files_dir = env
+        .call_method(
+            context,
+            jni_str!("getFilesDir"),
+            jni_sig!("()Ljava/io/File;"),
+            &[],
         )?
         .l()?;
+    let path = env
+        .call_method(
+            &files_dir,
+            jni_str!("getAbsolutePath"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )?
+        .l()?;
+    let path = JString::cast_local(env, path)?.try_to_string(env)?;
 
-    let viewport_rect = jni_coordinate_to_rust_viewport_rect(env, &coordinates)?;
-
-    let mut args: Vec<String> = args
-        .and_then(|args| {
-            serde_json::from_str(&args)
-                .inspect_err(|_| {
-                    error!("Invalid arguments. Servo arguments must be formatted as a JSON array")
-                })
-                .ok()
-        })
-        .unwrap_or_default();
-
-    if experimental_mode {
-        args.push("--enable-experimental-web-platform-features".to_owned());
+    let config_dir = PathBuf::from(path).join("servo");
+    if let Err(error) = std::fs::create_dir_all(&config_dir) {
+        error!("Failed to create config directory at {config_dir:?}: {error:?}");
     }
-
-    let (display_handle, window_handle) = display_and_window_handle(env, surface);
-    let opts = InitOptions {
-        args,
-        url,
-        viewport_rect,
-        density,
-        xr_discovery: None,
-        window_handle,
-        display_handle,
-    };
-
-    Ok((opts, log, log_str, gst_debug_str))
+    debug!("Default config dir: {config_dir:?}");
+    let _ = crate::prefs::DEFAULT_CONFIG_DIR
+        .set(config_dir)
+        .inspect_err(|path| warn!("Default config dir was already set to {path:?}"));
+    Ok(())
 }
 
 fn display_and_window_handle(

@@ -178,17 +178,13 @@ class PackageCommands(CommandBase):
             # Inform the android build of where `libservoshell.so` is located.
             env["SERVO_TARGET_DIR"] = target_dir
 
-            flavor_name = "Basic"
-            if flavor is not None:
-                flavor_name = flavor.title()
-
-            dir_to_resources = path.join(self.get_top_dir(), "target", "android", "resources")
+            dir_to_resources = path.join(self.get_top_dir(), "target", target_triple, "resources")
             if path.exists(dir_to_resources):
                 delete(dir_to_resources)
 
             copy_packaged_resources(dir_to_root, dir_to_resources)
 
-            variant = ":assemble" + flavor_name + arch_string + build_type_string
+            variant = ":assemble" + arch_string + build_type_string
             apk_task_name = ":servoapp" + variant
             aar_task_name = ":servoview" + variant
             argv = ["./gradlew", "--no-daemon", apk_task_name, aar_task_name]
@@ -261,9 +257,15 @@ class PackageCommands(CommandBase):
             ohos_libs_dir = path.join(ohos_target_dir, "entry", "libs", abi_string)
             os.makedirs(ohos_libs_dir)
             # The libservoshell.so binary that was built needs to be copied
-            # into the app folder heirarchy where hvigor expects it.
+            # into the app folder hierarchy where hvigor expects it.
             print(f"Copying {binary_path} to {ohos_libs_dir}")
             shutil.copy(binary_path, ohos_libs_dir)
+            # This includes `libc++` and in the future also potentially sanitizer libraries
+            # and maybe could also include shared library dependencies from our build, if
+            # we support building some dependencies as shared libraries in the future.
+            for runtime_library in self.target.runtime_libraries():
+                print(f"Copying {runtime_library} to {ohos_libs_dir}")
+                shutil.copy(runtime_library, ohos_libs_dir)
             try:
                 with cd(ohos_target_dir):
                     print("Calling", hvigor_command)
@@ -371,23 +373,46 @@ class PackageCommands(CommandBase):
                 template.render(exe_path=target_dir, dir_to_temp=dir_to_temp, resources_path=dir_to_resources)
             )
 
-            # run candle and light
+            # NOTE: `-acceptEula` below is accepting the conditions of WiX's
+            # Open Source Maintenance Fee. Servo is exempt per this clause in
+            # version 1.1 of the text, see https://github.com/wixtoolset/wix/blob/c5b1c40cd44145a24cb82349d988e7abdd0b94d5/OSMFEULA.txt
+            # > The Fee applies only to Users that use the Software as part of
+            # > revenue-generating activities and have an annual gross revenue
+            # > greater than or equal to US$10,000.
+
+            # Create the MSI installer.
             print("Creating MSI")
             try:
                 with cd(dir_to_msi):
-                    subprocess.check_call(["candle", wxs_path])
+                    subprocess.check_call(["wix", "build", "-arch", "x64", "-acceptEula", "wix7", wxs_path])
             except subprocess.CalledProcessError as e:
-                print("WiX candle exited with return value %d" % e.returncode)
-                return e.returncode
-            try:
-                wxsobj_path = "{}.wixobj".format(path.splitext(wxs_path)[0])
-                with cd(dir_to_msi):
-                    subprocess.check_call(["light", wxsobj_path])
-            except subprocess.CalledProcessError as e:
-                print("WiX light exited with return value %d" % e.returncode)
+                print("WiX build exited with return value %d" % e.returncode)
                 return e.returncode
             dir_to_installer = path.join(dir_to_msi, "Installer.msi")
             print("Packaged Servo into " + dir_to_installer)
+
+            # Register the WiX extension used by the bundle below. The extension is fetched
+            # from NuGet and cached under %USERPROFILE%\.wix\extensions. Pin the version to
+            # match the WiX toolset so the cache can be pre-populated on offline runners.
+            print("Registering WiX extensions")
+            extension = "WixToolset.BootstrapperApplications.wixext/7.0.0"
+            result = subprocess.run(
+                ["wix", "extension", "add", "-acceptEula", "wix7", "-g", extension],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                # `wix extension add` fails silently (exit code 2 with no output) when the
+                # extension cannot be resolved from NuGet.
+                print(result.stdout)
+                print(result.stderr)
+                print(
+                    f"WiX extension add exited with return value {result.returncode}. "
+                    f"The extension '{extension}' could not be added to the cache, most likely "
+                    "because it could not be downloaded from NuGet. Ensure the runner can reach "
+                    "nuget.org, or pre-populate the WiX extension cache (%USERPROFILE%\\.wix\\extensions)."
+                )
+                return result.returncode
 
             # Generate bundle with Servo installer.
             print("Creating bundle")
@@ -395,16 +420,19 @@ class PackageCommands(CommandBase):
             bundle_wxs_path = path.join(dir_to_msi, "ServoShell.wxs")
             try:
                 with cd(dir_to_msi):
-                    subprocess.check_call(["candle", bundle_wxs_path, "-ext", "WixBalExtension"])
+                    subprocess.check_call(
+                        [
+                            "wix",
+                            "build",
+                            "-acceptEula",
+                            "wix7",
+                            "-ext",
+                            "WixToolset.BootstrapperApplications.wixext",
+                            bundle_wxs_path,
+                        ]
+                    )
             except subprocess.CalledProcessError as e:
-                print("WiX candle exited with return value %d" % e.returncode)
-                return e.returncode
-            try:
-                wxsobj_path = "{}.wixobj".format(path.splitext(bundle_wxs_path)[0])
-                with cd(dir_to_msi):
-                    subprocess.check_call(["light", wxsobj_path, "-ext", "WixBalExtension"])
-            except subprocess.CalledProcessError as e:
-                print("WiX light exited with return value %d" % e.returncode)
+                print("WiX build exited with return value %d" % e.returncode)
                 return e.returncode
             print("Packaged Servo into " + path.join(dir_to_msi, "ServoShell.exe"))
 
@@ -549,7 +577,7 @@ class PackageCommands(CommandBase):
 
         replacements = {
             "ports/servoshell/platform/windows/servoshell.exe.manifest": r'assemblyIdentity[^\/>]+version="(?P<version>.*?).0\"[^\/>]*\/>',
-            "support/windows/ServoShell.wxs.mako": r'<Product(.|\n)*Version="(?P<version>.*?)".*>',
+            "support/windows/servoshell.wxs.mako": r'<Package(?:.|\n)*?\sVersion="(?P<version>[^"]*)"',
             "ports/servoshell/platform/macos/Info.plist": r"<key>CFBundleShortVersionString</key>\n\s*<string>(?P<version>.*?)</string>",
             "support/android/apk/servoapp/build.gradle.kts": r'versionName\s*=\s*"(?P<version>.*?)"',
             "support/openharmony/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',

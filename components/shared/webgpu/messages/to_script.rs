@@ -6,13 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 use servo_base::id::PipelineId;
-use wgpu_core::id::{
-    AdapterId, BindGroupId, BindGroupLayoutId, BufferId, CommandBufferId, ComputePassEncoderId,
-    ComputePipelineId, DeviceId, PipelineLayoutId, QuerySetId, RenderBundleId, RenderPassEncoderId,
-    RenderPipelineId, SamplerId, ShaderModuleId, StagingBufferId, SurfaceId, TextureId,
-    TextureViewId,
-};
 
+use crate::id::{
+    AdapterId, BindGroupId, BindGroupLayoutId, BufferId, CommandBufferId, CommandEncoderId,
+    ComputePassEncoderId, ComputePipelineId, DeviceId, ExternalTextureId, PipelineLayoutId,
+    QuerySetId, RenderBundleEncoderId, RenderBundleId, RenderPassEncoderId, RenderPipelineId,
+    SamplerId, ShaderModuleId, TextureId, TextureViewId,
+};
 use crate::{DeviceLostReason, Error, WebGPUDevice};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -28,17 +28,18 @@ pub enum WebGPUMsg {
     FreeRenderPipeline(RenderPipelineId),
     FreeBindGroup(BindGroupId),
     FreeBindGroupLayout(BindGroupLayoutId),
+    FreeCommandEncoder(CommandEncoderId),
     FreeCommandBuffer(CommandBufferId),
     FreeTexture(TextureId),
     FreeTextureView(TextureViewId),
     FreeSampler(SamplerId),
-    FreeSurface(SurfaceId),
     FreeShaderModule(ShaderModuleId),
     FreeRenderBundle(RenderBundleId),
-    FreeStagingBuffer(StagingBufferId),
     FreeQuerySet(QuerySetId),
     FreeComputePass(ComputePassEncoderId),
     FreeRenderPass(RenderPassEncoderId),
+    FreeExternalTexture(ExternalTextureId),
+    FreeRenderBundleEncoder(RenderBundleEncoderId),
     UncapturedError {
         device: WebGPUDevice,
         pipeline_id: PipelineId,

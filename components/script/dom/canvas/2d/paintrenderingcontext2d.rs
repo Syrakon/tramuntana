@@ -19,7 +19,10 @@ use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::DOMMatrixBinding::DOMMatrix2DInit;
 use crate::dom::bindings::codegen::Bindings::PaintRenderingContext2DBinding::PaintRenderingContext2DMethods;
-use crate::dom::bindings::codegen::UnionTypes::StringOrCanvasGradientOrCanvasPattern;
+use crate::dom::bindings::codegen::UnionTypes::{
+    StringOrCanvasGradientOrCanvasPattern,
+    UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
+};
 use crate::dom::bindings::error::{ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
@@ -31,7 +34,6 @@ use crate::dom::canvaspattern::CanvasPattern;
 use crate::dom::dommatrix::DOMMatrix;
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
 use crate::dom::path2d::Path2D;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct PaintRenderingContext2D {
@@ -62,13 +64,13 @@ impl PaintRenderingContext2D {
 
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &PaintWorkletGlobalScope,
-        can_gc: CanGc,
     ) -> Option<DomRoot<PaintRenderingContext2D>> {
         Some(reflect_dom_object(
+            cx,
             Box::new(PaintRenderingContext2D::new_inherited(global)?),
             global,
-            can_gc,
         ))
     }
 
@@ -299,6 +301,18 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-rect>
     fn Rect(&self, x: f64, y: f64, width: f64, height: f64) {
         self.canvas_state.rect(x, y, width, height)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-roundrect>
+    fn RoundRect(
+        &self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        radii: UnrestrictedDoubleOrDOMPointInitOrUnrestrictedDoubleOrDOMPointInitSequence,
+    ) -> ErrorResult {
+        self.canvas_state.round_rect(x, y, width, height, radii)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-quadraticcurveto>

@@ -16,14 +16,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_tungstenite::WebSocketStream;
 use async_tungstenite::tokio::{ConnectStream, client_async_tls_with_connector_and_config};
-use base64::Engine;
 use futures::stream::StreamExt;
+use headers::{
+    Authorization, Connection, HeaderMapExt, SecWebsocketKey, SecWebsocketVersion, Upgrade,
+};
 use http::HeaderMap;
 use http::header::{self, HeaderName, HeaderValue};
-use ipc_channel::ipc::IpcSender;
 use log::{debug, trace, warn};
 use net_traits::request::{RequestBuilder, RequestMode};
 use net_traits::{CookieSource, MessageData, WebSocketDomAction, WebSocketNetworkEvent};
+use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
 use servo_base::generic_channel::CallbackSetter;
 use servo_url::ServoUrl;
 use tokio::net::TcpStream;
@@ -55,7 +57,7 @@ pub fn create_handshake_request(
     let mut headers = HeaderMap::new();
     headers.insert(
         "Origin",
-        HeaderValue::from_str(&request.url.origin().ascii_serialization())?,
+        HeaderValue::from_str(request.url.origin().ascii_serialization().as_ref())?,
     );
 
     let host = format!(
@@ -65,22 +67,25 @@ pub fn create_handshake_request(
             .ok_or_else(|| Error::Url(UrlError::NoHostName))?
     );
     headers.insert("Host", HeaderValue::from_str(&host)?);
+
     // https://websockets.spec.whatwg.org/#concept-websocket-establish
     // 3. Append (`Upgrade`, `websocket`) to request’s header list.
-    headers.insert("Upgrade", HeaderValue::from_static("websocket"));
+    headers.typed_insert(Upgrade::websocket());
 
     // 4. Append (`Connection`, `Upgrade`) to request’s header list.
-    headers.insert("Connection", HeaderValue::from_static("upgrade"));
+    headers.typed_insert(Connection::upgrade());
 
     // 5. Let keyValue be a nonce consisting of a randomly selected 16-byte value that has been
     // forgiving-base64-encoded and isomorphic encoded.
-    let key = HeaderValue::from_str(&tungstenite::handshake::client::generate_key()).unwrap();
+    let mut nonce: [u8; 16] = [0; 16];
+    rand::fill(&mut nonce);
+    let sec_websocket_key_header: SecWebsocketKey = nonce.into();
 
     // 6. Append (`Sec-WebSocket-Key`, keyValue) to request’s header list.
-    headers.insert("Sec-WebSocket-Key", key);
+    headers.typed_insert(sec_websocket_key_header);
 
     // 7. Append (`Sec-WebSocket-Version`, `13`) to request’s header list.
-    headers.insert("Sec-Websocket-Version", HeaderValue::from_static("13"));
+    headers.typed_insert(SecWebsocketVersion::V13);
 
     // 8. For each protocol in protocols, combine (`Sec-WebSocket-Protocol`, protocol) in request’s
     // header list.
@@ -103,15 +108,10 @@ pub fn create_handshake_request(
     }
 
     if request.url.password().is_some() || request.url.username() != "" {
-        let basic = base64::engine::general_purpose::STANDARD.encode(format!(
-            "{}:{}",
+        headers.typed_insert(Authorization::basic(
             request.url.username(),
-            request.url.password().unwrap_or("")
+            request.url.password().unwrap_or(""),
         ));
-        headers.insert(
-            "Authorization",
-            HeaderValue::from_str(&format!("Basic {}", basic))?,
-        );
     }
     Ok(request.headers(headers).build())
 }
@@ -210,7 +210,7 @@ fn setup_dom_listener(
 /// on the WS tokio runtime.
 async fn run_ws_loop(
     mut dom_receiver: UnboundedReceiver<DomMsg>,
-    resource_event_sender: IpcSender<WebSocketNetworkEvent>,
+    resource_event_sender: ProfileGenericCallback<WebSocketNetworkEvent>,
     mut stream: WebSocketStream<ConnectStream>,
 ) {
     loop {
@@ -304,7 +304,7 @@ async fn run_ws_loop(
 /// listening loop will be started.
 pub(crate) async fn start_websocket(
     http_state: Arc<HttpState>,
-    resource_event_sender: IpcSender<WebSocketNetworkEvent>,
+    resource_event_sender: ProfileGenericCallback<WebSocketNetworkEvent>,
     protocols: &[String],
     client: &net_traits::request::Request,
     tls_config: TlsConfig,

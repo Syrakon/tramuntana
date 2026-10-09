@@ -11,6 +11,11 @@ use std::rc::Rc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use euclid::Rect;
+#[cfg(all(
+    feature = "gamepad",
+    not(any(target_os = "android", target_env = "ohos"))
+))]
+use gilrs::Event;
 use image::{DynamicImage, ImageFormat, RgbaImage};
 #[cfg(all(
     any(coverage, llvm_pgo),
@@ -18,6 +23,11 @@ use image::{DynamicImage, ImageFormat, RgbaImage};
 ))]
 use libc::c_char;
 use log::{error, info, warn};
+#[cfg(all(
+    feature = "gamepad",
+    not(any(target_os = "android", target_env = "ohos"))
+))]
+use servo::GamepadIndex;
 use servo::{
     AllowOrDenyRequest, AuthenticationRequest, BluetoothDeviceSelectionRequest, CSSPixel,
     ConsoleLogLevel, CreateNewWebViewRequest, DeviceIntPoint, DeviceIntSize, EmbedderControl,
@@ -36,7 +46,9 @@ use url::Url;
 pub(crate) use crate::desktop::gamepad::ServoshellGamepadDelegate;
 use crate::prefs::{EXPERIMENTAL_PREFS, ServoShellPreferences};
 use crate::webdriver::WebDriverEmbedderControls;
-use crate::window::{PlatformWindow, ServoShellWindow, ServoShellWindowId};
+use crate::window::{
+    PlatformWindow, ServoShellWindow, ServoShellWindowId, TopLevelWebViewCreationRequest,
+};
 
 #[cfg(all(
     any(coverage, llvm_pgo),
@@ -60,6 +72,9 @@ pub struct WebViewCollection {
     /// The [`WebView`] that is currently active. This is the [`WebView`] that is shown and has
     /// input focus.
     active_webview_id: Option<WebViewId>,
+
+    /// Whether or not the active WebView in this collection has system focus.
+    has_system_focus: bool,
 }
 
 impl WebViewCollection {
@@ -87,10 +102,6 @@ impl WebViewCollection {
 
     pub fn get(&self, id: WebViewId) -> Option<&WebView> {
         self.webviews.get(&id)
-    }
-
-    pub fn contains(&self, id: WebViewId) -> bool {
-        self.webviews.contains_key(&id)
     }
 
     pub fn active(&self) -> Option<&WebView> {
@@ -130,22 +141,33 @@ impl WebViewCollection {
         self.active_webview_id = Some(id_to_activate);
         for (webview_id, webview) in self.all_in_creation_order() {
             if id_to_activate == webview_id {
+                if self.has_system_focus {
+                    webview.set_focused(true);
+                }
                 webview.show();
-                webview.focus();
             } else {
+                if self.has_system_focus {
+                    webview.set_focused(false);
+                }
                 webview.hide();
-                webview.blur();
             }
         }
     }
 
     pub(crate) fn activate_webview_by_index(&mut self, index: usize) {
         let Some(webview_id) = self.creation_order.get(index) else {
-            // Just ignore requests to activate uknown WebViews. This can happen by pressing
+            // Just ignore requests to activate unknown WebViews. This can happen by pressing
             // keyboard shortcuts in the interface.
             return;
         };
         self.activate_webview(*webview_id);
+    }
+
+    pub(crate) fn set_focused(&mut self, focused: bool) {
+        self.has_system_focus = focused;
+        if let Some(active) = self.active() {
+            active.set_focused(focused);
+        }
     }
 }
 
@@ -159,7 +181,7 @@ pub(crate) enum UserInterfaceCommand {
     ReloadAll,
     NewWebView,
     CloseWebView(WebViewId),
-    NewWindow,
+    NewWindow(TopLevelWebViewCreationRequest),
 }
 
 pub(crate) struct RunningAppState {
@@ -182,7 +204,7 @@ pub(crate) struct RunningAppState {
     /// A [`HashMap`] of pending WebDriver events. It is the WebDriver embedder's responsibility
     /// to inform the WebDriver server when the event has been fully handled. This map is used
     /// to report back to WebDriver when that happens.
-    pub(crate) pending_webdriver_events: RefCell<HashMap<InputEventId, Sender<()>>>,
+    pub(crate) pending_webdriver_events: RefCell<HashMap<InputEventId, (WebViewId, Sender<()>)>>,
 
     /// A [`Receiver`] for receiving commands from a running WebDriver server, if WebDriver
     /// was enabled.
@@ -209,10 +231,12 @@ pub(crate) struct RunningAppState {
     experimental_preferences_enabled: Cell<bool>,
 
     /// The set of [`ServoShellWindow`]s that currently exist for this instance of servoshell.
+    ///
+    /// These are stored in creation order to ensure consistent focus behavior.
     // This is the last field of the struct to ensure that windows are dropped *after* all
     // other references to the relevant rendering contexts have been destroyed.
     // See https://github.com/servo/servo/issues/36711.
-    windows: RefCell<HashMap<ServoShellWindowId, Rc<ServoShellWindow>>>,
+    windows: RefCell<Vec<Rc<ServoShellWindow>>>,
 
     /// The currently focused [`ServoShellWindow`], if one is focused.
     focused_window: RefCell<Option<Rc<ServoShellWindow>>>,
@@ -279,25 +303,21 @@ impl RunningAppState {
     pub(crate) fn open_window(
         self: &Rc<Self>,
         platform_window: Rc<dyn PlatformWindow>,
-        initial_url: Url,
+        creation_request: TopLevelWebViewCreationRequest,
     ) -> Rc<ServoShellWindow> {
         let window = Rc::new(ServoShellWindow::new(platform_window.clone()));
-        self.windows
-            .borrow_mut()
-            .insert(window.id(), window.clone());
-        window.create_and_activate_toplevel_webview(self.clone(), initial_url);
+        self.windows.borrow_mut().push(window.clone());
+        window.create_and_activate_toplevel_webview(self.clone(), creation_request);
 
         // If the window already has platform focus, mark it as focused in our application state.
         if platform_window.has_platform_focus() {
-            self.focus_window(window.clone());
+            self.set_window_has_focus(window.clone(), true);
         }
 
         window
     }
 
-    pub(crate) fn windows<'a>(
-        &'a self,
-    ) -> Ref<'a, HashMap<ServoShellWindowId, Rc<ServoShellWindow>>> {
+    pub(crate) fn windows<'a>(&'a self) -> Ref<'a, Vec<Rc<ServoShellWindow>>> {
         self.windows.borrow()
     }
 
@@ -305,19 +325,49 @@ impl RunningAppState {
         self.focused_window.borrow().clone()
     }
 
-    pub(crate) fn focus_window(&self, window: Rc<ServoShellWindow>) {
-        window.focus();
-        *self.focused_window.borrow_mut() = Some(window);
+    pub(crate) fn set_window_has_focus(&self, window: Rc<ServoShellWindow>, has_focus: bool) {
+        let mut focused_window = self.focused_window.borrow_mut();
+
+        // If another window had focus before and this new window is gaining it, then
+        // ensure that the old window is explicitly unfocused.
+        if let Some(previously_focused_window) = &*focused_window &&
+            !Rc::ptr_eq(previously_focused_window, &window) &&
+            has_focus
+        {
+            previously_focused_window
+                .webview_collection
+                .borrow_mut()
+                .set_focused(false);
+        }
+
+        window
+            .webview_collection
+            .borrow_mut()
+            .set_focused(has_focus);
+
+        if let Some(previously_focused_window) = &*focused_window &&
+            Rc::ptr_eq(previously_focused_window, &window) &&
+            !has_focus
+        {
+            *focused_window = None;
+        } else if has_focus {
+            *focused_window = Some(window);
+        }
     }
 
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(target_os = "android", expect(dead_code))]
     pub(crate) fn window(&self, id: ServoShellWindowId) -> Option<Rc<ServoShellWindow>> {
-        self.windows.borrow().get(&id).cloned()
+        self.windows
+            .borrow()
+            .iter()
+            .find(|window| window.id() == id)
+            .cloned()
     }
 
     pub(crate) fn webview_by_id(&self, webview_id: WebViewId) -> Option<WebView> {
-        self.maybe_window_for_webview_id(webview_id)?
-            .webview_by_id(webview_id)
+        self.windows()
+            .iter()
+            .find_map(|window| window.webview_by_id(webview_id))
     }
 
     pub(crate) fn webdriver_receiver(&self) -> Option<&Receiver<WebDriverCommandMsg>> {
@@ -373,7 +423,7 @@ impl RunningAppState {
         self.experimental_preferences_enabled.get()
     }
 
-    #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
+    #[cfg_attr(target_env = "ohos", expect(dead_code))]
     pub(crate) fn set_experimental_preferences_enabled(&self, new_value: bool) {
         let old_value = self.experimental_preferences_enabled.replace(new_value);
         if old_value == new_value {
@@ -386,7 +436,8 @@ impl RunningAppState {
 
     /// Close any [`ServoShellWindow`] that doesn't have an open [`WebView`].
     fn close_empty_windows(&self) {
-        self.windows.borrow_mut().retain(|_, window| {
+        let mut move_focus = false;
+        self.windows.borrow_mut().retain(|window| {
             if !self.exit_scheduled.get() && !window.should_close() {
                 return true;
             }
@@ -395,9 +446,23 @@ impl RunningAppState {
                 Rc::ptr_eq(window, &focused_window)
             {
                 *self.focused_window.borrow_mut() = None;
+                move_focus = !focused_window.platform_window().platform_manages_focus();
             }
             false
         });
+
+        // If the platform doesn't manage focus, then focus the most recently opened
+        // window.
+        if move_focus &&
+            let Some(newly_focused_window) = self
+                .windows()
+                .iter()
+                .rev()
+                .find(|window| !window.platform_window().platform_manages_focus())
+                .cloned()
+        {
+            self.set_window_has_focus(newly_focused_window, true);
+        }
     }
 
     /// Spins the internal application event loop.
@@ -411,26 +476,18 @@ impl RunningAppState {
         self: &Rc<Self>,
         create_platform_window: Option<&dyn Fn(Url) -> Rc<dyn PlatformWindow>>,
     ) -> bool {
-        // We clone here to avoid a double borrow. User interface commands can update the list of windows.
-        let windows: Vec<_> = self.windows.borrow().values().cloned().collect();
-        for window in windows {
-            window.handle_interface_commands(self, create_platform_window);
-        }
-
         self.handle_webdriver_messages(create_platform_window);
-
-        #[cfg(all(
-            feature = "gamepad",
-            not(any(target_os = "android", target_env = "ohos"))
-        ))]
-        if servo::pref!(dom_gamepad_enabled) {
-            self.handle_gamepad_events();
-        }
 
         self.servo.spin_event_loop();
 
-        for window in self.windows.borrow().values() {
+        for window in self.windows.borrow().iter() {
             window.update_and_request_repaint_if_necessary(self);
+        }
+
+        // We clone here to avoid a double borrow. User interface commands can update the list of windows.
+        let windows: Vec<_> = self.windows.borrow().iter().cloned().collect();
+        for window in windows {
+            window.handle_interface_commands(self, create_platform_window);
         }
 
         if self.servoshell_preferences.exit_after_stable_image && self.achieved_stable_image.get() {
@@ -450,28 +507,29 @@ impl RunningAppState {
         !self.exit_scheduled.get()
     }
 
-    pub(crate) fn maybe_window_for_webview_id(
-        &self,
-        webview_id: WebViewId,
-    ) -> Option<Rc<ServoShellWindow>> {
-        for window in self.windows.borrow().values() {
-            if window.contains_webview(webview_id) {
-                return Some(window.clone());
-            }
-        }
-        None
+    fn maybe_window_for_webview(&self, webview: &WebView) -> Option<Rc<ServoShellWindow>> {
+        // Look up the ServoShellWindow by RenderingContext. This method can be called while a
+        // WebView is being constructed, which means that it may not fully be associated with a
+        // ServoShellWindow yet.
+        let rendering_context = webview.rendering_context();
+        self.windows()
+            .iter()
+            .find(|window| {
+                Rc::ptr_eq(
+                    &window.platform_window().rendering_context(),
+                    &rendering_context,
+                )
+            })
+            .cloned()
     }
 
-    pub(crate) fn window_for_webview_id(&self, webview_id: WebViewId) -> Rc<ServoShellWindow> {
-        self.maybe_window_for_webview_id(webview_id)
-            .unwrap_or_else(|| panic!("Looking for unexpected WebView: {webview_id:?}"))
+    pub(crate) fn window_for_webview(&self, webview: &WebView) -> Rc<ServoShellWindow> {
+        self.maybe_window_for_webview(webview)
+            .unwrap_or_else(|| panic!("Looking for unexpected WebView: {:?}", webview.id()))
     }
 
-    pub(crate) fn platform_window_for_webview_id(
-        &self,
-        webview_id: WebViewId,
-    ) -> Rc<dyn PlatformWindow> {
-        self.window_for_webview_id(webview_id).platform_window()
+    pub(crate) fn platform_window_for_webview(&self, webview: &WebView) -> Rc<dyn PlatformWindow> {
+        self.window_for_webview(webview).platform_window()
     }
 
     /// If we are exiting after achieving a stable image or we want to save the display of the
@@ -561,7 +619,7 @@ impl RunningAppState {
             if let Some(response_sender) = response_sender {
                 self.pending_webdriver_events
                     .borrow_mut()
-                    .insert(event_id, response_sender);
+                    .insert(event_id, (webview_id, response_sender));
             }
         } else {
             error!("Could not find WebView ({webview_id:?}) for WebDriver event: {input_event:?}");
@@ -618,7 +676,7 @@ impl RunningAppState {
             return;
         };
 
-        self.platform_window_for_webview_id(webview_id)
+        self.platform_window_for_webview(&webview)
             .dismiss_embedder_controls_for_webview(webview_id);
 
         info!("Loading URL in webview {}: {}", webview_id, url);
@@ -630,7 +688,12 @@ impl RunningAppState {
         feature = "gamepad",
         not(any(target_os = "android", target_env = "ohos"))
     ))]
-    pub(crate) fn handle_gamepad_events(&self) {
+    pub(crate) fn handle_gamepad_events(
+        &self,
+        event: Event,
+        gamepad_name: String,
+        gamepad_index: GamepadIndex,
+    ) {
         let Some(gamepad_delegate) = self.gamepad_delegate.as_ref() else {
             return;
         };
@@ -640,11 +703,7 @@ impl RunningAppState {
         else {
             return;
         };
-        gamepad_delegate.handle_gamepad_events(active_webview);
-    }
-
-    pub(crate) fn handle_focused(&self, window: Rc<ServoShellWindow>) {
-        *self.focused_window.borrow_mut() = Some(window);
+        gamepad_delegate.handle_gamepad_events(event, gamepad_name, gamepad_index, active_webview);
     }
 
     /// Interrupt any ongoing WebDriver-based script evaluation.
@@ -670,13 +729,14 @@ impl RunningAppState {
         }
     }
 
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     pub(crate) fn set_accessibility_active(&self, active: bool) {
         let was_active = self.accessibility_active.replace(active);
         if active == was_active {
             return;
         }
 
-        for window in self.windows().values() {
+        for window in self.windows().iter() {
             for (_, webview) in window.webviews() {
                 // Activate accessibility in the WebView.
                 // There are two sites like this; this is the a11y activation site.
@@ -692,22 +752,19 @@ impl RunningAppState {
 
 impl WebViewDelegate for RunningAppState {
     fn screen_geometry(&self, webview: WebView) -> Option<servo::ScreenGeometry> {
-        Some(
-            self.platform_window_for_webview_id(webview.id())
-                .screen_geometry(),
-        )
+        Some(self.platform_window_for_webview(&webview).screen_geometry())
     }
 
     fn notify_status_text_changed(&self, webview: WebView, _status: Option<String>) {
-        self.window_for_webview_id(webview.id()).set_needs_update();
+        self.window_for_webview(&webview).set_needs_update();
     }
 
     fn notify_history_changed(&self, webview: WebView, _entries: Vec<Url>, _current: usize) {
-        self.window_for_webview_id(webview.id()).set_needs_update();
+        self.window_for_webview(&webview).set_needs_update();
     }
 
     fn notify_page_title_changed(&self, webview: WebView, _: Option<String>) {
-        self.window_for_webview_id(webview.id()).set_needs_update();
+        self.window_for_webview(&webview).set_needs_update();
     }
 
     fn notify_traversal_complete(&self, _webview: WebView, traversal_id: TraversalId) {
@@ -719,12 +776,12 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn request_move_to(&self, webview: WebView, new_position: DeviceIntPoint) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .set_position(new_position);
     }
 
     fn request_resize_to(&self, webview: WebView, requested_outer_size: DeviceIntSize) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .request_resize(&webview, requested_outer_size);
     }
 
@@ -733,12 +790,23 @@ impl WebViewDelegate for RunningAppState {
         webview: WebView,
         authentication_request: AuthenticationRequest,
     ) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .show_http_authentication_dialog(webview.id(), authentication_request);
     }
 
     fn request_create_new(&self, parent_webview: WebView, request: CreateNewWebViewRequest) {
-        let window = self.window_for_webview_id(parent_webview.id());
+        let window = self.window_for_webview(&parent_webview);
+
+        // When WebDriver wants to open a new WebView, do this in a new window. Normally, servoshell
+        // throttles WebViews that are hidden, but WebDriver expects all opened WebViews to stay
+        // active. Using a separate window ensures this.
+        if self.servoshell_preferences.webdriver_port.get().is_some() {
+            window.queue_user_interface_command(UserInterfaceCommand::NewWindow(
+                TopLevelWebViewCreationRequest::WithCreateRequest(request),
+            ));
+            return;
+        }
+
         let platform_window = window.platform_window();
         let webview = request
             .builder(platform_window.rendering_context())
@@ -746,22 +814,16 @@ impl WebViewDelegate for RunningAppState {
             .delegate(parent_webview.delegate())
             .build();
 
-        webview.notify_theme_change(platform_window.theme());
         window.add_webview(webview.clone());
-
-        // When WebDriver is enabled, do not focus and raise the WebView to the top,
-        // as that is what the specification expects. Otherwise, we would like `window.open()`
-        // to create a new foreground tab
-        if self.servoshell_preferences.webdriver_port.get().is_none() {
-            window.activate_webview(webview.id());
-        } else {
-            webview.hide();
-        }
+        window.activate_webview(webview.id());
     }
 
     fn notify_closed(&self, webview: WebView) {
-        self.window_for_webview_id(webview.id())
-            .close_webview(webview.id())
+        let webview_id = webview.id();
+        self.pending_webdriver_events
+            .borrow_mut()
+            .retain(|_, (pending_webview_id, _)| *pending_webview_id != webview_id);
+        self.window_for_webview(&webview).close_webview(webview_id)
     }
 
     fn notify_input_event_handled(
@@ -770,20 +832,19 @@ impl WebViewDelegate for RunningAppState {
         id: InputEventId,
         result: InputEventResult,
     ) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .notify_input_event_handled(&webview, id, result);
-        if let Some(response_sender) = self.pending_webdriver_events.borrow_mut().remove(&id) {
-            let _ = response_sender.send(());
-        }
+
+        self.pending_webdriver_events.borrow_mut().remove(&id);
     }
 
     fn notify_cursor_changed(&self, webview: WebView, cursor: servo::Cursor) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .set_cursor(cursor);
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        self.window_for_webview_id(webview.id()).set_needs_update();
+        self.window_for_webview(&webview).set_needs_update();
 
         if status == LoadStatus::Complete {
             if let Some(sender) = self
@@ -799,7 +860,7 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_fullscreen_state_changed(&self, webview: WebView, fullscreen_state: bool) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .set_fullscreen(fullscreen_state);
     }
 
@@ -808,17 +869,17 @@ impl WebViewDelegate for RunningAppState {
         webview: WebView,
         request: BluetoothDeviceSelectionRequest,
     ) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .show_bluetooth_device_dialog(webview.id(), request);
     }
 
     fn request_permission(&self, webview: WebView, permission_request: PermissionRequest) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .show_permission_dialog(webview.id(), permission_request);
     }
 
     fn notify_new_frame_ready(&self, webview: WebView) {
-        self.window_for_webview_id(webview.id()).set_needs_repaint();
+        self.window_for_webview(&webview).set_needs_repaint();
     }
 
     fn show_embedder_control(&self, webview: WebView, embedder_control: EmbedderControl) {
@@ -842,7 +903,7 @@ impl WebViewDelegate for RunningAppState {
             return;
         }
 
-        self.window_for_webview_id(webview.id())
+        self.window_for_webview(&webview)
             .show_embedder_control(webview, embedder_control);
     }
 
@@ -853,27 +914,27 @@ impl WebViewDelegate for RunningAppState {
             return;
         }
 
-        self.window_for_webview_id(webview.id())
+        self.window_for_webview(&webview)
             .hide_embedder_control(webview, embedder_control_id);
     }
 
     fn notify_favicon_changed(&self, webview: WebView) {
-        self.window_for_webview_id(webview.id())
+        self.window_for_webview(&webview)
             .notify_favicon_changed(webview);
     }
 
     fn notify_media_session_event(&self, webview: WebView, event: MediaSessionEvent) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .notify_media_session_event(event);
     }
 
     fn notify_crashed(&self, webview: WebView, reason: String, backtrace: Option<String>) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .notify_crashed(webview, reason, backtrace);
     }
 
     fn show_console_message(&self, webview: WebView, level: ConsoleLogLevel, message: String) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .show_console_message(level, &message);
     }
 
@@ -882,7 +943,7 @@ impl WebViewDelegate for RunningAppState {
         webview: WebView,
         tree_update: accesskit::TreeUpdate,
     ) {
-        self.platform_window_for_webview_id(webview.id())
+        self.platform_window_for_webview(&webview)
             .notify_accessibility_tree_update(webview, tree_update);
     }
 }

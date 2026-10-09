@@ -9,136 +9,90 @@ mod font_identifier;
 mod font_template;
 mod system_font_service_proxy;
 
-use std::ops::{Deref, Range};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 pub use font_descriptor::*;
 pub use font_identifier::*;
 pub use font_template::*;
 use malloc_size_of_derive::MallocSizeOf;
-use num_derive::{NumOps, One, Zero};
+pub use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
+use servo_arc::Arc as ServoArc;
 use servo_base::generic_channel::GenericSharedMemory;
+use style::font_face::Descriptors;
+use style::stylesheets::LockedFontFaceRule;
 pub use system_font_service_proxy::*;
-use webrender_api::euclid::num::One;
 
-/// An index that refers to a byte offset in a text run. This could
-/// the middle of a glyph.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    Deserialize,
-    Eq,
-    MallocSizeOf,
-    NumOps,
-    Ord,
-    One,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-    Zero,
-)]
-pub struct ByteIndex(pub usize);
-
-impl ByteIndex {
-    pub fn get(&self) -> usize {
-        self.0
-    }
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum WebFontLoadEvent {
+    LoadedSuccessfully,
+    UnblockedFontReadyPromise,
 }
 
-/// A range of UTF-8 bytes in a text run. This is used to identify glyphs in a `GlyphRun`
-/// by their original character byte offsets in the text.
-#[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
-pub struct TextByteRange(Range<ByteIndex>);
+pub type StylesheetWebFontLoadFinishedCallback =
+    Arc<dyn Fn(WebFontLoadEvent) + Send + Sync + 'static>;
 
-impl TextByteRange {
-    pub fn len(&self) -> ByteIndex {
-        self.0.end - self.0.start
-    }
+#[derive(Serialize, Deserialize)]
+struct SerializableFontData(Arc<GenericSharedMemory>);
 
-    #[inline]
-    pub fn intersect(&self, other: &Self) -> Self {
-        let begin = self.start.max(other.start);
-        let end = self.end.min(other.end);
-
-        if end < begin {
-            Self::default()
-        } else {
-            Self::new(begin, end)
-        }
-    }
-
-    #[inline]
-    pub fn contains_inclusive(&self, index: ByteIndex) -> bool {
-        index >= self.start && index <= self.end
-    }
-}
-
-impl Deref for TextByteRange {
-    type Target = Range<ByteIndex>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Iterator for TextByteRange {
-    type Item = ByteIndex;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.0.start == self.0.end {
-            None
-        } else {
-            let next = self.0.start;
-            self.0.start = self.0.start + ByteIndex::one();
-            Some(next)
+impl From<FontData> for SerializableFontData {
+    fn from(value: FontData) -> Self {
+        match value {
+            FontData::MemoryMapped(mmap) => {
+                SerializableFontData(Arc::new(GenericSharedMemory::from_bytes(&mmap)))
+            },
+            FontData::SharedMemory(generic_shared_memory) => {
+                SerializableFontData(generic_shared_memory)
+            },
         }
     }
 }
 
-impl DoubleEndedIterator for TextByteRange {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.0.start == self.0.end {
-            None
-        } else {
-            self.0.end = self.0.end - ByteIndex::one();
-            Some(self.0.end)
-        }
+impl From<SerializableFontData> for FontData {
+    fn from(value: SerializableFontData) -> Self {
+        FontData::SharedMemory(value.0)
     }
 }
-
-impl TextByteRange {
-    pub fn new(start: ByteIndex, end: ByteIndex) -> Self {
-        Self(start..end)
-    }
-
-    pub fn iter(&self) -> Range<ByteIndex> {
-        self.0.clone()
-    }
-}
-
-pub type StylesheetWebFontLoadFinishedCallback = Arc<dyn Fn(bool) + Send + Sync + 'static>;
 
 /// A data structure to store data for fonts. Data is stored internally in an
 /// [`GenericSharedMemory`] handle, so that it can be sent without serialization
 /// across IPC channels.
-#[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
-pub struct FontData(#[conditional_malloc_size_of] pub(crate) Arc<GenericSharedMemory>);
+#[derive(Clone, Deserialize, Serialize, MallocSizeOf)]
+#[serde(from = "SerializableFontData", into = "SerializableFontData")]
+pub enum FontData {
+    MemoryMapped(#[conditional_malloc_size_of] Arc<Mmap>),
+    SharedMemory(#[conditional_malloc_size_of] Arc<GenericSharedMemory>),
+}
 
 impl FontData {
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self(Arc::new(GenericSharedMemory::from_bytes(bytes)))
+        Self::SharedMemory(Arc::new(GenericSharedMemory::from_bytes(bytes)))
     }
 
-    pub fn as_ipc_shared_memory(&self) -> Arc<GenericSharedMemory> {
-        self.0.clone()
+    pub fn from_mmap(mmap: Mmap) -> Self {
+        Self::MemoryMapped(Arc::new(mmap))
+    }
+
+    pub fn as_ipc_shared_memory(self) -> Arc<GenericSharedMemory> {
+        match self {
+            FontData::MemoryMapped(mmap) => Arc::new(GenericSharedMemory::from_bytes(&mmap)),
+            FontData::SharedMemory(generic_shared_memory) => generic_shared_memory,
+        }
+    }
+
+    /// This is in single process mode more efficient because we do not have to copy the vector.
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        Self::SharedMemory(Arc::new(GenericSharedMemory::from_vec(bytes)))
     }
 }
 
 impl AsRef<[u8]> for FontData {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        match &self {
+            FontData::MemoryMapped(mmap) => mmap,
+            FontData::SharedMemory(generic_shared_memory) => generic_shared_memory,
+        }
     }
 }
 
@@ -146,7 +100,7 @@ impl AsRef<[u8]> for FontData {
 ///
 /// If the font data is of a TTC (TrueType collection) file, then the index of a specific font within
 /// the collection. If the font data is for is single font then the index will always be 0.
-#[derive(Deserialize, Clone, Serialize)]
+#[derive(Deserialize, Clone, Serialize, MallocSizeOf)]
 pub struct FontDataAndIndex {
     /// The raw font file data (.ttf, .otf, .ttc, etc)
     pub data: FontData,
@@ -157,4 +111,39 @@ pub struct FontDataAndIndex {
 #[derive(Copy, Clone, PartialEq)]
 pub enum FontDataError {
     FailedToLoad,
+}
+
+/// Describes how the set of active `@font-face` rules was changed after a call to `FontContext::rebuild_font_face_set`.
+#[derive(Clone, Default)]
+pub struct WebFontSetDifference {
+    /// A list of `@font-face` rules that were added in this update.
+    pub added_font_faces: Vec<ServoArc<FontFaceRuleInfo>>,
+    /// A list of `@font-face` rules that were removed in this update.
+    pub removed_font_faces: Vec<ServoArc<FontFaceRuleInfo>>,
+    /// Whether the cascade index of any `@font-face` rule changed during this update.
+    ///
+    /// This can cause different fonts to be selected during font matching.
+    pub cascade_index_of_any_rule_changed: bool,
+}
+
+impl WebFontSetDifference {
+    /// Returns `true` iff the font face set remained unchanged by the update.
+    pub fn is_empty(&self) -> bool {
+        self.added_font_faces.is_empty() && self.removed_font_faces.is_empty()
+    }
+}
+
+#[derive(MallocSizeOf)]
+pub struct FontFaceRuleInfo {
+    /// The index of this `@font-face` in the cascade, relative to all
+    /// other `@font-face` rules.
+    pub cascade_index: AtomicUsize,
+    /// The descriptors on the `@font-face` rule.
+    pub descriptors: Descriptors,
+    /// The CSS rule that created this `@font-face`.
+    ///
+    /// This does *not* uniquely identify this struct across updates
+    /// to the set of live `@font-face` rules.
+    #[conditional_malloc_size_of]
+    pub rule: ServoArc<LockedFontFaceRule>,
 }

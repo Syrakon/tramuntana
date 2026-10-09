@@ -1,7 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-#![allow(rustdoc::private_intra_doc_links)]
+#![expect(rustdoc::private_intra_doc_links)]
 
 //! # HTML Tables (╯°□°)╯︵ ┻━┻
 //!
@@ -211,6 +211,14 @@ impl Table {
                 new_style,
             );
     }
+
+    pub(crate) fn subtree_size(&self) -> usize {
+        self.slots
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(TableSlot::subtree_size)
+            .sum()
+    }
 }
 
 type TableSlotCoordinates = Point2D<usize, UnknownUnit>;
@@ -296,6 +304,13 @@ impl std::fmt::Debug for TableSlot {
 impl TableSlot {
     fn new_spanned(offset: TableSlotOffset) -> Self {
         Self::Spanned(vec![offset])
+    }
+
+    pub(crate) fn subtree_size(&self) -> usize {
+        match self {
+            TableSlot::Cell(cell) => cell.borrow().context.subtree_size(),
+            TableSlot::Spanned(..) | TableSlot::Empty => 0,
+        }
     }
 }
 

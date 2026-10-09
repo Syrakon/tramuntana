@@ -7,7 +7,7 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use js::jsapi::CompilationType;
 use js::rust::HandleValue;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::TrustedScriptBinding::TrustedScriptMethods;
 use crate::dom::bindings::codegen::UnionTypes::TrustedScriptOrString;
@@ -37,7 +37,7 @@ impl TrustedScript {
     }
 
     pub(crate) fn new(cx: &mut JSContext, data: DOMString, global: &GlobalScope) -> DomRoot<Self> {
-        reflect_dom_object_with_cx(Box::new(Self::new_inherited(data)), global, cx)
+        reflect_dom_object(cx, Box::new(Self::new_inherited(data)), global)
     }
 
     pub(crate) fn get_trusted_type_compliant_string(
@@ -87,8 +87,7 @@ impl TrustedScript {
         };
         // Step 2.2. Let isTrusted be true if bodyArg implements TrustedScript,
         // and false otherwise.
-        let mut is_trusted = match TrustedTypePolicyFactory::is_trusted_script(cx.into(), body_arg)
-        {
+        let mut is_trusted = match TrustedTypePolicyFactory::is_trusted_script(cx, body_arg) {
             // Step 2.3. If isTrusted is true then:
             Ok(trusted_script) => {
                 // Step 2.3.1. If bodyString is not equal to bodyArg’s data, set isTrusted to false.
@@ -151,7 +150,7 @@ impl TrustedScript {
         };
         global
             .get_csp_list()
-            .is_js_evaluation_allowed(global, &source_string.str())
+            .is_js_evaluation_allowed(cx, global, &source_string.str())
     }
 }
 

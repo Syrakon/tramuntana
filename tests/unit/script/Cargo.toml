@@ -12,9 +12,11 @@ name = "script_tests"
 path = "lib.rs"
 
 [dependencies]
+embedder_traits = { workspace = true }
 encoding_rs = { workspace = true }
 euclid = { workspace = true }
 keyboard-types = { workspace = true }
 script = { workspace = true }
 servo-base = { workspace = true }
 servo-url = { workspace = true }
+tempfile = { workspace = true }

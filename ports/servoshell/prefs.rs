@@ -45,9 +45,9 @@ pub(crate) static EXPERIMENTAL_PREFS: &[&str] = &[
     "dom_storage_manager_api_enabled",
     "dom_webgl2_enabled",
     "dom_webgpu_enabled",
+    "layout_css_ellipse_corners_enabled",
     "layout_columns_enabled",
     "layout_container_queries_enabled",
-    "layout_grid_enabled",
     "layout_variable_fonts_enabled",
 ];
 
@@ -104,6 +104,9 @@ pub(crate) struct ServoShellPreferences {
     /// Log also to a file
     #[cfg(target_env = "ohos")]
     pub log_to_file: bool,
+    /// Enable memory output if tracing is enabled.
+    #[allow(unused)]
+    pub memory_output: bool,
 }
 
 impl Default for ServoShellPreferences {
@@ -130,6 +133,7 @@ impl Default for ServoShellPreferences {
             #[cfg(target_env = "ohos")]
             log_to_file: false,
             experimental_preferences_enabled: false,
+            memory_output: false,
         }
     }
 }
@@ -393,10 +397,6 @@ struct CmdArgs {
     #[bpaf(argument("~/.config/servo"))]
     config_dir: Option<PathBuf>,
 
-    /// Use temporary storage (data on disk will not persist across restarts).
-    #[bpaf(long)]
-    temporary_storage: bool,
-
     ///
     ///  Run as a content process and connect to the given pipe.
     #[bpaf(argument("servo-ipc-channel.abcdefg"))]
@@ -406,7 +406,7 @@ struct CmdArgs {
     ///  A comma-separated string of debug options. Pass help to show available options.
     #[bpaf(
         short('Z'),
-        argument("layout_grid_enabled=true,dom_async_clipboard_enabled"),
+        argument("layout_flexbox_balance=true,dom_async_clipboard_enabled"),
         long,
         map(map_debug_options),
         fallback(vec![])
@@ -444,6 +444,12 @@ struct CmdArgs {
     headless: bool,
 
     ///
+    /// Path to a hosts file (like `/etc/hosts`).
+    /// Ignored if the `HOST_FILE` environment variable is set.
+    #[bpaf(long("host-file"), argument("/path/to/hosts"))]
+    host_file: Option<PathBuf>,
+
+    ///
     ///  Whether or not to completely ignore certificate errors.
     #[bpaf(long)]
     ignore_certificate_errors: bool,
@@ -466,6 +472,10 @@ struct CmdArgs {
     /// Also log to a file (/data/app/el2/100/base/org.servo.servo/cache/servo.log).
     #[bpaf(long)]
     log_to_file: bool,
+
+    /// Should we output memory stats after a page load. Only useful if tracing is enabled
+    #[bpaf(long)]
+    memory_output: bool,
 
     /// Run in multiprocess mode.
     #[bpaf(short('M'), long)]
@@ -526,6 +536,9 @@ struct CmdArgs {
     #[bpaf(long("simulate-touch-events"))]
     simulate_touch_events: bool,
 
+    /// Use temporary storage (data on disk will not persist across restarts).
+    #[bpaf(long)]
+    temporary_storage: bool,
     /// Define a custom filter for traces. Overrides `SERVO_TRACING` if set.
     #[bpaf(long("tracing-filter"), argument("FILTER"))]
     tracing_filter: Option<String>,
@@ -564,12 +577,16 @@ struct CmdArgs {
     #[bpaf(argument::<String>("1024x740"), parse(parse_resolution_string), fallback(None))]
     window_size: Option<Size2D<u32, DeviceIndependentPixel>>,
 
+    /// Set js_mem_gc_zeal_level=2 and js_mem_gc_zeal_frequency=1
+    #[bpaf(long)]
+    zealous_gc: bool,
+
     /// The url we should load.
     #[bpaf(positional("URL"), fallback(String::from("https://www.servo.org")))]
     url: String,
 }
 
-fn update_preferences_from_command_line_arguemnts(
+fn update_preferences_from_command_line_arguments(
     preferences: &mut Preferences,
     cmd_args: &CmdArgs,
 ) {
@@ -606,6 +623,16 @@ fn update_preferences_from_command_line_arguemnts(
 
     if cmd_args.webdriver_port.is_some() {
         preferences.dom_testing_html_input_element_select_files_enabled = true;
+    }
+
+    if cmd_args.zealous_gc {
+        #[cfg(not(feature = "debugmozjs"))]
+        warn!(
+            "The zealous-gc option requires Servo to be compiled with debug-mozjs to take effect."
+        );
+
+        preferences.js_mem_gc_zeal_level = 2;
+        preferences.js_mem_gc_zeal_frequency = 1;
     }
 }
 
@@ -667,7 +694,7 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
 
     let mut preferences = get_preferences(&cmd_args.prefs_file, &config_dir);
 
-    update_preferences_from_command_line_arguemnts(&mut preferences, &cmd_args);
+    update_preferences_from_command_line_arguments(&mut preferences, &cmd_args);
 
     // FIXME: enable JIT compilation on 32-bit Android after the startup crash issue (#31134) is fixed.
     if cfg!(target_os = "android") && cfg!(target_pointer_width = "32") {
@@ -683,6 +710,11 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         .map_or(default_window_size, |screen_size_override| {
             default_window_size.min(screen_size_override)
         });
+
+    #[cfg(not(all(feature = "tracing", feature = "tracing-hitrace")))]
+    if cmd_args.memory_output {
+        log::error!("Memory reporting only works with tracing and tracing-hitrace enabled.");
+    }
 
     let servoshell_preferences = ServoShellPreferences {
         url: Some(cmd_args.url),
@@ -706,12 +738,18 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         }),
         #[cfg(target_env = "ohos")]
         log_to_file: cmd_args.log_to_file,
+        memory_output: cmd_args.memory_output,
         ..Default::default()
     };
 
     let Ok(debug_options) = parse_diagnostics_logging(cmd_args.debug) else {
         return ArgumentParsingResult::ErrorParsing;
     };
+
+    #[cfg(not(feature = "multiprocess"))]
+    if cmd_args.multiprocess || cmd_args.force_ipc {
+        log::error!("IPC was disabled at compile time. IPC and multiprocess modes are disabled");
+    }
 
     let opts = Opts {
         debug: debug_options,
@@ -731,6 +769,7 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         certificate_path: cmd_args
             .certificate_path
             .map(|p| p.to_string_lossy().into_owned()),
+        host_file: cmd_args.host_file,
         ignore_certificate_errors: cmd_args.ignore_certificate_errors,
         unminify_js: cmd_args.unminify_js,
         local_script_source: cmd_args
@@ -897,4 +936,9 @@ fn test_servoshell_cmd() {
             .unwrap(),
         String::from("/tmp/test")
     );
+
+    assert!({
+        let p = test_parse("--zealous-gc").1;
+        p.js_mem_gc_zeal_level == 2 && p.js_mem_gc_zeal_frequency == 1
+    });
 }

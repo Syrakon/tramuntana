@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::borrow::Cow;
+use std::ops::Deref;
 
+use atomic_refcell::AtomicRef;
 use layout_api::{
     LayoutElement, LayoutElementType, LayoutNode, LayoutNodeType, PseudoElementChain,
 };
@@ -14,7 +16,6 @@ use style::properties::ComputedValues;
 use style::selector_parser::PseudoElement;
 use style::values::generics::counters::{Content, ContentItem};
 use style::values::specified::Quotes;
-use web_atoms::LocalName;
 
 use crate::context::LayoutContext;
 use crate::dom::{BoxSlot, LayoutBox, NodeExt};
@@ -84,8 +85,46 @@ pub(super) enum PseudoElementContentItem {
     Replaced(ReplacedContents),
 }
 
+/// A reference to a string encountered during box tree construction. This
+/// can either be a reference to a borrowed DOM string, a `&str` or an owned
+/// `String`.
+pub(crate) enum BoxTreeString<'a> {
+    /// Text borrowed in its entirety from a DOM node.
+    Ref(AtomicRef<'a, str>),
+    /// Text that exists independent of a particular DOM node.
+    Cow(Cow<'a, str>),
+}
+
+impl<'a> From<AtomicRef<'a, str>> for BoxTreeString<'a> {
+    fn from(text: AtomicRef<'a, str>) -> BoxTreeString<'a> {
+        BoxTreeString::Ref(text)
+    }
+}
+
+impl<'a> From<Cow<'a, str>> for BoxTreeString<'a> {
+    fn from(text: Cow<'a, str>) -> BoxTreeString<'a> {
+        BoxTreeString::Cow(text)
+    }
+}
+
+impl From<String> for BoxTreeString<'_> {
+    fn from(text: String) -> BoxTreeString<'static> {
+        BoxTreeString::Cow(text.into())
+    }
+}
+
+impl Deref for BoxTreeString<'_> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Ref(ref_) => ref_,
+            Self::Cow(cow) => cow,
+        }
+    }
+}
+
 pub(super) trait TraversalHandler<'dom> {
-    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: Cow<'dom, str>);
+    fn handle_text(&mut self, info: &NodeAndStyleInfo<'dom>, text: BoxTreeString<'dom>);
 
     /// Or pseudo-element
     fn handle_element(
@@ -120,7 +159,7 @@ fn traverse_children_of<'dom>(
     for child in parent_element_info.node.flat_tree_children() {
         if child.is_text_node() {
             let info = NodeAndStyleInfo::new(child, child.style(&context.style_context));
-            handler.handle_text(&info, child.text_content());
+            handler.handle_text(&info, child.text_content().into());
         } else if child.is_element() {
             traverse_element(child, context, handler);
         }
@@ -160,7 +199,7 @@ fn traverse_element<'dom>(
         },
         Display::GeneratingBox(display) => {
             let contents = Contents::for_element(element, context);
-            let display = display.used_value_for_contents(&contents);
+            let display = display.used_value_for_contents(&contents, &info);
             let box_slot = element.box_slot();
             handler.handle_element(&info, display, contents, box_slot);
         },
@@ -254,7 +293,8 @@ impl Contents {
         let is_widget = matches!(
             node.type_id(),
             Some(LayoutNodeType::Element(
-                LayoutElementType::HTMLInputElement |
+                LayoutElementType::HTMLButtonElement |
+                    LayoutElementType::HTMLInputElement |
                     LayoutElementType::HTMLSelectElement |
                     LayoutElementType::HTMLTextAreaElement
             ))
@@ -314,85 +354,52 @@ pub(crate) fn generate_pseudo_element_content(
 ) -> Vec<PseudoElementContentItem> {
     match &pseudo_element_info.style.get_counters().content {
         Content::Items(items) => {
-            let mut vec = vec![];
-            for item in items.items.iter() {
-                match item {
-                    ContentItem::String(s) => {
-                        vec.push(PseudoElementContentItem::Text(s.to_string()));
-                    },
-                    ContentItem::Attr(attr) => {
-                        let element = pseudo_element_info
-                            .node
-                            .as_element()
-                            .expect("Expected an element");
-
-                        // From
-                        // <https://html.spec.whatwg.org/multipage/#case-sensitivity-of-the-css-%27attr%28%29%27-function>
-                        //
-                        // > CSS Values and Units leaves the case-sensitivity of attribute names for
-                        // > the purpose of the `attr()` function to be defined by the host language.
-                        // > [[CSSVALUES]].
-                        // >
-                        // > When comparing the attribute name part of a CSS `attr()`function to the
-                        // > names of namespace-less attributes on HTML elements in HTML documents,
-                        // > the name part of the CSS `attr()` function must first be converted to
-                        // > ASCII lowercase. The same function when compared to other attributes must
-                        // > be compared according to its original case. In both cases, to match the
-                        // > values must be identical to each other (and therefore the comparison is
-                        // > case sensitive).
-                        let attr_name = match element.is_html_element_in_html_document() {
-                            true => &*attr.attribute.to_ascii_lowercase(),
-                            false => &*attr.attribute,
-                        };
-
-                        pseudo_element_info
-                            .node
-                            .set_uses_content_attribute_with_attr(true);
-                        let attr_val =
-                            element.attribute(&attr.namespace_url, &LocalName::from(attr_name));
-                        vec.push(PseudoElementContentItem::Text(
-                            attr_val.map_or("".to_string(), |s| s.to_string()),
-                        ));
-                    },
-                    ContentItem::Image(image) => {
-                        if let Some(replaced_content) =
+            items
+                .items
+                .iter()
+                .filter_map(|item| {
+                    match item {
+                        ContentItem::String(s) => {
+                            Some(PseudoElementContentItem::Text(s.to_string()))
+                        },
+                        ContentItem::Image(image) => {
                             ReplacedContents::from_image(pseudo_element_info.node, context, image)
-                        {
-                            vec.push(PseudoElementContentItem::Replaced(replaced_content));
-                        }
-                    },
-                    ContentItem::OpenQuote | ContentItem::CloseQuote => {
-                        // TODO(xiaochengh): calculate quote depth
-                        let maybe_quote = match &pseudo_element_info.style.get_list().quotes {
-                            Quotes::QuoteList(quote_list) => {
-                                quote_list.0.first().map(|quote_pair| {
-                                    get_quote_from_pair(
+                                .map(PseudoElementContentItem::Replaced)
+                        },
+                        ContentItem::OpenQuote | ContentItem::CloseQuote => {
+                            // TODO(xiaochengh): calculate quote depth
+                            let maybe_quote = match &pseudo_element_info.style.get_list().quotes {
+                                Quotes::QuoteList(quote_list) => {
+                                    quote_list.0.first().map(|quote_pair| {
+                                        get_quote_from_pair(
+                                            item,
+                                            &*quote_pair.opening,
+                                            &*quote_pair.closing,
+                                        )
+                                    })
+                                },
+                                Quotes::Auto => {
+                                    let lang = &pseudo_element_info.style.get_font()._x_lang;
+                                    let quotes = quotes_for_lang(lang.0.as_ref(), 0);
+                                    Some(get_quote_from_pair(
                                         item,
-                                        &*quote_pair.opening,
-                                        &*quote_pair.closing,
-                                    )
-                                })
-                            },
-                            Quotes::Auto => {
-                                let lang = &pseudo_element_info.style.get_font()._x_lang;
-                                let quotes = quotes_for_lang(lang.0.as_ref(), 0);
-                                Some(get_quote_from_pair(item, &quotes.opening, &quotes.closing))
-                            },
-                        };
-                        if let Some(quote) = maybe_quote {
-                            vec.push(PseudoElementContentItem::Text(quote));
-                        }
-                    },
-                    ContentItem::Counter(_, style) | ContentItem::Counters(_, _, style) => {
-                        // TODO: Add support for counters, this assumes a value of 0.
-                        vec.push(PseudoElementContentItem::Text(
-                            generate_counter_representation(style).to_string(),
-                        ));
-                    },
-                    ContentItem::NoOpenQuote | ContentItem::NoCloseQuote => {},
-                }
-            }
-            vec
+                                        &quotes.opening,
+                                        &quotes.closing,
+                                    ))
+                                },
+                            };
+                            maybe_quote.map(PseudoElementContentItem::Text)
+                        },
+                        ContentItem::Counter(_, style) | ContentItem::Counters(_, _, style) => {
+                            // TODO: Add support for counters, this assumes a value of 0.
+                            Some(PseudoElementContentItem::Text(
+                                generate_counter_representation(style).to_string(),
+                            ))
+                        },
+                        ContentItem::NoOpenQuote | ContentItem::NoCloseQuote => None,
+                    }
+                })
+                .collect()
         },
         Content::Normal | Content::None => unreachable!(),
     }

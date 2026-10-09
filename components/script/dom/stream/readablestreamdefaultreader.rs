@@ -8,10 +8,13 @@ use std::mem;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
+use js::conversions::{ConversionResult, FromJSValConvertible};
 use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
 use js::realm::CurrentRealm;
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue};
+use js::typedarray::Uint8Array;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object, reflect_dom_object_with_proto};
 
@@ -20,19 +23,19 @@ use super::readablebytestreamcontroller::ReadableByteStreamController;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultReaderBinding::{
     ReadableStreamDefaultReaderMethods, ReadableStreamReadResult,
 };
+use crate::dom::bindings::conversions::ConversionBehavior;
 use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise, TracedPromise};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
-use crate::dom::readablestream::{ReadableStream, bytes_from_chunk_jsval};
+use crate::dom::readablestream::ReadableStream;
 use crate::dom::stream::defaultteereadrequest::DefaultTeeReadRequest;
 use crate::dom::stream::readablestreamgenericreader::ReadableStreamGenericReader;
 use crate::dom::types::ReadableStreamDefaultController;
 use crate::realms::enter_auto_realm;
-use crate::script_runtime::CanGc;
 
 type ReadAllBytesSuccessSteps = dyn Fn(&mut js::context::JSContext, &[u8]);
 type ReadAllBytesFailureSteps = dyn Fn(&mut js::context::JSContext, SafeHandleValue);
@@ -70,21 +73,22 @@ fn read_loop(
     // bytes, successSteps, and failureSteps:
 
     // Step 1 .Let readRequest be a new read request with the following items:
-    let req = ReadRequest::ReadLoop {
+    rooted!(&in(cx) let req = ReadRequest::ReadLoop {
         success_steps,
         failure_steps,
         reader: Dom::from_ref(reader),
         bytes: Rc::new(DomRefCell::new(Vec::new())),
-    };
+    });
     // Step 2 .Perform ! ReadableStreamDefaultReaderRead(reader, readRequest).
     reader.read(cx, &req);
 }
 
 /// <https://streams.spec.whatwg.org/#read-request>
 #[derive(Clone, JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) enum ReadRequest {
     /// <https://streams.spec.whatwg.org/#default-reader-read>
-    Read(#[conditional_malloc_size_of] Rc<Promise>),
+    Read(TracedPromise),
     /// <https://streams.spec.whatwg.org/#ref-for-read-request%E2%91%A2>
     DefaultTee {
         tee_read_request: Dom<DefaultTeeReadRequest>,
@@ -107,6 +111,8 @@ pub(crate) enum ReadRequest {
     },
 }
 
+impl js::rust::Rootable for ReadRequest {}
+
 impl ReadRequest {
     /// <https://streams.spec.whatwg.org/#read-request-chunk-steps>
     pub(crate) fn chunk_steps(
@@ -120,20 +126,20 @@ impl ReadRequest {
                 // chunk steps, given chunk
                 // Resolve promise with «[ "value" → chunk, "done" → false ]».
                 promise.resolve_native(
+                    cx,
                     &ReadableStreamReadResult {
                         done: Some(false),
-                        value: chunk,
+                        value: chunk.into_box(),
                     },
-                    CanGc::from_cx(cx),
                 );
             },
             ReadRequest::DefaultTee { tee_read_request } => {
-                tee_read_request.enqueue_chunk_steps(chunk);
+                tee_read_request.enqueue_chunk_steps(cx, chunk);
             },
             ReadRequest::ByteTee {
                 byte_tee_read_request,
             } => {
-                byte_tee_read_request.enqueue_chunk_steps(global, chunk);
+                byte_tee_read_request.enqueue_chunk_steps(cx, global, chunk);
             },
             ReadRequest::ReadLoop {
                 success_steps: _,
@@ -144,38 +150,63 @@ impl ReadRequest {
                 // Spec: chunk steps, given chunk
                 let global = reader.global();
 
-                match bytes_from_chunk_jsval(cx.into(), &chunk, CanGc::from_cx(cx)) {
-                    Ok(vec) => {
-                        // Step 2. Append the bytes represented by chunk to bytes.
-                        bytes.borrow_mut().extend_from_slice(&vec);
-
-                        // Step 3. Read-loop given reader, bytes, successSteps, and failureSteps.
-                        // Spec note: Avoid direct recursion; queue into a microtask.
-                        // Resolving the promise will queue a microtask to call into the native handler.
-                        let tick = Promise::new(&global, CanGc::from_cx(cx));
-                        tick.resolve_native(&(), CanGc::from_cx(cx));
-
-                        let handler = PromiseNativeHandler::new(
-                            &global,
-                            Some(Box::new(ContinueReadMicrotask {
-                                reader: Dom::from_ref(reader),
-                                request: self.clone(),
-                            })),
-                            None,
-                            CanGc::from_cx(cx),
-                        );
-
-                        let mut realm = enter_auto_realm(cx, &*global);
-                        let cx = &mut realm.current_realm();
-                        tick.append_native_handler(cx, &handler);
-                    },
-                    Err(err) => {
-                        // Step 1. If chunk is not a Uint8Array object, call failureSteps with a TypeError and abort.
+                // Step 1. If chunk is not a Uint8Array object, call failureSteps with a TypeError and abort.
+                auto_root!(&in(cx) let array = match Uint8Array::from_jsval(cx, chunk.handle(), ()) {
+                    Ok(ConversionResult::Success(array)) => array,
+                    _ => {
                         rooted!(&in(cx) let mut v = UndefinedValue());
-                        err.to_jsval(cx.into(), &global, v.handle_mut(), CanGc::from_cx(cx));
+                        Error::Type(c"Chunk is not a Uint8Array.".to_owned())
+                            .to_jsval(cx, &global, v.handle_mut());
                         (failure_steps)(cx, v.handle());
+                        return;
                     },
+                });
+
+                // Step 2. Append the bytes represented by chunk to bytes.
+                if array.is_shared() {
+                    let chunk_bytes = match Vec::<u8>::from_jsval(
+                        cx,
+                        chunk.handle(),
+                        ConversionBehavior::EnforceRange,
+                    ) {
+                        Ok(ConversionResult::Success(chunk_bytes)) => chunk_bytes,
+                        _ => {
+                            rooted!(&in(cx) let mut v = UndefinedValue());
+                            Error::Type(c"Unknown format for bytes read.".to_owned()).to_jsval(
+                                cx,
+                                &global,
+                                v.handle_mut(),
+                            );
+                            (failure_steps)(cx, v.handle());
+                            return;
+                        },
+                    };
+                    bytes.borrow_mut().extend_from_slice(&chunk_bytes);
+                } else {
+                    bytes
+                        .borrow_mut()
+                        .extend_from_slice(array.as_slice_safe(cx.no_gc()).unwrap_or(&[]));
                 }
+
+                // Step 3. Read-loop given reader, bytes, successSteps, and failureSteps.
+                // Spec note: Avoid direct recursion; queue into a microtask.
+                // Resolving the promise will queue a microtask to call into the native handler.
+                let tick = Promise::new(cx, &global);
+                tick.resolve_native(cx, &());
+
+                let handler = PromiseNativeHandler::new(
+                    cx,
+                    &global,
+                    Some(Box::new(ContinueReadMicrotask {
+                        reader: Dom::from_ref(reader),
+                        request: self.clone(),
+                    })),
+                    None,
+                );
+
+                let mut realm = enter_auto_realm(cx, &*global);
+                let cx = &mut realm.current_realm();
+                tick.append_native_handler(cx, &handler);
             },
         }
     }
@@ -186,14 +217,12 @@ impl ReadRequest {
             ReadRequest::Read(promise) => {
                 // close steps
                 // Resolve promise with «[ "value" → undefined, "done" → true ]».
-                let result = RootedTraceableBox::new(Heap::default());
-                result.set(UndefinedValue());
                 promise.resolve_native(
+                    cx,
                     &ReadableStreamReadResult {
                         done: Some(true),
-                        value: result,
+                        value: Heap::boxed(UndefinedValue()),
                     },
-                    CanGc::from_cx(cx),
                 );
             },
             ReadRequest::DefaultTee { tee_read_request } => {
@@ -228,7 +257,7 @@ impl ReadRequest {
             ReadRequest::Read(promise) => {
                 // error steps, given e
                 // Reject promise with e.
-                promise.reject_native(&e, CanGc::from_cx(cx))
+                promise.reject_native(cx, &e)
             },
             ReadRequest::DefaultTee { tee_read_request } => {
                 tee_read_request.error_steps();
@@ -265,8 +294,7 @@ struct ByteTeeClosedPromiseRejectionHandler {
     canceled_1: Rc<Cell<bool>>,
     #[conditional_malloc_size_of]
     canceled_2: Rc<Cell<bool>>,
-    #[conditional_malloc_size_of]
-    cancel_promise: Rc<Promise>,
+    cancel_promise: TracedPromise,
     #[conditional_malloc_size_of]
     reader_version: Rc<Cell<u64>>,
     expected_version: u64,
@@ -289,7 +317,7 @@ impl Callback for ByteTeeClosedPromiseRejectionHandler {
 
         // If canceled1 is false or canceled2 is false, resolve cancelPromise with undefined.
         if !self.canceled_1.get() || !self.canceled_2.get() {
-            self.cancel_promise.resolve_native(&(), CanGc::from_cx(cx));
+            self.cancel_promise.resolve_native(cx, &());
         }
     }
 }
@@ -305,8 +333,7 @@ struct DefaultTeeClosedPromiseRejectionHandler {
     canceled_1: Rc<Cell<bool>>,
     #[conditional_malloc_size_of]
     canceled_2: Rc<Cell<bool>>,
-    #[conditional_malloc_size_of]
-    cancel_promise: Rc<Promise>,
+    cancel_promise: TracedPromise,
 }
 
 impl Callback for DefaultTeeClosedPromiseRejectionHandler {
@@ -320,7 +347,7 @@ impl Callback for DefaultTeeClosedPromiseRejectionHandler {
 
         // If canceled_1 is false or canceled_2 is false, resolve cancelPromise with undefined.
         if !self.canceled_1.get() || !self.canceled_2.get() {
-            self.cancel_promise.resolve_native(&(), CanGc::from_cx(cx));
+            self.cancel_promise.resolve_native(cx, &());
         }
     }
 }
@@ -336,47 +363,47 @@ pub(crate) struct ReadableStreamDefaultReader {
     read_requests: DomRefCell<VecDeque<ReadRequest>>,
 
     /// <https://streams.spec.whatwg.org/#readablestreamgenericreader-closedpromise>
-    #[conditional_malloc_size_of]
-    closed_promise: DomRefCell<Rc<Promise>>,
+    closed_promise: DomRefCell<TracedPromise>,
 }
 
 impl ReadableStreamDefaultReader {
     fn new_with_proto(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<SafeHandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<ReadableStreamDefaultReader> {
+        let closed_promise = Promise::new(cx, global);
         reflect_dom_object_with_proto(
-            Box::new(ReadableStreamDefaultReader::new_inherited(global, can_gc)),
+            cx,
+            Box::new(ReadableStreamDefaultReader::new_inherited(&closed_promise)),
             global,
             proto,
-            can_gc,
         )
     }
 
-    fn new_inherited(global: &GlobalScope, can_gc: CanGc) -> ReadableStreamDefaultReader {
+    fn new_inherited(promise: &RootedPromise) -> ReadableStreamDefaultReader {
         ReadableStreamDefaultReader {
             reflector_: Reflector::new(),
             stream: MutNullableDom::new(None),
             read_requests: DomRefCell::new(Default::default()),
-            closed_promise: DomRefCell::new(Promise::new(global, can_gc)),
+            closed_promise: DomRefCell::new(promise.to_traced()),
         }
     }
 
-    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<ReadableStreamDefaultReader> {
-        reflect_dom_object(
-            Box::new(Self::new_inherited(global, can_gc)),
-            global,
-            can_gc,
-        )
+    pub(crate) fn new(
+        cx: &mut JSContext,
+        global: &GlobalScope,
+    ) -> DomRoot<ReadableStreamDefaultReader> {
+        let closed_promise = Promise::new(cx, global);
+        reflect_dom_object(cx, Box::new(Self::new_inherited(&closed_promise)), global)
     }
 
     /// <https://streams.spec.whatwg.org/#set-up-readable-stream-default-reader>
     pub(crate) fn set_up(
         &self,
+        cx: &mut JSContext,
         stream: &ReadableStream,
         global: &GlobalScope,
-        can_gc: CanGc,
     ) -> Fallible<()> {
         // If ! IsReadableStreamLocked(stream) is true, throw a TypeError exception.
         if stream.is_locked() {
@@ -384,7 +411,7 @@ impl ReadableStreamDefaultReader {
         }
         // Perform ! ReadableStreamReaderGenericInitialize(reader, stream).
 
-        self.generic_initialize(global, stream, can_gc);
+        self.generic_initialize(cx, global, stream);
 
         // Set reader.[[readRequests]] to a new empty list.
         self.read_requests.borrow_mut().clear();
@@ -395,15 +422,13 @@ impl ReadableStreamDefaultReader {
     /// <https://streams.spec.whatwg.org/#readable-stream-close>
     pub(crate) fn close(&self, cx: &mut js::context::JSContext) {
         // Resolve reader.[[closedPromise]] with undefined.
-        self.closed_promise
-            .borrow()
-            .resolve_native(&(), CanGc::from_cx(cx));
+        self.closed_promise.borrow().resolve_native(cx, &());
         // If reader implements ReadableStreamDefaultReader,
         // Let readRequests be reader.[[readRequests]].
-        let mut read_requests = self.take_read_requests();
+        rooted!(&in(cx) let mut read_requests = self.take_read_requests());
         // Set reader.[[readRequests]] to an empty list.
         // For each readRequest of readRequests,
-        for request in read_requests.drain(0..) {
+        for request in read_requests.iter() {
             // Perform readRequest’s close steps.
             request.close_steps(cx);
         }
@@ -424,12 +449,10 @@ impl ReadableStreamDefaultReader {
     /// <https://streams.spec.whatwg.org/#readable-stream-error>
     pub(crate) fn error(&self, cx: &mut js::context::JSContext, e: SafeHandleValue) {
         // Reject reader.[[closedPromise]] with e.
-        self.closed_promise
-            .borrow()
-            .reject_native(&e, CanGc::from_cx(cx));
+        self.closed_promise.borrow().reject_native(cx, &e);
 
         // Set reader.[[closedPromise]].[[PromiseIsHandled]] to true.
-        self.closed_promise.borrow().set_promise_is_handled();
+        self.closed_promise.borrow().set_promise_is_handled(cx);
 
         // Perform ! ReadableStreamDefaultReaderErrorReadRequests(reader, e).
         self.error_read_requests(cx, e);
@@ -446,15 +469,13 @@ impl ReadableStreamDefaultReader {
     /// <https://streams.spec.whatwg.org/#abstract-opdef-readablestreamdefaultreaderrelease>
     pub(crate) fn release(&self, cx: &mut js::context::JSContext) -> Fallible<()> {
         // Perform ! ReadableStreamReaderGenericRelease(reader).
-        self.generic_release(CanGc::from_cx(cx))
-            .expect("Generic release failed");
+        self.generic_release(cx).expect("Generic release failed");
         // Let e be a new TypeError exception.
         rooted!(&in(cx) let mut error = UndefinedValue());
         Error::Type(c"Reader is released".to_owned()).to_jsval(
-            cx.into(),
+            cx,
             &self.global(),
             error.handle_mut(),
-            CanGc::from_cx(cx),
         );
 
         // Perform ! ReadableStreamDefaultReaderErrorReadRequests(reader, e).
@@ -469,10 +490,10 @@ impl ReadableStreamDefaultReader {
     /// <https://streams.spec.whatwg.org/#abstract-opdef-readablestreamdefaultreadererrorreadrequests>
     fn error_read_requests(&self, cx: &mut js::context::JSContext, rval: SafeHandleValue) {
         // step 1
-        let mut read_requests = self.take_read_requests();
+        rooted!(&in(cx) let mut read_requests = self.take_read_requests());
 
         // step 2 & 3
-        for request in read_requests.drain(0..) {
+        for request in read_requests.iter() {
             request.error_steps(cx, rval);
         }
     }
@@ -516,7 +537,7 @@ impl ReadableStreamDefaultReader {
         branch_2: &ReadableStream,
         canceled_1: Rc<Cell<bool>>,
         canceled_2: Rc<Cell<bool>>,
-        cancel_promise: Rc<Promise>,
+        cancel_promise: &RootedPromise,
         reader_version: Rc<Cell<u64>>,
         expected_version: u64,
     ) {
@@ -526,6 +547,7 @@ impl ReadableStreamDefaultReader {
 
         let global = self.global();
         let handler = PromiseNativeHandler::new(
+            cx,
             &global,
             None,
             Some(Box::new(ByteTeeClosedPromiseRejectionHandler {
@@ -533,11 +555,10 @@ impl ReadableStreamDefaultReader {
                 branch_2_controller: Dom::from_ref(&branch_2_controller),
                 canceled_1,
                 canceled_2,
-                cancel_promise,
+                cancel_promise: cancel_promise.to_traced(),
                 reader_version,
                 expected_version,
             })),
-            CanGc::from_cx(cx),
         );
 
         let mut realm = enter_auto_realm(cx, &*global);
@@ -556,7 +577,7 @@ impl ReadableStreamDefaultReader {
         branch_2: &ReadableStream,
         canceled_1: Rc<Cell<bool>>,
         canceled_2: Rc<Cell<bool>>,
-        cancel_promise: Rc<Promise>,
+        cancel_promise: &RootedPromise,
     ) {
         let branch_1_controller = branch_1.get_default_controller();
 
@@ -564,6 +585,7 @@ impl ReadableStreamDefaultReader {
 
         let global = self.global();
         let handler = PromiseNativeHandler::new(
+            cx,
             &global,
             None,
             Some(Box::new(DefaultTeeClosedPromiseRejectionHandler {
@@ -571,9 +593,8 @@ impl ReadableStreamDefaultReader {
                 branch_2_controller: Dom::from_ref(&branch_2_controller),
                 canceled_1,
                 canceled_2,
-                cancel_promise,
+                cancel_promise: cancel_promise.to_traced(),
             })),
-            CanGc::from_cx(cx),
         );
 
         let mut realm = enter_auto_realm(cx, &*global);
@@ -602,7 +623,7 @@ impl ReadableStreamDefaultReader {
     pub(crate) fn process_read_requests(
         &self,
         cx: &mut js::context::JSContext,
-        controller: DomRoot<ReadableByteStreamController>,
+        controller: &ReadableByteStreamController,
     ) -> Fallible<()> {
         // While reader.[[readRequests]] is not empty,
         while !self.read_requests.borrow().is_empty() {
@@ -613,7 +634,7 @@ impl ReadableStreamDefaultReader {
 
             // Let readRequest be reader.[[readRequests]][0].
             // Remove entry from controller.[[queue]].
-            let read_request = self.remove_read_request();
+            rooted!(&in(cx) let read_request = self.remove_read_request());
 
             // Perform ! ReadableByteStreamControllerFillReadRequestFromQueue(controller, readRequest).
             controller
@@ -627,39 +648,33 @@ impl ReadableStreamDefaultReader {
 impl ReadableStreamDefaultReaderMethods<crate::DomTypeHolder> for ReadableStreamDefaultReader {
     /// <https://streams.spec.whatwg.org/#default-reader-constructor>
     fn Constructor(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<SafeHandleObject>,
-        can_gc: CanGc,
         stream: &ReadableStream,
     ) -> Fallible<DomRoot<Self>> {
-        let reader = Self::new_with_proto(global, proto, can_gc);
+        let reader = Self::new_with_proto(cx, global, proto);
 
         // Perform ? SetUpReadableStreamDefaultReader(this, stream).
-        Self::set_up(&reader, stream, global, can_gc)?;
+        reader.set_up(cx, stream, global)?;
 
         Ok(reader)
     }
 
     /// <https://streams.spec.whatwg.org/#default-reader-read>
-    fn Read(&self, cx: &mut js::context::JSContext) -> Rc<Promise> {
+    fn Read(&self, cx: &mut js::context::JSContext) -> RootedPromise {
         // If this.[[stream]] is undefined, return a promise rejected with a TypeError exception.
         if self.stream.get().is_none() {
             rooted!(&in(cx) let mut error = UndefinedValue());
             Error::Type(c"stream is undefined".to_owned()).to_jsval(
-                cx.into(),
+                cx,
                 &self.global(),
                 error.handle_mut(),
-                CanGc::from_cx(cx),
             );
-            return Promise::new_rejected(
-                &self.global(),
-                cx.into(),
-                error.handle(),
-                CanGc::from_cx(cx),
-            );
+            return Promise::new_rejected(cx, &self.global(), error.handle());
         }
         // Let promise be a new promise.
-        let promise = Promise::new2(cx, &self.global());
+        let promise = Promise::new(cx, &self.global());
 
         // Let readRequest be a new read request with the following items:
         // chunk steps, given chunk
@@ -671,10 +686,7 @@ impl ReadableStreamDefaultReaderMethods<crate::DomTypeHolder> for ReadableStream
         // error steps, given e
         // Reject promise with e.
 
-        // Rooting(unrooted_must_root): the read request contains only a promise,
-        // which does not need to be rooted,
-        // as it is safely managed natively via an Rc.
-        let read_request = ReadRequest::Read(promise.clone());
+        rooted!(&in(cx) let read_request = ReadRequest::Read(promise.to_traced()));
 
         // Perform ! ReadableStreamDefaultReaderRead(this, readRequest).
         self.read(cx, &read_request);
@@ -695,23 +707,23 @@ impl ReadableStreamDefaultReaderMethods<crate::DomTypeHolder> for ReadableStream
     }
 
     /// <https://streams.spec.whatwg.org/#generic-reader-closed>
-    fn Closed(&self) -> Rc<Promise> {
-        self.closed()
+    fn Closed(&self, cx: &JSContext) -> RootedPromise {
+        self.closed(cx)
     }
 
     /// <https://streams.spec.whatwg.org/#generic-reader-cancel>
-    fn Cancel(&self, cx: &mut js::context::JSContext, reason: SafeHandleValue) -> Rc<Promise> {
+    fn Cancel(&self, cx: &mut js::context::JSContext, reason: SafeHandleValue) -> RootedPromise {
         self.generic_cancel(cx, &self.global(), reason)
     }
 }
 
 impl ReadableStreamGenericReader for ReadableStreamDefaultReader {
-    fn get_closed_promise(&self) -> Rc<Promise> {
-        self.closed_promise.borrow().clone()
+    fn get_closed_promise(&self, cx: &JSContext) -> RootedPromise {
+        self.closed_promise.borrow().root(cx)
     }
 
-    fn set_closed_promise(&self, promise: Rc<Promise>) {
-        *self.closed_promise.borrow_mut() = promise;
+    fn set_closed_promise(&self, promise: &RootedPromise) {
+        *self.closed_promise.borrow_mut() = promise.to_traced();
     }
 
     fn set_stream(&self, stream: Option<&ReadableStream>) {

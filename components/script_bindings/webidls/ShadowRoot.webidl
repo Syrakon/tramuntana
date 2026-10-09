@@ -25,8 +25,13 @@ ShadowRoot includes DocumentOrShadowRoot;
 
 // https://html.spec.whatwg.org/multipage/#dom-parsing-and-serialization
 partial interface ShadowRoot {
-  [CEReactions, Throws] undefined setHTMLUnsafe((TrustedHTML or DOMString) html);
+  [CEReactions, Throws] undefined setHTMLUnsafe((TrustedHTML or DOMString) html, optional SetHTMLUnsafeOptions options = {});
   DOMString getHTML(optional GetHTMLOptions options = {});
 
   [CEReactions, Throws] attribute (TrustedHTML or [LegacyNullToEmptyString] DOMString) innerHTML;
+};
+
+// https://wicg.github.io/sanitizer-api/#sanitizer-api
+partial interface ShadowRoot {
+  [CEReactions, Throws] undefined setHTML(DOMString html, optional SetHTMLOptions options = {});
 };

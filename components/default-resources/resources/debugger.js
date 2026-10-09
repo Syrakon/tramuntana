@@ -7,7 +7,12 @@ const debuggeesToPipelineIds = new Map;
 const debuggeesToWorkerIds = new Map;
 const sourceIdsToScripts = new Map;
 const frameActorsToFrames = new Map;
+const objectActorsToObjects = new Map;
 const environmentsToEnvironmentActors = new Map;
+const blackboxing = new Map;
+let suspendedFrame = null;
+let lastPauseLocation = null;
+let debuggerPaused = false;
 
 // <https://searchfox.org/firefox-main/source/devtools/server/actors/thread.js#155>
 // Possible values for the `why.type` attribute in "paused" event
@@ -44,6 +49,16 @@ function findKeyByValue(map, search) {
     return undefined;
 }
 
+// The === operator isn't really applicable to pipelineId
+function findDebuggeeByPipelineId(search) {
+    for (const [key, value] of debuggeesToPipelineIds) {
+        if (value.namespaceId == search.namespaceId && value.index == search.index) {
+            return key;
+        }
+    }
+    return undefined;
+}
+
 dbg.uncaughtExceptionHook = function(error) {
     console.error(`[debugger] Uncaught exception at ${error.fileName}:${error.lineNumber}:${error.columnNumber}: ${error.name}: ${error.message}`);
 };
@@ -75,42 +90,64 @@ addEventListener("addDebuggee", event => {
 
 // Convert debuggee value to property descriptor value
 // <https://searchfox.org/firefox-main/source/devtools/server/actors/object/utils.js#116>
-function createValueGrip(value, depth = 0) {
+function createValueGrip(value, depth) {
     switch (typeof value) {
         case "undefined":
-            return { valueType: "undefined" };
+            return "VoidValue";
         case "boolean":
-            return { valueType: "boolean", booleanValue: value };
+            return { BooleanValue: value };
         case "number":
             if (value === Infinity) {
-                return { valueType: "Infinity" };
+                return { NumberValue: "Infinity" };
             } else if (value === -Infinity) {
-                return { valueType: "-Infinity" };
+                return { NumberValue: "-Infinity" };
             } else if (Number.isNaN(value)) {
-                return { valueType: "NaN" };
+                return { NumberValue: "NaN" };
             } else if (Object.is(value, -0)) {
-                return { valueType: "-0" };
+                return { NumberValue: "-0" };
             }
-            return { valueType: "number", numberValue: value };
+            return { NumberValue: value };
         case "string":
-            return { valueType: "string", stringValue: value };
+            return { StringValue: value };
         case "object":
             // <https://searchfox.org/firefox-main/source/devtools/server/actors/object/utils.js#153>
             if (value === null) {
-                return { valueType: "null" };
+                return { NullValue: false };
             }
-            if (value.optimizedOut || value.uninitialized || value.missingArguments) {
-                return { valueType: "null" };
+            if (value.uninitialized) {
+                return { NullValue: true };
             }
+            if (value.optimizedOut || value.missingArguments) {
+                return { NullValue: false };
+            }
+            // TODO: handle typed arrays and storage independently
+            const ownPropertyLength = value.getOwnPropertyNamesLength();
+            let objectActorId = findKeyByValue(objectActorsToObjects, value);
+            const objectValue = {
+                class: value.class,
+                ownPropertyLength: Number.isFinite(ownPropertyLength) ? ownPropertyLength : undefined,
+            };
             // Debugger.Object - get preview using registered previewers
             // <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger.object/index.html>
-            return {
-                valueType: "object",
-                objectClass: value.class,
-                preview: getPreview(value, depth),
-            };
+            const preview = getPreview(value, depth + 1);
+            if (!preview) {
+                // Reusing an actor with a stored preview can cause recursion, we should handle it properly at some point.
+                return { ObjectValue: objectValue };
+            }
+            objectValue.preview = preview;
+
+            if (!objectActorId) {
+                objectActorId = registerObjectActor(JSON.stringify({ ObjectValue: objectValue }));
+                if (!objectActorId) {
+                    console.error("[debugger] Couldn't create object actor");
+                    return { ObjectValue: objectValue };
+                }
+                objectActorsToObjects.set(objectActorId, value);
+            }
+            objectValue.actor = objectActorId;
+            return { ObjectValue: objectValue };
         default:
-            return { valueType: "string", stringValue: String(value) };
+            return { StringValue: String(value) };
     }
 }
 
@@ -165,10 +202,90 @@ function extractOwnProperties(obj, depth) {
 // <https://searchfox.org/mozilla-central/source/devtools/server/actors/object/previewers.js#80>
 const previewers = {};
 
+// <https://searchfox.org/firefox-main/source/devtools/shared/DevToolsUtils.js#182>
+function getProperty(object, name) {
+    const root = object;
+    while (object) {
+        let desc;
+        try {
+            desc = object.getOwnPropertyDescriptor(name);
+        } catch (e) {
+            return undefined;
+        }
+
+        if (desc) {
+            if ("value" in desc) {
+                return desc.value;
+            }
+
+            if (desc.get) {
+                try {
+                    return desc.get.call(root)?.return;
+                } catch (e) { }
+            }
+
+            return undefined;
+        }
+
+        object = object.proto;
+    }
+
+    return undefined;
+}
+
+// Calls the property with the given `name` on the given `object`, where
+// `name` is a string, and `object` a Debugger.Object instance.
+// <https://searchfox.org/firefox-main/source/devtools/shared/DevToolsUtils.js#943>
+function callPropertyOnObject(object, name, ...args) {
+    let descriptor;
+    let proto = object;
+    do {
+        descriptor = proto.getOwnPropertyDescriptor(name);
+        if (descriptor !== undefined) {
+            break;
+        }
+        proto = proto.proto;
+    } while (proto !== null);
+
+    if (descriptor === undefined) {
+        throw new Error("No such property");
+    }
+
+    const value = descriptor.value;
+    if (typeof value !== "object" || value === null || !("callable" in value)) {
+        throw new Error("Not a callable object.");
+    }
+
+    if (value.script !== undefined) {
+        throw new Error(
+            "The property isn't a native function and will execute code in the debuggee"
+        );
+    }
+
+    const result = value.call(object, ...args);
+    if (result === null) {
+        throw new Error("Code was terminated.");
+    }
+    if ("throw" in result) {
+        throw result.throw;
+    }
+    return result.return;
+}
+
+// <https://searchfox.org/firefox-main/source/devtools/shared/DevToolsUtils.js#983>
+function* makeDebuggeeIterator(object) {
+    while (true) {
+        const nextValue = callPropertyOnObject(object, "next");
+        if (getProperty(nextValue, "done")) {
+            break;
+        }
+        yield getProperty(nextValue, "value");
+    }
+}
+
 // <https://searchfox.org/mozilla-central/source/devtools/server/actors/object/previewers.js#125>
 previewers.Function = [ function FunctionPreviewer(obj, depth) {
-    const { ownProperties, ownPropertiesLength } = extractOwnProperties(obj, depth);
-    let function_details = {
+    let functionDetails = {
         name: obj.name,
         displayName: obj.displayName,
         parameterNames: obj.parameterNames ? obj.parameterNames: [],
@@ -176,65 +293,87 @@ previewers.Function = [ function FunctionPreviewer(obj, depth) {
         isGenerator: obj.isGeneratorFunction,
     }
 
+    let preview = { kind: "Object", function: functionDetails };
     if (depth > 1) {
-        return { kind: "Object", function: function_details, ownPropertiesLength };
+        return undefined;
     }
 
-    return {
-        kind: "Object",
-        ownProperties,
-        ownPropertiesLength,
-        function: function_details
-    };
+    const { ownProperties, ownPropertiesLength } = extractOwnProperties(obj, depth);
+    preview.ownProperties = ownProperties;
+    preview.ownPropertiesLength = ownPropertiesLength;
+
+    return preview;
 } ];
 
 // <https://searchfox.org/mozilla-central/source/devtools/server/actors/object/previewers.js#172>
 previewers.Array = [ function ArrayPreviewer(obj, depth) {
     const lengthDescriptor = obj.getOwnPropertyDescriptor("length");
-    const length = lengthDescriptor ? lengthDescriptor.value : 0;
+    const arrayLength = lengthDescriptor ? lengthDescriptor.value : 0;
 
+    let preview = { kind: "ArrayLike", arrayLength };
     if (depth > 1) {
-        return {
-            kind: "ArrayLike",
-            arrayLength: length,
-        };
+        return preview;
     }
 
-    const items = [];
-    for (let i = 0; i < length; i++) {
-        try {
-            const desc = obj.getOwnPropertyDescriptor(i);
-            if (desc && desc.value !== undefined) {
-                const grip = createValueGrip(desc.value, depth);
-                delete grip.preview;
-                items.push(grip);
-            }
-        } catch (e) {
-            // For now skip properties that throw on access
+    preview.items = [];
+    for (let i = 0; i < arrayLength; i++) {
+        const desc = obj.getOwnPropertyDescriptor(i);
+        if (desc && desc.value !== undefined) {
+            preview.items.push(createValueGrip(desc.value, depth + 1));
         }
     }
 
+    return preview;
+} ];
+
+// <https://searchfox.org/firefox-main/source/devtools/server/actors/object/property-iterator.js#298>
+function enumMapEntries(obj, depth) {
+    const entries = makeDebuggeeIterator(callPropertyOnObject(obj, "entries"));
     return {
-        kind: "ArrayLike",
-        arrayLength: length,
-        items: items,
+        *[Symbol.iterator]() {
+            for (const entry of entries) {
+                yield [
+                    getProperty(entry, 0),
+                    getProperty(entry, 1),
+                ].map(value => createValueGrip(value, depth));
+            }
+        }
     };
+}
+
+// <https://searchfox.org/firefox-main/source/devtools/server/actors/object/previewers.js#450>
+previewers.Map = [ function MapPreviewer(object, depth) {
+    const size = getProperty(object, "size");
+    if (typeof size !== "number") {
+        return undefined;
+    }
+
+    let preview = { kind: "MapLike", size };
+    if (depth > 1) {
+        return preview;
+    }
+
+    preview.entries = [];
+    for (const entry of enumMapEntries(object, depth)) {
+        preview.entries.push(entry);
+    }
+
+    return preview;
 } ];
 
 // Generic fallback for object previewer
 // <https://searchfox.org/mozilla-central/source/devtools/server/actors/object/previewers.js#856>
 previewers.Object = [ function ObjectPreviewer(obj, depth) {
-    const { ownProperties, ownPropertiesLength } = extractOwnProperties(obj, depth);
-
+    let preview = { kind: "Object" };
     if (depth > 1) {
-       return { kind: "Object", ownPropertiesLength };
+       return undefined;
     }
 
-    return {
-        kind: "Object",
-        ownProperties,
-        ownPropertiesLength,
-    };
+    const { ownProperties, ownPropertiesLength } = extractOwnProperties(obj, depth);
+    preview.ownProperties = ownProperties;
+    preview.ownPropertiesLength = ownPropertiesLength;
+
+    return preview;
 } ];
 
 function getPreview(obj, depth) {
@@ -243,56 +382,163 @@ function getPreview(obj, depth) {
     // <https://searchfox.org/mozilla-central/source/devtools/server/actors/object.js#295>
     const typePreviewers = previewers[className] || previewers.Object;
     for (const previewer of typePreviewers) {
-        const result = previewer(obj, depth);
-        if (result) return result;
+        try {
+            const result = previewer(obj, depth);
+            if (result) return result;
+        } catch (e) {
+            console.error(`[debugger] Couldn't populate ${className} preview: ${e}`);
+        }
     }
 
-    return { ownProperties: [], ownPropertiesLength: 0 };
+    return undefined;
 }
 
 // Evaluate some javascript code in the global context of the debuggee
 // See executeInGlobal() at <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger.object/index.html#function-properties-of-the-debugger-object-prototype>
 addEventListener("eval", event => {
-    const {code, pipelineId, workerId, frameActorId} = event;
+    const { code, pipelineId, workerId, frameActorId } = event;
 
-    let completionValue;
+    let frame;
     if (frameActorId) {
-        const frame = frameActorsToFrames.get(frameActorId);
-        // <https://searchfox.org/firefox-main/source/js/src/doc/Debugger/Debugger.Frame.md#223>
-        if (frame?.onStack) {
-            completionValue = frame.eval(code);
+        frame = frameActorsToFrames.get(frameActorId);
+    }
+    let global = workerId !== undefined ?
+        findKeyByValue(debuggeesToWorkerIds, workerId) :
+        findDebuggeeByPipelineId(pipelineId);
+
+    let noSideEffectDebugger;
+    if (event.eager) {
+        noSideEffectDebugger = createSideEffectFreeDebugger(global);
+
+        // We need to eval in the context of the temporary debugger to apply side-effect tracking
+        if (frame) {
+            frame = noSideEffectDebugger.adoptFrame(frame);
         } else {
-            completionValue = { throw: "Frame not available" };
+            global = noSideEffectDebugger.adoptDebuggeeValue(global);
         }
-    } else {
-        const object = workerId !== undefined ?
-            findKeyByValue(debuggeesToWorkerIds, workerId) :
-            findKeyByValue(debuggeesToPipelineIds, pipelineId);
-        completionValue = object.executeInGlobal(code);
     }
 
-    // Completion values: <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#completion-values>
-    let resultValue;
-    if (completionValue === null) {
-        resultValue = { completionType: "terminated", value: createValueGrip(undefined), hasException: false };
-    } else if ("throw" in completionValue) {
-        // See adoptDebuggeeValue() in <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger/index.html>
-        // <https://searchfox.org/firefox-main/source/devtools/server/actors/webconsole/eval-with-debugger.js#312>
-        // we probably don't need adoptDebuggeeValue, as we only have one debugger instance for now
-        // let value = dbg.adoptDebuggeeValue(completionValue.throw);
-        resultValue = { completionType: "throw", value: createValueGrip(completionValue.throw), hasException: true };
-    } else if ("return" in completionValue) {
-        resultValue = { completionType: "return", value: createValueGrip(completionValue.return), hasException: false };
-    }
+    try {
+        let completionValue;
+        if (frame) {
+            // <https://searchfox.org/firefox-main/source/js/src/doc/Debugger/Debugger.Frame.md#223>
+            if (frame?.onStack) {
+                completionValue = frame.eval(code);
+            } else {
+                completionValue = { throw: "Frame not available" };
+            }
+        } else {
+            completionValue = global.executeInGlobal(code);
+        }
 
-    // To avoid recursion errors in the WebIDL, preview needs to live outside of the property descriptor
-    if (resultValue.value.preview) {
-        resultValue.preview = resultValue.value.preview;
-        delete resultValue.value.preview;
-    }
+        // Completion values: <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#completion-values>
+        let resultValue;
+        if (completionValue === null) {
+            resultValue = {
+                value: createValueGrip(undefined, 0),
+                hasException: false,
+            };
+        } else if ("throw" in completionValue) {
+            let exceptionMessage = null;
+            if (typeof completionValue.throw.unsafeDereference === "function") {
+                const deref = completionValue.throw.unsafeDereference();
+                if (typeof deref.message === "string") {
+                    exceptionMessage = deref.message;
+                }
+            }
+            if (!exceptionMessage) {
+                exceptionMessage = `Uncaught ${completionValue.throw}`;
+            }
+            resultValue = {
+                value: createValueGrip(completionValue.throw, 0),
+                exceptionMessage,
+                hasException: true,
+            };
+        } else if ("return" in completionValue) {
+            resultValue = {
+                value: createValueGrip(completionValue.return, 0),
+                hasException: false,
+            };
+        }
 
-    evalResult(event, resultValue);
+        evalResult(event, {
+            serializedValue: JSON.stringify(resultValue.value),
+            exceptionMessage: resultValue.hasException ? resultValue.exceptionMessage : null,
+            hasException: resultValue.hasException,
+        });
+    } finally {
+        if (noSideEffectDebugger) {
+            noSideEffectDebugger.onNativeCall = undefined;
+            noSideEffectDebugger.shouldAvoidSideEffects = false;
+
+            // This must be called last as the cleanup above depends on the list of debuggees
+            noSideEffectDebugger.removeAllDebuggees();
+        }
+    }
 });
+
+// <https://searchfox.org/firefox-main/source/devtools/server/actors/webconsole/eval-with-debugger.js#436>
+function createSideEffectFreeDebugger(debuggee) {
+    const eagerDbg = new Debugger;
+
+    // Special flag in order to ensure that any evaluation or call being
+    // made via this debugger will be ignored by all debuggers except this one.
+    eagerDbg.exclusiveDebuggerOnEval = true;
+
+    // TODO: Add other debuggees that the evaluation might use
+    eagerDbg.addDebuggee(debuggee.unsafeDereference());
+
+    const timeoutDuration = 100;
+    const endTime = Date.now() + timeoutDuration;
+    let count = 0;
+    function shouldCancel() {
+        // To keep the evaled code as quick as possible, we avoid querying the
+        // current time on ever single step and instead check every 100 steps
+        // as an arbitrary count that seemed to be "often enough".
+        return ++count % 100 === 0 && Date.now() > endTime;
+    }
+
+    const executedScripts = new Set();
+    const handler = {
+        hit: () => null,
+    };
+    // null means abort; undefined means continue
+    eagerDbg.onEnterFrame = frame => {
+        if (shouldCancel()) {
+            return null;
+        }
+        frame.onStep = () => {
+            if (shouldCancel()) {
+                return null;
+            }
+            return undefined;
+        };
+
+        const script = frame.script;
+        if (executedScripts.has(script)) {
+            // Skip setting breakpoints in the same script again
+            return undefined;
+        }
+        executedScripts.add(script);
+
+        const offsets = script.getEffectfulOffsets();
+        for (const offset of offsets) {
+            script.setBreakpoint(offset, handler);
+        }
+
+        return undefined;
+    };
+
+    eagerDbg.onNativeCall = (_callee, _reason) => {
+        // TODO: Allow side-effect-free native calls
+        // Aborting on all native calls is naïve but safe
+        return null;
+    };
+
+    eagerDbg.shouldAvoidSideEffects = true;
+
+    return eagerDbg;
+}
 
 addEventListener("getPossibleBreakpoints", event => {
     const {spidermonkeyId} = event;
@@ -314,9 +560,10 @@ function createFrameActor(frame, pipelineId) {
         frameActorId = registerFrameActor(pipelineId, {
             // TODO: Some properties throw if terminated is true
             // TODO: arguments: frame.arguments,
-            displayName: frame.script.displayName,
+            displayName: frame.script.displayName ?? null,
             onStack: frame.onStack,
             oldest: frame.older == null,
+            serializedThis: JSON.stringify(createValueGrip(frame.this, 0)),
             terminated: frame.terminated,
             type_: frame.type,
             url: frame.script.url,
@@ -333,6 +580,13 @@ function createFrameActor(frame, pipelineId) {
 }
 
 function handlePauseAndRespond(frame, pauseReason) {
+    // https://searchfox.org/firefox-main/source/devtools/server/actors/thread.js#1706
+    // We don't handle nested pauses correctly.  Don't try - if we're
+    // paused, just continue running whatever code triggered the pause.
+    if (debuggerPaused) {
+        return undefined;
+    }
+
     dbg.onEnterFrame = undefined;
     clearSteppingHooks(frame);
 
@@ -353,13 +607,24 @@ function handlePauseAndRespond(frame, pauseReason) {
         column: offsetMetadata.columnNumber - 1,
         line: offsetMetadata.lineNumber
     };
+    lastPauseLocation = { line: offsetMetadata.lineNumber, column: offsetMetadata.columnNumber };
+
+    const source = frame.script.source;
+    if (source != null && isBlackBoxed(source.id, frameOffset.line, frameOffset.column)) {
+        return undefined;
+    }
 
     // Notify devtools and enter pause loop. This blocks until Resume.
-    pauseAndRespond(
-        pipelineId,
-        frameOffset,
-        pauseReason
-    );
+    debuggerPaused = true;
+    try {
+        pauseAndRespond(
+            pipelineId,
+            frameOffset,
+            pauseReason
+        );
+    } finally {
+        debuggerPaused = false;
+    }
 
     // <https://web.archive.org/web/20251212212538/https://firefox-source-docs.mozilla.org/js/Debugger/Conventions.html#resumption-values>
     // Return undefined to continue execution normally after resume.
@@ -427,28 +692,37 @@ addEventListener("interrupt", event => {
     );
 });
 
+// <https://searchfox.org/firefox-main/source/devtools/server/actors/thread.js#1088>
+function hasMoved(frame) {
+    if (!lastPauseLocation) {
+        return true;
+    }
+    const meta = frame.script.getOffsetMetadata(frame.offset);
+    return meta.lineNumber !== lastPauseLocation.line ||
+           meta.columnNumber !== lastPauseLocation.column;
+}
+
 function makeSteppingHooks(steppingType, startFrame) {
     return {
-        onEnterFrame: (frame) => {
+        onEnterFrame: function (frame) {
             const { onStep, onPop } = makeSteppingHooks("next", frame);
             frame.onStep = onStep;
             frame.onPop = onPop;
         },
-        onStep: () => {
-            const meta = startFrame.script.getOffsetMetadata(startFrame.offset);
-            if (meta.isBreakpoint && meta.isStepStart) {
-                return handlePauseAndRespond(startFrame, { type_: PAUSE_REASONS.RESUME_LIMIT });
+        onStep: function () {
+            const meta = this.script.getOffsetMetadata(this.offset);
+            if (!meta.isBreakpoint || !hasMoved(this)) {
+                return undefined;
+            }
+            if (this !== startFrame || meta.isStepStart) {
+                return handlePauseAndRespond(this, { type_: PAUSE_REASONS.RESUME_LIMIT });
             }
         },
-        onPop: (completion) => {
+        onPop: function (completion) {
             this.reportedPop = true;
-            suspendedFrame = startFrame;
-            if (steppingType !== "finish") {
-                // TODO: completion contains the return value, we have to send it back
-                // <https://searchfox.org/firefox-main/source/devtools/server/actors/thread.js#1026>
-                return handlePauseAndRespond(startFrame, { type_: steppingType });
-            }
-            attachSteppingHooks("next", startFrame);
+            suspendedFrame = this;
+            attachSteppingHooks(steppingType, this);
+            return undefined;
         },
     }
 }
@@ -501,7 +775,7 @@ function clearSteppingHooks(suspendedFrame) {
         suspendedFrame.onStep = undefined;
         suspendedFrame.onPop = undefined;
     }
-    let frame = this.youngestFrame;
+    let frame = dbg.getNewestFrame();
     if (frame?.onStack) {
         while (frame) {
             frame.onStep = undefined;
@@ -522,6 +796,10 @@ addEventListener("resume", event => {
         }
     }
     if (steppingType) {
+        // This is a temporary fix until we support async contexts.
+        if (steppingType === "finish") {
+            lastPauseLocation = null;
+        }
         attachSteppingHooks(steppingType, frame);
     } else {
         clearSteppingHooks(frame);
@@ -560,9 +838,16 @@ function createEnvironmentActor(environment) {
         parent = createEnvironmentActor(environment.parent);
     }
 
+    let bindingVariables = [];
     if (environment.type == "declarative") {
-        info.bindingVariables = buildBindings(environment);
+        bindingVariables = buildBindings(environment);
     }
+
+    // <https://searchfox.org/firefox-main/source/devtools/server/actors/environment.js#62>
+    if (environment.type == "object" || environment.type == "with") {
+        info.serializedObject = JSON.stringify(createValueGrip(environment.object, 0));
+    }
+    info.serializedBindings = JSON.stringify(bindingVariables);
 
     let actor = environmentsToEnvironmentActors.get(environment);
     actor = registerEnvironmentActor(info, parent, actor);
@@ -571,7 +856,7 @@ function createEnvironmentActor(environment) {
 }
 
 function buildBindings(environment) {
-    let bindingVars = [];
+    const bindingVariables = [];
     for (const name of environment.names()) {
         const value = environment.getVariable(name);
         const property = {
@@ -583,27 +868,90 @@ function buildBindings(environment) {
                 (value.optimizedOut || value.uninitialized || value.missingArguments)
             ),
             isAccessor: false,
-            value: createValueGrip(value),
+            value: createValueGrip(value, 0),
         };
 
-        // To avoid recursion errors in the WebIDL, preview needs to live outside of the property descriptor
-        let preview = undefined;
-        if (property.value.preview) {
-            preview = property.value.preview;
-            delete property.value.preview;
-        }
-
-        bindingVars.push({ property, preview });
+        bindingVariables.push(property);
     }
-    return bindingVars;
+    return bindingVariables;
 }
 
 // Get a `Debugger.Environment` instance within which evaluation is taking place.
 // <https://searchfox.org/firefox-main/source/devtools/server/actors/frame.js#109>
 addEventListener("getEnvironment", event => {
-    const {frameActorId} = event;
-    frame = frameActorsToFrames.get(frameActorId);
+    const { frameActorId, pipelineId } = event;
+    let environment;
+    if (frameActorId) {
+        environment = frameActorsToFrames.get(frameActorId).environment;
+    } else {
+        environment = findDebuggeeByPipelineId(pipelineId).asEnvironment();
+    }
 
-    const actor = createEnvironmentActor(frame.environment);
+    const actor = createEnvironmentActor(environment);
     getEnvironmentResult(actor);
 });
+
+addEventListener("blackbox", event => {
+    if (event.coversFullSource) {
+        // Blackbox the entire source
+        blackboxing.set(event.spidermonkeyId, []);
+    } else {
+        // Blackbox only a part of the source
+        let blackbox = blackboxing.get(event.spidermonkeyId);
+        if (blackbox == undefined) {
+            blackbox = [];
+        }
+
+        blackbox.push({
+            start: event.start(),
+            end: event.end()
+        });
+
+        blackboxing.set(event.spidermonkeyId, blackbox);
+    }
+});
+
+addEventListener("unblackbox", event => {
+    if (event.coversFullSource) {
+        // Unblackbox the entire source
+        blackboxing.delete(event.spidermonkeyId);
+    } else {
+        // Unblackbox an earlier range of the source
+        const array = blackboxing.get(event.spidermonkeyId);
+
+        const start = event.start();
+        const end = event.end();
+        const index = array.findIndex(range => range.start.line === start.line
+                && range.start.column === start.column
+                && range.end.line === end.line
+                && range.end.column === end.column
+        );
+        if (index !== -1) {
+            array.splice(index, 1);
+
+            // Empty arrays represent a fully blackboxed file
+            // Therefore, if we just made the array empty we will need to remove it from the map
+            if (array.length === 0) {
+                blackboxing.delete(event.spidermonkeyId);
+            }
+        }
+    }
+});
+
+function isBlackBoxed(spidermonkeyId, line, column) {
+    const sourceBlackboxing = blackboxing.get(spidermonkeyId);
+
+    if (sourceBlackboxing == undefined) {
+        return false;
+    } else if (sourceBlackboxing.length === 0) {
+        // An empty array represents a fully ignored source
+        return true;
+    }
+
+    for (const range of sourceBlackboxing) {
+        return (range.start.line < line || (range.start.line === line && range.start.column <= column))
+                && (range.end.line > line || (range.end.line === line && range.end.column >= column))
+    }
+
+    return false;
+}

@@ -25,63 +25,65 @@ pub(crate) fn try_extract_nodeset<N: Node>(v: Value<N>) -> Result<NodeSet<N>, Er
 impl Expression {
     pub(crate) fn evaluate<D: Dom>(
         &self,
+        cx: &mut D::Context,
         context: &EvaluationCtx<D>,
     ) -> Result<Value<D::Node>, Error> {
         match self {
             // And/Or expression are separated because they can sometimes be evaluated
             // without evaluating both operands.
             Expression::Binary(left, BinaryOperator::And, right) => {
-                let left_bool = left.evaluate(context)?.convert_to_boolean();
-                let v = left_bool && right.evaluate(context)?.convert_to_boolean();
+                let left_bool = left.evaluate(cx, context)?.convert_to_boolean();
+                let v = left_bool && right.evaluate(cx, context)?.convert_to_boolean();
                 Ok(Value::Boolean(v))
             },
             Expression::Binary(left, BinaryOperator::Or, right) => {
-                let left_bool = left.evaluate(context)?.convert_to_boolean();
-                let v = left_bool || right.evaluate(context)?.convert_to_boolean();
+                let left_bool = left.evaluate(cx, context)?.convert_to_boolean();
+                let v = left_bool || right.evaluate(cx, context)?.convert_to_boolean();
                 Ok(Value::Boolean(v))
             },
             Expression::Binary(left, binary_operator, right) => {
-                let left_value = left.evaluate(context)?;
-                let right_value = right.evaluate(context)?;
+                let left_value = left.evaluate(cx, context)?;
+                let right_value = right.evaluate(cx, context)?;
 
                 let value = match binary_operator {
-                    BinaryOperator::Equal => (left_value == right_value).into(),
-                    BinaryOperator::NotEqual => (left_value != right_value).into(),
-                    BinaryOperator::LessThan => {
-                        (left_value.convert_to_number() < right_value.convert_to_number()).into()
-                    },
-                    BinaryOperator::GreaterThan => {
-                        (left_value.convert_to_number() > right_value.convert_to_number()).into()
-                    },
-                    BinaryOperator::LessThanOrEqual => {
-                        (left_value.convert_to_number() <= right_value.convert_to_number()).into()
-                    },
-                    BinaryOperator::GreaterThanOrEqual => {
-                        (left_value.convert_to_number() >= right_value.convert_to_number()).into()
-                    },
-                    BinaryOperator::Add => {
-                        (left_value.convert_to_number() + right_value.convert_to_number()).into()
-                    },
-                    BinaryOperator::Subtract => {
-                        (left_value.convert_to_number() - right_value.convert_to_number()).into()
-                    },
-                    BinaryOperator::Multiply => {
-                        (left_value.convert_to_number() * right_value.convert_to_number()).into()
-                    },
-                    BinaryOperator::Divide => {
-                        (left_value.convert_to_number() / right_value.convert_to_number()).into()
-                    },
-                    BinaryOperator::Modulo => {
-                        (left_value.convert_to_number() % right_value.convert_to_number()).into()
-                    },
+                    BinaryOperator::Equal => (left_value.partial_eq(cx, &right_value)).into(),
+                    BinaryOperator::NotEqual => (!left_value.partial_eq(cx, &right_value)).into(),
+                    BinaryOperator::LessThan => (left_value.convert_to_number(cx) <
+                        right_value.convert_to_number(cx))
+                    .into(),
+                    BinaryOperator::GreaterThan => (left_value.convert_to_number(cx) >
+                        right_value.convert_to_number(cx))
+                    .into(),
+                    BinaryOperator::LessThanOrEqual => (left_value.convert_to_number(cx) <=
+                        right_value.convert_to_number(cx))
+                    .into(),
+                    BinaryOperator::GreaterThanOrEqual => (left_value.convert_to_number(cx) >=
+                        right_value.convert_to_number(cx))
+                    .into(),
+                    BinaryOperator::Add => (left_value.convert_to_number(cx) +
+                        right_value.convert_to_number(cx))
+                    .into(),
+                    BinaryOperator::Subtract => (left_value.convert_to_number(cx) -
+                        right_value.convert_to_number(cx))
+                    .into(),
+                    BinaryOperator::Multiply => (left_value.convert_to_number(cx) *
+                        right_value.convert_to_number(cx))
+                    .into(),
+                    BinaryOperator::Divide => (left_value.convert_to_number(cx) /
+                        right_value.convert_to_number(cx))
+                    .into(),
+                    BinaryOperator::Modulo => (left_value.convert_to_number(cx) %
+                        right_value.convert_to_number(cx))
+                    .into(),
                     BinaryOperator::Union => {
-                        let as_nodes =
-                            |e: &Expression| e.evaluate(context).and_then(try_extract_nodeset);
-                        let mut left_nodes = as_nodes(left)?;
-                        let right_nodes = as_nodes(right)?;
+                        let as_nodes = |cx: &mut D::Context, e: &Expression| {
+                            e.evaluate(cx, context).and_then(try_extract_nodeset)
+                        };
+                        let mut left_nodes = as_nodes(cx, left)?;
+                        let right_nodes = as_nodes(cx, right)?;
 
                         left_nodes.extend(right_nodes);
-                        left_nodes.sort();
+                        left_nodes.sort(cx);
                         Value::NodeSet(left_nodes)
                     },
                     _ => unreachable!("And/Or were handled above"),
@@ -90,16 +92,16 @@ impl Expression {
                 Ok(value)
             },
             Expression::Negate(expr) => {
-                let value = -expr.evaluate(context)?.convert_to_number();
+                let value = -expr.evaluate(cx, context)?.convert_to_number(cx);
                 Ok(value.into())
             },
-            Expression::Path(path_expr) => path_expr.evaluate(context),
+            Expression::Path(path_expr) => path_expr.evaluate(cx, context),
             Expression::LocationStep(location_step_expression) => {
-                location_step_expression.evaluate(context)
+                location_step_expression.evaluate(cx, context)
             },
-            Expression::Filter(filter_expression) => filter_expression.evaluate(context),
+            Expression::Filter(filter_expression) => filter_expression.evaluate(cx, context),
             Expression::Literal(literal) => Ok(literal.evaluate::<D>()),
-            Expression::Function(function) => function.evaluate(context),
+            Expression::Function(function) => function.evaluate(cx, context),
             Expression::ContextItem => {
                 let mut result = NodeSet::default();
                 result.push(context.context_node.clone());
@@ -111,7 +113,11 @@ impl Expression {
 }
 
 impl PathExpression {
-    fn evaluate<D: Dom>(&self, context: &EvaluationCtx<D>) -> Result<Value<D::Node>, Error> {
+    fn evaluate<D: Dom>(
+        &self,
+        cx: &mut D::Context,
+        context: &EvaluationCtx<D>,
+    ) -> Result<Value<D::Node>, Error> {
         // Use root node for absolute paths, context_node otherwise
         let starting_node = if self.is_absolute {
             context.context_node.get_root_node()
@@ -128,7 +134,7 @@ impl PathExpression {
         } else {
             current_nodes.push(starting_node);
         }
-        current_nodes.assume_sorted();
+        current_nodes.assume_sorted(cx);
 
         let have_multiple_steps = self.steps.len() > 1;
 
@@ -136,7 +142,7 @@ impl PathExpression {
             let mut next_nodes = NodeSet::default();
             for node in current_nodes {
                 let step_context = context.subcontext_for_node(node.clone());
-                let step_result = step_expression.evaluate(&step_context)?;
+                let step_result = step_expression.evaluate(cx, &step_context)?;
                 match (have_multiple_steps, step_result) {
                     (_, Value::NodeSet(nodes)) => {
                         // as long as we evaluate to nodesets, keep going
@@ -218,7 +224,7 @@ fn apply_node_test<D: Dom>(test: &NodeTest, node: &D::Node) -> Result<bool, Erro
                 false
             }
         },
-        NodeTest::Wildcard => node.as_element().is_some(),
+        NodeTest::Wildcard => node.as_element().is_some() || node.as_attribute().is_some(),
         NodeTest::Kind(kind) => match kind {
             KindTest::PI(target) => {
                 if let Some(processing_instruction) = node.as_processing_instruction() {
@@ -244,7 +250,11 @@ fn apply_node_test<D: Dom>(test: &NodeTest, node: &D::Node) -> Result<bool, Erro
 }
 
 impl LocationStepExpression {
-    fn evaluate<D: Dom>(&self, context: &EvaluationCtx<D>) -> Result<Value<D::Node>, Error> {
+    fn evaluate<D: Dom>(
+        &self,
+        cx: &mut D::Context,
+        context: &EvaluationCtx<D>,
+    ) -> Result<Value<D::Node>, Error> {
         let nodes: NodeSet<D::Node> = match self.axis {
             Axis::Child => context.context_node.children().collect(),
             Axis::Descendant => context.context_node.traverse_preorder().skip(1).collect(),
@@ -260,7 +270,7 @@ impl LocationStepExpression {
             Axis::Attribute => {
                 if let Some(element) = context.context_node.as_element() {
                     element
-                        .attributes()
+                        .attributes(cx)
                         .map(|attribute| attribute.as_node())
                         .collect()
                 } else {
@@ -289,7 +299,7 @@ impl LocationStepExpression {
             filtered_nodes
         } else {
             // Apply predicates
-            self.predicate_list.apply::<D>(filtered_nodes)
+            self.predicate_list.apply::<D>(cx, filtered_nodes)
         };
 
         // Enforce tree order between nodes in the list
@@ -305,11 +315,11 @@ impl LocationStepExpression {
                 Axis::DescendantOrSelf
         ) {
             // The elements on these axis values are already in tree order
-            filtered_nodes.assume_sorted();
+            filtered_nodes.assume_sorted(cx);
         } else {
             // The elements on these axis values are in inverse tree order
             filtered_nodes.reverse();
-            filtered_nodes.assume_sorted();
+            filtered_nodes.assume_sorted(cx);
         };
 
         Ok(Value::NodeSet(filtered_nodes))
@@ -317,7 +327,11 @@ impl LocationStepExpression {
 }
 
 impl PredicateListExpression {
-    fn apply<D: Dom>(&self, mut matched_nodes: NodeSet<D::Node>) -> NodeSet<D::Node> {
+    fn apply<D: Dom>(
+        &self,
+        cx: &mut D::Context,
+        mut matched_nodes: NodeSet<D::Node>,
+    ) -> NodeSet<D::Node> {
         for predicate_expr in &self.predicates {
             let size = matched_nodes.len();
 
@@ -331,7 +345,7 @@ impl PredicateListExpression {
                         size,
                     }),
                 };
-                let eval_result = predicate_expr.evaluate(&predicate_ctx);
+                let eval_result = predicate_expr.evaluate(cx, &predicate_ctx);
 
                 let keep = match eval_result {
                     Ok(Value::Number(number)) => position as f64 == number,
@@ -350,14 +364,18 @@ impl PredicateListExpression {
 }
 
 impl FilterExpression {
-    fn evaluate<D: Dom>(&self, context: &EvaluationCtx<D>) -> Result<Value<D::Node>, Error> {
+    fn evaluate<D: Dom>(
+        &self,
+        cx: &mut D::Context,
+        context: &EvaluationCtx<D>,
+    ) -> Result<Value<D::Node>, Error> {
         debug_assert!(!self.predicates.predicates.is_empty());
 
-        let Value::NodeSet(node_set) = self.expression.evaluate(context)? else {
+        let Value::NodeSet(node_set) = self.expression.evaluate(cx, context)? else {
             // You can't use filtering expressions `[]` on other than node-sets
             return Err(Error::NotANodeset);
         };
-        Ok(Value::NodeSet(self.predicates.apply::<D>(node_set)))
+        Ok(Value::NodeSet(self.predicates.apply::<D>(cx, node_set)))
     }
 }
 

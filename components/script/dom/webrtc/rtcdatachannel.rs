@@ -6,14 +6,16 @@ use std::cell::Cell;
 use std::ptr;
 
 use dom_struct::dom_struct;
-use js::jsapi::{JSAutoRealm, JSObject};
+use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
+use js::jsapi::JSObject;
 use js::jsval::UndefinedValue;
+use js::realm::CurrentRealm;
 use js::rust::CustomAutoRooterGuard;
-use js::typedarray::{ArrayBuffer, ArrayBufferView, CreateWith};
+use js::typedarray::{ArrayBuffer, ArrayBufferU8, ArrayBufferView};
 use script_bindings::cell::DomRefCell;
-use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::match_domstring_ascii;
-use script_bindings::reflector::{DomObject, reflect_dom_object};
+use script_bindings::reflector::reflect_dom_object;
 use script_bindings::weakref::WeakRef;
 use servo_constellation_traits::BlobImpl;
 use servo_media::webrtc::{
@@ -21,6 +23,7 @@ use servo_media::webrtc::{
 };
 
 use crate::conversions::Convert;
+use crate::dom::bindings::buffer_source::create_buffer_source;
 use crate::dom::bindings::codegen::Bindings::RTCDataChannelBinding::{
     RTCDataChannelInit, RTCDataChannelMethods, RTCDataChannelState,
 };
@@ -38,7 +41,6 @@ use crate::dom::messageevent::MessageEvent;
 use crate::dom::rtcerror::RTCError;
 use crate::dom::rtcerrorevent::RTCErrorEvent;
 use crate::dom::rtcpeerconnection::RTCPeerConnection;
-use crate::script_runtime::CanGc;
 
 #[derive(JSTraceable, MallocSizeOf)]
 struct DroppableRTCDataChannel {
@@ -92,7 +94,7 @@ impl RTCDataChannel {
         servo_media_id: Option<DataChannelId>,
     ) -> RTCDataChannel {
         let mut init: DataChannelInit = options.convert();
-        init.label = label.to_string();
+        init.label = label.0.clone();
 
         let controller = peer_connection.get_webrtc_controller().borrow();
         let servo_media_id = servo_media_id.unwrap_or(
@@ -113,21 +115,22 @@ impl RTCDataChannel {
             negotiated: options.negotiated,
             id: options.id,
             ready_state: Cell::new(RTCDataChannelState::Connecting),
-            binary_type: DomRefCell::new(DOMString::from("blob")),
+            binary_type: DomRefCell::new(DOMString::from_static("blob")),
             peer_connection: Dom::from_ref(peer_connection),
             droppable: DroppableRTCDataChannel::new(WeakRef::new(peer_connection), servo_media_id),
         }
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         peer_connection: &RTCPeerConnection,
         label: USVString,
         options: &RTCDataChannelInit,
         servo_media_id: Option<DataChannelId>,
-        can_gc: CanGc,
     ) -> DomRoot<RTCDataChannel> {
         let rtc_data_channel = reflect_dom_object(
+            cx,
             Box::new(RTCDataChannel::new_inherited(
                 peer_connection,
                 label,
@@ -135,7 +138,6 @@ impl RTCDataChannel {
                 servo_media_id,
             )),
             global,
-            can_gc,
         );
 
         peer_connection
@@ -148,36 +150,34 @@ impl RTCDataChannel {
         self.droppable.get_servo_media_id()
     }
 
-    pub(crate) fn on_open(&self, can_gc: CanGc) {
+    pub(crate) fn on_open(&self, cx: &mut JSContext) {
         let event = Event::new(
+            cx,
             &self.global(),
             atom!("open"),
             EventBubbles::DoesNotBubble,
             EventCancelable::NotCancelable,
-            can_gc,
         );
-        event.upcast::<Event>().fire(self.upcast(), can_gc);
+        event.upcast::<Event>().fire(cx, self.upcast());
     }
 
-    pub(crate) fn on_close(&self, can_gc: CanGc) {
+    pub(crate) fn on_close(&self, cx: &mut JSContext) {
         let event = Event::new(
+            cx,
             &self.global(),
             atom!("close"),
             EventBubbles::DoesNotBubble,
             EventCancelable::NotCancelable,
-            can_gc,
         );
-        event.upcast::<Event>().fire(self.upcast(), can_gc);
+        event.upcast::<Event>().fire(cx, self.upcast());
 
         self.peer_connection
             .unregister_data_channel(&self.get_servo_media_id());
     }
 
-    pub(crate) fn on_error(&self, error: WebRtcError, can_gc: CanGc) {
+    pub(crate) fn on_error(&self, cx: &mut CurrentRealm, error: WebRtcError) {
         let global = self.global();
         let window = global.as_window();
-        let cx = GlobalScope::get_cx();
-        let _ac = JSAutoRealm::new(*cx, self.reflector().get_jsobject().get());
         let init = RTCErrorInit {
             errorDetail: RTCErrorDetailType::Data_channel_failure,
             httpRequestStatusCode: None,
@@ -189,72 +189,68 @@ impl RTCDataChannel {
         let message = match error {
             WebRtcError::Backend(message) => DOMString::from(message),
         };
-        let error = RTCError::new(window, &init, message, can_gc);
-        let event = RTCErrorEvent::new(window, atom!("error"), false, false, &error, can_gc);
-        event.upcast::<Event>().fire(self.upcast(), can_gc);
+        let error = RTCError::new(cx, window, &init, message);
+        let event = RTCErrorEvent::new(cx, window, atom!("error"), false, false, &error);
+        event.upcast::<Event>().fire(cx, self.upcast());
     }
 
-    #[expect(unsafe_code)]
-    pub(crate) fn on_message(&self, channel_message: DataChannelMessage, can_gc: CanGc) {
+    pub(crate) fn on_message(&self, cx: &mut CurrentRealm, channel_message: DataChannelMessage) {
         let global = self.global();
-        let cx = GlobalScope::get_cx();
-        let _ac = JSAutoRealm::new(*cx, self.reflector().get_jsobject().get());
-        rooted!(in(*cx) let mut message = UndefinedValue());
+        rooted!(&in(cx) let mut message = UndefinedValue());
 
         match channel_message {
             DataChannelMessage::Text(text) => {
-                text.safe_to_jsval(cx, message.handle_mut(), can_gc);
+                text.to_jsval(cx, message.handle_mut());
             },
             DataChannelMessage::Binary(data) => {
                 let binary_type = self.binary_type.borrow();
                 match_domstring_ascii!(binary_type,
                     "blob" => {
                         let blob = Blob::new(
+                            cx,
                             &global,
-                            BlobImpl::new_from_bytes(data, "".to_owned()),
-                            can_gc,
+                            BlobImpl::new_from_bytes(data, String::new()),
                         );
-                        blob.safe_to_jsval(cx, message.handle_mut(), can_gc);
+                        blob.to_jsval(cx, message.handle_mut());
                     },
                     "arraybuffer" => {
-                        rooted!(in(*cx) let mut array_buffer = ptr::null_mut::<JSObject>());
-                        unsafe {
-                            assert!(
-                                ArrayBuffer::create(
-                                    *cx,
-                                    CreateWith::Slice(&data),
-                                    array_buffer.handle_mut()
-                                )
-                                .is_ok()
+                        rooted!(&in(cx) let mut array_buffer = ptr::null_mut::<JSObject>());
+                        assert!(
+                            create_buffer_source::<ArrayBufferU8>(
+                                cx,
+                                &data,
+                                array_buffer.handle_mut()
                             )
-                        };
-                        (*array_buffer).safe_to_jsval(cx, message.handle_mut(), can_gc);
-                },
-            _ => unreachable!(),)
+                            .is_ok()
+                        );
+                        (*array_buffer).to_jsval(cx, message.handle_mut());
+                    },
+                    _ => unreachable!(),
+                )
             },
         }
 
         MessageEvent::dispatch_jsval(
+            cx,
             self.upcast(),
             &global,
             message.handle(),
-            Some(&global.origin().immutable().ascii_serialization()),
+            Some(global.origin().immutable().ascii_serialization().as_ref()),
             None,
             vec![],
-            can_gc,
         );
     }
 
-    pub(crate) fn on_state_change(&self, state: DataChannelState, can_gc: CanGc) {
+    pub(crate) fn on_state_change(&self, cx: &mut JSContext, state: DataChannelState) {
         if let DataChannelState::Closing = state {
             let event = Event::new(
+                cx,
                 &self.global(),
                 atom!("closing"),
                 EventBubbles::DoesNotBubble,
                 EventCancelable::NotCancelable,
-                can_gc,
             );
-            event.upcast::<Event>().fire(self.upcast(), can_gc);
+            event.upcast::<Event>().fire(cx, self.upcast());
         };
         self.ready_state.set(state.convert());
     }
@@ -269,8 +265,12 @@ impl RTCDataChannel {
             SendSource::Blob(blob) => {
                 DataChannelMessage::Binary(blob.get_bytes().unwrap_or(vec![]))
             },
-            SendSource::ArrayBuffer(array) => DataChannelMessage::Binary(array.to_vec()),
-            SendSource::ArrayBufferView(array) => DataChannelMessage::Binary(array.to_vec()),
+            SendSource::ArrayBuffer(array) => {
+                DataChannelMessage::Binary(array.to_vec().unwrap_or_default())
+            },
+            SendSource::ArrayBufferView(array) => {
+                DataChannelMessage::Binary(array.to_vec().unwrap_or_default())
+            },
         };
 
         let controller = self.peer_connection.get_webrtc_controller().borrow();

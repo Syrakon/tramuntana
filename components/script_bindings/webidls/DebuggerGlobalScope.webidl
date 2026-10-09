@@ -7,6 +7,7 @@
 [Global=DebuggerGlobalScope, Exposed=DebuggerGlobalScope]
 interface DebuggerGlobalScope: GlobalScope {
     undefined notifyNewSource(NotifyNewSource args);
+    DOMString? registerObjectActor(DOMString serializedValue);
 };
 
 dictionary NotifyNewSource {
@@ -22,4 +23,9 @@ dictionary NotifyNewSource {
 dictionary PipelineIdInit {
     required unsigned long namespaceId;
     required unsigned long index;
+};
+
+dictionary DebuggerSourceLocation {
+    required unsigned long line;
+    required unsigned long column;
 };

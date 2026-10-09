@@ -7,15 +7,15 @@
 //! response is received, it is forwarded to the appropriate script thread.
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use crossbeam_channel::Sender;
 use embedder_traits::user_contents::UserContentManagerId;
-use embedder_traits::{Theme, ViewportDetails, WebDriverLoadStatus};
+use embedder_traits::{ViewportDetails, WebDriverLoadStatus};
 use http::header;
 use js::context::JSContext;
 use net_traits::blob_url_store::UrlWithBlobClaim;
-use net_traits::policy_container::RequestPolicyContainer;
 use net_traits::request::{
     CredentialsMode, InsecureRequestsPolicy, Origin, PreloadedResources, RedirectMode,
     RequestBuilder, RequestClient, RequestMode,
@@ -26,7 +26,7 @@ use net_traits::{
     Metadata, ReferrerPolicy, fetch_async, set_default_accept_language,
 };
 use script_bindings::inheritance::Castable;
-use script_traits::{DocumentActivity, NewPipelineInfo};
+use script_traits::{DocumentActivity, NewPipelineInfo, WebViewState};
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
 use servo_constellation_traits::{
@@ -39,14 +39,15 @@ use url::Position;
 use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElementMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::refcounted::Trusted;
+use crate::dom::document::AbortReason;
 use crate::dom::element::Element;
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
 use crate::dom::node::node::NodeTraits;
 use crate::dom::window::Window;
 use crate::dom::windowproxy::WindowProxy;
-use crate::fetch::FetchCanceller;
+use crate::event_loop::script_thread::ScriptThread;
+use crate::fetch::fetch::FetchCanceller;
 use crate::messaging::MainThreadScriptMsg;
-use crate::script_thread::ScriptThread;
 
 #[derive(Clone)]
 pub struct NavigationListener {
@@ -147,9 +148,9 @@ pub(crate) struct InProgressLoad {
     /// The browsing context being loaded into.
     #[no_trace]
     pub(crate) browsing_context_id: BrowsingContextId,
-    /// The top level ancestor browsing context.
+    /// The shared state for the `WebView` of this [`InProgressLoad`].
     #[no_trace]
-    pub(crate) webview_id: WebViewId,
+    pub(crate) webview_state: Rc<WebViewState>,
     /// The parent pipeline and frame type associated with this load, if any.
     #[no_trace]
     pub(crate) parent_info: Option<PipelineId>,
@@ -179,22 +180,25 @@ pub(crate) struct InProgressLoad {
     #[no_trace]
     /// The [`UserContentManagerId`] associated with this load's `WebView`.
     pub(crate) user_content_manager_id: Option<UserContentManagerId>,
-    /// The [`Theme`] to use for this page, once it loads.
-    #[no_trace]
-    pub(crate) theme: Theme,
     /// The [`TargetSnapshotParams`] to use when creating this document.
     #[no_trace]
     pub(crate) target_snapshot_params: TargetSnapshotParams,
+    /// Name of this iframe, if any
+    pub(crate) frame_name: Option<String>,
 }
 
 impl InProgressLoad {
     /// Create a new InProgressLoad object.
-    pub(crate) fn new(new_pipeline_info: NewPipelineInfo) -> InProgressLoad {
+    pub(crate) fn new(
+        new_pipeline_info: NewPipelineInfo,
+        webview_state: Rc<WebViewState>,
+    ) -> InProgressLoad {
         let url = new_pipeline_info.load_data.url.clone();
+
         InProgressLoad {
             pipeline_id: new_pipeline_info.new_pipeline_id,
             browsing_context_id: new_pipeline_info.browsing_context_id,
-            webview_id: new_pipeline_info.webview_id,
+            webview_state,
             parent_info: new_pipeline_info.parent_info,
             opener: new_pipeline_info.opener,
             viewport_details: new_pipeline_info.viewport_details,
@@ -205,9 +209,13 @@ impl InProgressLoad {
             load_data: new_pipeline_info.load_data,
             url_list: vec![url],
             user_content_manager_id: new_pipeline_info.user_content_manager_id,
-            theme: new_pipeline_info.theme,
             target_snapshot_params: new_pipeline_info.target_snapshot_params,
+            frame_name: new_pipeline_info.frame_name,
         }
+    }
+
+    pub(crate) fn webview_id(&self) -> WebViewId {
+        self.webview_state.id
     }
 
     pub(crate) fn request_builder(&mut self) -> RequestBuilder {
@@ -217,7 +225,7 @@ impl InProgressLoad {
         };
 
         let id = self.pipeline_id;
-        let webview_id = self.webview_id;
+        let webview_id = self.webview_state.id;
 
         let insecure_requests_policy = self
             .load_data
@@ -226,12 +234,11 @@ impl InProgressLoad {
 
         let request_client = RequestClient {
             preloaded_resources: PreloadedResources::default(),
-            policy_container: RequestPolicyContainer::PolicyContainer(
-                self.load_data.policy_container.clone().unwrap_or_default(),
-            ),
+            policy_container: self.load_data.policy_container.clone().unwrap_or_default(),
             origin: Origin::Origin(client_origin),
             is_nested_browsing_context: self.parent_info.is_some(),
             insecure_requests_policy,
+            has_trustworthy_ancestor_origin: self.load_data.has_trustworthy_ancestor_origin,
         };
 
         let mut request_builder = RequestBuilder::new(
@@ -247,14 +254,15 @@ impl InProgressLoad {
         .pipeline_id(Some(id))
         .referrer_policy(self.load_data.referrer_policy)
         .policy_container(self.load_data.policy_container.clone().unwrap_or_default())
-        .insecure_requests_policy(insecure_requests_policy)
-        .has_trustworthy_ancestor_origin(self.load_data.has_trustworthy_ancestor_origin)
         .headers(self.load_data.headers.clone())
         .body(self.load_data.data.clone())
         .redirect_mode(RedirectMode::Manual)
         .crash(self.load_data.crash.clone())
         .client(request_client)
         .url_list(self.url_list.clone());
+
+        request_builder.reload_navigation = self.load_data.reload_navigation;
+        request_builder.history_navigation = self.load_data.history_navigation;
 
         if !request_builder.headers.contains_key(header::ACCEPT) {
             request_builder
@@ -362,9 +370,15 @@ pub(crate) fn navigate(
     window: &Window,
     history_handling: NavigationHistoryBehavior,
     force_reload: bool,
-    load_data: LoadData,
+    mut load_data: LoadData,
 ) {
-    let doc = window.Document();
+    let document = window.Document();
+
+    // <https://html.spec.whatwg.org/multipage/#process-a-navigate-fetch>
+    if force_reload {
+        // Step 7. If entry's document state's reload pending is true, then set request's reload-navigation flag.
+        load_data.reload_navigation = true;
+    }
 
     // Step 3. Let initiatorOriginSnapshot be sourceDocument's origin.
     let initiator_origin_snapshot = &load_data.load_origin;
@@ -377,7 +391,7 @@ pub(crate) fn navigate(
     let window_proxy = window.window_proxy();
     if let Some(active) = window_proxy.currently_active() &&
         pipeline_id == active &&
-        doc.is_prompting_or_unloading()
+        document.is_prompting_or_unloading()
     {
         return;
     }
@@ -391,7 +405,8 @@ pub(crate) fn navigate(
         // Note: `targetNavigable` is not actually defined in the spec, "active document" is
         // assumed to be the correct reference based on WPT results
         if let LoadOrigin::Script(initiator_origin) = initiator_origin_snapshot {
-            if load_data.url == doc.url() && initiator_origin.same_origin(&*doc.origin()) {
+            if load_data.url == document.url() && initiator_origin.same_origin(&*document.origin())
+            {
                 NavigationHistoryBehavior::Replace
             } else {
                 // Step 12.2. Otherwise, set historyHandling to "push".
@@ -409,12 +424,12 @@ pub(crate) fn navigate(
     // document, then set historyHandling to "replace".
     //
     // Inlines implementation of https://html.spec.whatwg.org/multipage/#the-navigation-must-be-a-replace
-    let history_handling = if load_data.url.scheme() == "javascript" || doc.is_initial_about_blank()
-    {
-        NavigationHistoryBehavior::Replace
-    } else {
-        history_handling
-    };
+    let history_handling =
+        if load_data.url.scheme() == "javascript" || document.is_initial_about_blank() {
+            NavigationHistoryBehavior::Replace
+        } else {
+            history_handling
+        };
 
     // Step 14. If all of the following are true:
     // > documentResource is null;
@@ -422,7 +437,7 @@ pub(crate) fn navigate(
     if !force_reload
         // > url equals navigable's active session history entry's URL with exclude fragments set to true; and
         && load_data.url.as_url()[..Position::AfterQuery] ==
-            doc.url().as_url()[..Position::AfterQuery]
+            document.url().as_url()[..Position::AfterQuery]
         // > url's fragment is non-null,
         && load_data.url.fragment().is_some()
     {
@@ -469,22 +484,40 @@ pub(crate) fn navigate(
         // navigable's active window to navigate to a javascript: URL given navigable, url,
         // historyHandling, sourceSnapshotParams, initiatorOriginSnapshot, userInvolvement,
         // cspNavigationType, initialInsertion, and navigationId.
-        let global = window.as_global_scope();
-        let trusted_window = Trusted::new(window);
-        let sender = global.script_to_constellation_chan().clone();
+
+        let Some(initiator_pipeline_id) = load_data.creator_pipeline_id else {
+            unreachable!("javascript: URL navigations must have a creator pipeline");
+        };
+        let Some(initiator_window) = ScriptThread::find_window(initiator_pipeline_id) else {
+            warn!("Can't find global for navigation initiator");
+            return;
+        };
+
+        let target_window = Trusted::new(window);
         let mut load_data = load_data;
-        load_data.about_base_url = window.Document().about_base_url();
+        let initiator_window = Trusted::new(&*initiator_window);
         let task = task!(navigate_javascript: move |cx| {
             // Important re security. See https://github.com/servo/servo/issues/23373
-            let window = trusted_window.root();
-            let global = window.as_global_scope();
-            if ScriptThread::navigate_to_javascript_url(cx, global, global, &mut load_data, None, None) {
-                sender
+            let target_window = target_window.root();
+            let initiator_window = initiator_window.root();
+            if ScriptThread::navigate_to_javascript_url(cx, initiator_window.upcast(), target_window.upcast(), &mut load_data, None, None) {
+                target_window
+                    .as_global_scope()
+                    .script_to_constellation_chan()
                     .send(ScriptToConstellationMessage::LoadUrl(load_data, history_handling, target_snapshot_params))
                     .unwrap();
+            } else {
+                // Note: not in the spec, but required to avoid timeouts in
+                // tests that navigate to javascript: URLs that don't result
+                // in documents: https://github.com/whatwg/html/issues/12773
+                let window_proxy = target_window.window_proxy();
+                if window_proxy.parent().is_some() {
+                    window_proxy.stop_delaying_load_events_mode();
+                }
             }
         });
-        global
+        window
+            .as_global_scope()
             .task_manager()
             .navigation_and_traversal_task_source()
             .queue(task);
@@ -492,27 +525,42 @@ pub(crate) fn navigate(
         return;
     }
 
-    // Step 23. In parallel, run these steps:
+    // Step 23. If sourceDocument is navigable's container document, then reserve deferred
+    // fetch quota for navigable's container given url's origin.
+    // TODO: Implement this.
+
+    // Step 24. In parallel, run these steps:
     //
     // TODO: in parallel
 
-    // Step 23.1. Let unloadPromptCanceled be the result of checking if unloading
+    // Step 24.1. Let unloadPromptCanceled be the result of checking if unloading
     // is canceled for navigable's active document's inclusive descendant navigables.
-    let unload_prompt_canceled = doc.check_if_unloading_is_cancelled(cx, false);
-    // Step 23.2. If unloadPromptCanceled is not "continue",
+    let unload_prompt_canceled = document.check_if_unloading_is_cancelled(cx, false);
+    // Step 24.2. If unloadPromptCanceled is not "continue",
     // or navigable's ongoing navigation is no longer navigationId:
     //
     // TODO: Check for ongoing navigation
     if !unload_prompt_canceled {
-        // Step 23.2.1. Invoke WebDriver BiDi navigation failed with navigable
+        // Step 24.2.1. Invoke WebDriver BiDi navigation failed with navigable
         // and a new WebDriver BiDi navigation status whose id is navigationId,
         // status is "canceled", and url is url.
         // TODO
-        // Step 23.2.2. Abort these steps.
+        // Step 24.2.2. Abort these steps.
         return;
     }
 
-    // Step 23.9. Attempt to populate the history entry's document for historyEntry,
+    // Step 24.4. Queue a global task on the navigation and traversal task source given
+    // navigable's active window to abort a document and its descendants given navigable's
+    // active document.
+    let trusted_document = Trusted::new(&*document);
+    window
+        .task_manager()
+        .navigation_and_traversal_task_source()
+        .queue(task!(abort_a_document_and_its_descendants: move |cx| {
+            trusted_document.root().abort_a_document_and_its_descendants(cx, AbortReason::Navigate);
+        }));
+
+    // Step 24.9. Attempt to populate the history entry's document for historyEntry,
     // given navigable, "navigate", sourceSnapshotParams, targetSnapshotParams,
     // userInvolvement, navigationId, navigationParams, cspNavigationType,
     // with allowPOST set to true and completionSteps set to the following step:

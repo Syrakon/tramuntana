@@ -9,12 +9,11 @@ use js::rust::HandleValue;
 use script_bindings::codegen::GenericBindings::IDBKeyRangeBinding::IDBKeyRangeMethods;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use script_bindings::root::DomRoot;
-use script_bindings::script_runtime::CanGc;
 use storage_traits::indexeddb::IndexedDBKeyRange;
 
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::globalscope::GlobalScope;
-use crate::indexeddb::{convert_value_to_key, key_type_to_jsval};
+use crate::dom::indexeddb::key::{convert_value_to_key, key_type_to_jsval};
 
 #[dom_struct]
 pub struct IDBKeyRange {
@@ -31,8 +30,12 @@ impl IDBKeyRange {
         }
     }
 
-    pub fn new(global: &GlobalScope, inner: IndexedDBKeyRange, can_gc: CanGc) -> DomRoot<Self> {
-        reflect_dom_object(Box::new(IDBKeyRange::new_inherited(inner)), global, can_gc)
+    pub fn new(
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        inner: IndexedDBKeyRange,
+    ) -> DomRoot<Self> {
+        reflect_dom_object(cx, Box::new(IDBKeyRange::new_inherited(inner)), global)
     }
 
     pub fn inner(&self) -> &IndexedDBKeyRange {
@@ -79,7 +82,7 @@ impl IDBKeyRangeMethods<crate::DomTypeHolder> for IDBKeyRange {
 
         // Step 3. Create and return a new key range containing only key.
         let inner = IndexedDBKeyRange::only(key);
-        Ok(IDBKeyRange::new(global, inner, CanGc::from_cx(cx)))
+        Ok(IDBKeyRange::new(cx, global, inner))
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbkeyrange-lowerbound>
@@ -97,7 +100,7 @@ impl IDBKeyRangeMethods<crate::DomTypeHolder> for IDBKeyRange {
         // Step 3. Create and return a new key range with lower bound set to lowerKey, lower open
         // flag set to open, upper bound set to null, and upper open flag set to true.
         let inner = IndexedDBKeyRange::lower_bound(lower_key, open);
-        Ok(IDBKeyRange::new(global, inner, CanGc::from_cx(cx)))
+        Ok(IDBKeyRange::new(cx, global, inner))
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbkeyrange-upperbound>
@@ -116,7 +119,7 @@ impl IDBKeyRangeMethods<crate::DomTypeHolder> for IDBKeyRange {
         // Step 3. Create and return a new key range with lower bound set to null, lower open flag
         // set to true, upper bound set to upperKey, and upper open flag set to open.
         let inner = IndexedDBKeyRange::upper_bound(upper_key, open);
-        Ok(IDBKeyRange::new(global, inner, CanGc::from_cx(cx)))
+        Ok(IDBKeyRange::new(cx, global, inner))
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbkeyrange-bound>
@@ -149,7 +152,7 @@ impl IDBKeyRangeMethods<crate::DomTypeHolder> for IDBKeyRange {
         // flag set to lowerOpen, upper bound set to upperKey and upper open flag set to upperOpen.
         let inner =
             IndexedDBKeyRange::new(Some(lower_key), Some(upper_key), lower_open, upper_open);
-        Ok(IDBKeyRange::new(global, inner, CanGc::from_cx(cx)))
+        Ok(IDBKeyRange::new(cx, global, inner))
     }
 
     /// <https://www.w3.org/TR/IndexedDB-3/#dom-idbkeyrange-_includes>

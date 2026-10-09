@@ -11,10 +11,12 @@
 
 pub mod cross_process_instant;
 pub mod generic_channel;
+#[macro_use]
 pub mod id;
 pub mod print_tree;
 mod rope;
 pub mod text;
+pub mod threadboost;
 pub mod threadpool;
 mod unicode_block;
 
@@ -22,8 +24,6 @@ use std::fs::File;
 use std::io::{BufWriter, Read};
 use std::path::Path;
 
-use ipc_channel::IpcError;
-use ipc_channel::ipc::IpcSender;
 use log::{trace, warn};
 use malloc_size_of_derive::MallocSizeOf;
 pub use rope::{Rope, RopeChars, RopeIndex, RopeMovement, RopeSlice};
@@ -113,19 +113,4 @@ impl WebRenderEpochToU16 for WebRenderEpoch {
     fn as_u16(&self) -> u16 {
         (self.0 % u16::MAX as u32) as u16
     }
-}
-
-pub type IpcSendResult = Result<(), IpcError>;
-
-/// Abstraction of the ability to send a particular type of message,
-/// used by net_traits::ResourceThreads to ease the use its IpcSender sub-fields
-/// XXX: If this trait will be used more in future, some auto derive might be appealing
-pub trait IpcSend<T>
-where
-    T: serde::Serialize + for<'de> serde::Deserialize<'de>,
-{
-    /// send message T
-    fn send(&self, _: T) -> IpcSendResult;
-    /// get underlying sender
-    fn sender(&self) -> IpcSender<T>;
 }

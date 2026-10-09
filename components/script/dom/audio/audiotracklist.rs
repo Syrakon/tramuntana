@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::reflect_dom_object;
 
@@ -16,7 +17,6 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::html::htmlmediaelement::HTMLMediaElement;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct AudioTrackList {
@@ -38,15 +38,15 @@ impl AudioTrackList {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         tracks: &[&AudioTrack],
         media_element: Option<&HTMLMediaElement>,
-        can_gc: CanGc,
     ) -> DomRoot<AudioTrackList> {
         reflect_dom_object(
+            cx,
             Box::new(AudioTrackList::new_inherited(tracks, media_element)),
             window,
-            can_gc,
         )
     }
 
@@ -91,7 +91,8 @@ impl AudioTrackList {
         // Queue a task to fire an event named change.
         let global = &self.global();
         let this = Trusted::new(self);
-        let task_source = global.task_manager().media_element_task_source();
+        let task_manager = global.task_manager();
+        let task_source = task_manager.media_element_task_source();
         task_source.queue(task!(media_track_change: move |cx| {
             let this = this.root();
             this.upcast::<EventTarget>().fire_event(cx, atom!("change"));

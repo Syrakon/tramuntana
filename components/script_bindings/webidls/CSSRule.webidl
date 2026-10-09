@@ -16,7 +16,7 @@ interface CSSRule {
 
   readonly attribute unsigned short type;
   attribute DOMString cssText;
-  // readonly attribute CSSRule? parentRule;
+  readonly attribute CSSRule? parentRule;
   readonly attribute CSSStyleSheet? parentStyleSheet;
 };
 
@@ -29,4 +29,9 @@ partial interface CSSRule {
 // https://drafts.csswg.org/css-conditional-3/#extentions-to-cssrule-interface
 partial interface CSSRule {
     const unsigned short SUPPORTS_RULE = 12;
+};
+
+// https://drafts.csswg.org/css-fonts/#om-fontfeaturevalues
+partial interface CSSRule {
+    const unsigned short FONT_FEATURE_VALUES_RULE = 14;
 };

@@ -36,7 +36,7 @@ use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::node::Node;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::servoparser::{ParsingAlgorithm, Sink};
-use crate::dom::shadowroot::ShadowRoot;
+use crate::dom::shadowroot::shadowroot::ShadowRoot;
 
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -177,12 +177,6 @@ struct SerializationIterator {
 
     /// List of shadow root objects that should be serialized
     shadow_roots: Vec<DomRoot<ShadowRoot>>,
-}
-
-enum SerializationChildrenIterator<C, S> {
-    None,
-    Children(C),
-    ShadowContents(S),
 }
 
 impl SerializationIterator {

@@ -165,8 +165,8 @@ fn test_fetch_blob() {
     impl FetchTaskTarget for FetchResponseCollector {
         fn process_request_body(&mut self, _: &Request) {}
         fn process_response(&mut self, _: &Request, _: &Response) {}
-        fn process_response_chunk(&mut self, _: &Request, chunk: Vec<u8>) {
-            self.buffer.extend_from_slice(chunk.as_slice());
+        fn process_response_chunk(&mut self, _: &Request, chunk: bytes::Bytes) {
+            self.buffer.extend_from_slice(&chunk);
         }
         /// Fired when the response is fully fetched
         fn process_response_eof(&mut self, _: &Request, response: &Response) {
@@ -174,13 +174,15 @@ fn test_fetch_blob() {
             let _ = self.sender.send(response.clone());
         }
         fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+
+        fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
     }
 
     let context = new_fetch_context(None, None);
 
     let bytes = b"content";
     let blob_buf = BlobBuf {
-        filename: Some("test.txt".into()),
+        filename: Some("test .txt".into()),
         type_string: "text/plain".into(),
         size: bytes.len() as u64,
         bytes: bytes.to_vec(),
@@ -211,7 +213,7 @@ fn test_fetch_blob() {
         expected: bytes.to_vec(),
     };
 
-    spawn_blocking_task::<_, Response>(methods::fetch(request, &mut target, &context));
+    spawn_blocking_task(methods::fetch(request, &mut target, &context));
 
     let fetch_response = receiver.recv().unwrap();
     assert!(!fetch_response.is_network_error());
@@ -262,7 +264,7 @@ fn test_file() {
     // have the file's MIME type and contents.
     let actual_response = fetch_response.actual_response();
     assert!(!actual_response.is_network_error());
-    assert_eq!(actual_response.headers.len(), 1);
+    assert_eq!(actual_response.headers.len(), 2);
     let content_type: Mime = actual_response
         .headers
         .typed_get::<ContentType>()
@@ -270,8 +272,16 @@ fn test_file() {
         .into();
     assert_eq!(content_type, mime::TEXT_CSS);
 
-    let resp_body = actual_response.body.lock();
     let file = fs::read(path).unwrap();
+
+    let content_size: u64 = actual_response
+        .headers
+        .typed_get::<ContentLength>()
+        .unwrap()
+        .0;
+    assert_eq!(content_size, file.len() as u64);
+
+    let resp_body = actual_response.body.lock();
 
     match *resp_body {
         ResponseBody::Done(ref val) => {
@@ -793,8 +803,8 @@ fn test_fetch_with_local_urls_only() {
 // NOTE(emilio): If this test starts failing:
 //
 // openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-//   -keyout resources/privatekey_for_testing.key       \
-//   -out resources/self_signed_certificate_for_testing.crt
+//   -keyout components/net/tests/privatekey_for_testing.key         \
+//   -out components/net/tests/self_signed_certificate_for_testing.crt
 //
 // And make sure to specify `localhost` as the server name.
 #[test]
@@ -1099,6 +1109,8 @@ fn test_fetch_blocked_nosniff() {
         (Destination::Script, mime::TEXT_JAVASCRIPT, false),
         (Destination::Script, mime::TEXT_CSS, true),
         (Destination::Style, mime::TEXT_CSS, false),
+        (Destination::Style, mime::TEXT_HTML, true),
+        (Destination::Style, mime::TEXT_PLAIN, true),
     ];
 
     for test in tests {
@@ -1575,7 +1587,7 @@ fn test_fetch_request_intercepted() {
                     HeaderValue::from_static(HEADERVALUE),
                 );
                 let response =
-                    embedder_traits::WebResourceResponse::new(web_resource_request.url.clone())
+                    embedder_traits::WebResourceResponse::new(web_resource_request.url.into_url())
                         .headers(headers)
                         .status_code(StatusCode::FOUND)
                         .status_message(STATUS_MESSAGE.to_vec());

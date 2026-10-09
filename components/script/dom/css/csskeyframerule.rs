@@ -6,7 +6,7 @@ use std::cell::RefCell;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
-use script_bindings::reflector::reflect_dom_object_with_cx;
+use script_bindings::reflector::reflect_dom_object;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, SharedRwLockReadGuard, ToCssWithGuard};
 use style::stylesheets::CssRuleType;
@@ -20,8 +20,8 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::cssgroupingrule::CSSGroupingRule;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct CSSKeyframeRule {
@@ -34,11 +34,12 @@ pub(crate) struct CSSKeyframeRule {
 
 impl CSSKeyframeRule {
     fn new_inherited(
+        parent_rule: Option<&CSSGroupingRule>,
         parent_stylesheet: &CSSStyleSheet,
         keyframerule: Arc<Locked<Keyframe>>,
     ) -> CSSKeyframeRule {
         CSSKeyframeRule {
-            css_rule: CSSRule::new_inherited(parent_stylesheet),
+            css_rule: CSSRule::new_inherited(parent_rule, parent_stylesheet),
             keyframe_rule: RefCell::new(keyframerule),
             style_declaration: Default::default(),
         }
@@ -47,16 +48,18 @@ impl CSSKeyframeRule {
     pub(crate) fn new(
         cx: &mut JSContext,
         window: &Window,
+        parent_rule: Option<&CSSGroupingRule>,
         parent_stylesheet: &CSSStyleSheet,
         keyframerule: Arc<Locked<Keyframe>>,
     ) -> DomRoot<CSSKeyframeRule> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(CSSKeyframeRule::new_inherited(
+                parent_rule,
                 parent_stylesheet,
                 keyframerule,
             )),
             window,
-            cx,
         )
     }
 
@@ -78,6 +81,7 @@ impl CSSKeyframeRuleMethods<crate::DomTypeHolder> for CSSKeyframeRule {
         self.style_declaration.or_init(|| {
             let guard = self.css_rule.shared_lock().read();
             CSSStyleDeclaration::new(
+                cx,
                 self.global().as_window(),
                 CSSStyleOwner::CSSRule(
                     Dom::from_ref(self.upcast()),
@@ -85,7 +89,6 @@ impl CSSKeyframeRuleMethods<crate::DomTypeHolder> for CSSKeyframeRule {
                 ),
                 None,
                 CSSModificationAccess::ReadWrite,
-                CanGc::from_cx(cx),
             )
         })
     }

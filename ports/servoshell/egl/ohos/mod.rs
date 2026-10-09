@@ -50,7 +50,8 @@
 /// `servoshell` registers callbacks for the xcomponent object.
 /// After [`init()`] finishes, ArkTS will call the callback for `on_surface_created`, that we just
 /// registered. In the callback we send a message to our main thread, informing it of the new window.
-/// Additionally, for the first window, we also setup vsync callbacks.
+/// Vsync subscription is owned by [`super::app::VsyncRefreshDriver`] (created when the platform
+/// window is registered) and armed on demand whenever an observer asks for the next frame.
 ///
 /// At this point the initialization is finished, and servoshell is ready.
 mod resources;
@@ -63,7 +64,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{LazyLock, Once, OnceLock, mpsc};
+use std::sync::{LazyLock, Mutex, Once, OnceLock, mpsc};
 use std::{fs, thread};
 
 use euclid::{Point2D, Rect, Scale, Size2D};
@@ -75,7 +76,7 @@ use napi_ohos::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallM
 use napi_ohos::{Env, JsString, JsValue};
 use ohos_abilitykit_sys::runtime::application_context;
 use ohos_ime::{
-    AttachOptions, CreateImeProxyError, CreateTextEditorProxyError, Ime, ImeProxy,
+    AttachOptions, CreateImeProxyError, CreateTextEditorProxyError, Ime, ImeProxy, KeyboardStatus,
     RawTextEditorProxy,
 };
 use ohos_ime_sys::types::InputMethod_EnterKeyType;
@@ -86,11 +87,14 @@ use raw_window_handle::{
 };
 use servo::{
     self, DevicePixel, EventLoopWaker, InputMethodControl, InputMethodType, LoadStatus,
-    MediaSessionPlaybackState, PrefValue, Zero,
+    MediaSessionPlaybackState, PrefValue, SelectElement, WebViewId, Zero,
 };
+use xcomponent_sys::keyboard_types_compat::{KeyEventConverter, ModifierState};
 use xcomponent_sys::{
     OH_NativeXComponent, OH_NativeXComponent_Callback, OH_NativeXComponent_GetKeyEvent,
-    OH_NativeXComponent_GetKeyEventAction, OH_NativeXComponent_GetKeyEventCode,
+    OH_NativeXComponent_GetKeyEventAction, OH_NativeXComponent_GetKeyEventCapsLockState,
+    OH_NativeXComponent_GetKeyEventCode, OH_NativeXComponent_GetKeyEventModifierKeyStates,
+    OH_NativeXComponent_GetKeyEventNumLockState, OH_NativeXComponent_GetKeyEventScrollLockState,
     OH_NativeXComponent_GetTouchEvent, OH_NativeXComponent_GetXComponentOffset,
     OH_NativeXComponent_GetXComponentSize, OH_NativeXComponent_KeyAction,
     OH_NativeXComponent_KeyCode, OH_NativeXComponent_KeyEvent,
@@ -124,7 +128,39 @@ static PROMPT_TOAST: OnceLock<
 > = OnceLock::new();
 static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(0);
 
+static KEY_EVENT_CONVERTER: Mutex<KeyEventConverter> = Mutex::new(KeyEventConverter::new());
+
 static SERVO_CHANNEL: OnceLock<Sender<ServoAction>> = OnceLock::new();
+
+/// set special mode for graphics operation, see [https://developer.huawei.com/consumer/en/doc/harmonyos-faqs/faqs-arkgraphics-2d-14]
+fn set_efficient_window_method(window: *mut c_void) {
+    unsafe {
+        let mut usage: u64 = 0;
+        let return_value = ohos_window_sys::native_window::OH_NativeWindow_NativeWindowHandleOpt(
+            window as *mut ohos_sys_opaque_types::NativeWindow,
+            ohos_window_sys::native_window::NativeWindowOperation::GET_USAGE as i32,
+            &mut usage,
+        );
+        if return_value != 0 {
+            log::warn!(
+                "Could not get NativeWindowHandleOpt. Will continue without efficient windowing mode."
+            );
+            return;
+        }
+
+        usage &= !(ohos_window_sys::native_buffer::native_buffer::OH_NativeBuffer_Usage::NATIVEBUFFER_USAGE_CPU_READ.0 as u64);
+        let return_value = ohos_window_sys::native_window::OH_NativeWindow_NativeWindowHandleOpt(
+            window as *mut ohos_sys_opaque_types::NativeWindow,
+            ohos_window_sys::native_window::NativeWindowOperation::SET_USAGE as i32,
+            usage,
+        );
+        if return_value != 0 {
+            log::warn!(
+                "Could not set Native WindowHandleOpt. Will continue without efficient windowing mode."
+            );
+        }
+    }
+}
 
 pub(crate) fn get_raw_window_handle(
     xcomponent: *mut OH_NativeXComponent,
@@ -135,6 +171,8 @@ pub(crate) fn get_raw_window_handle(
     let window_origin = unsafe { get_xcomponent_offset(xcomponent, window) }
         .expect("Could not get native window offset");
     let viewport_rect = Rect::new(window_origin, window_size);
+    set_efficient_window_method(window);
+
     let native_window = NonNull::new(window).expect("Could not get native window");
     let window_handle = RawWindowHandle::OhosNdk(OhosNdkWindowHandle::new(native_window));
     (window_handle, viewport_rect)
@@ -338,12 +376,12 @@ pub(super) enum ServoAction {
         y: f32,
         pointer_id: i32,
     },
-    KeyUp(Key),
-    KeyDown(Key),
+    KeyEvent(keyboard_types::KeyboardEvent),
     InsertText(String),
     ImeDeleteForward(usize),
     ImeDeleteBackward(usize),
     ImeSendEnter,
+    ImeDismiss,
     Vsync,
     Resize {
         width: i32,
@@ -373,14 +411,14 @@ impl std::fmt::Debug for ServoAction {
                 .field("y", y)
                 .field("pointer_id", pointer_id)
                 .finish(),
-            Self::KeyUp(arg0) => f.debug_tuple("KeyUp").field(arg0).finish(),
-            Self::KeyDown(arg0) => f.debug_tuple("KeyDown").field(arg0).finish(),
+            Self::KeyEvent(_) => f.debug_struct("KeyEvent").finish(),
             Self::InsertText(arg0) => f.debug_tuple("InsertText").field(arg0).finish(),
             Self::ImeDeleteForward(arg0) => f.debug_tuple("ImeDeleteForward").field(arg0).finish(),
             Self::ImeDeleteBackward(arg0) => {
                 f.debug_tuple("ImeDeleteBackward").field(arg0).finish()
             },
             Self::ImeSendEnter => write!(f, "ImeSendEnter"),
+            Self::ImeDismiss => write!(f, "ImeDismiss"),
             Self::Vsync => write!(f, "Vsync"),
             Self::Resize { width, height } => f
                 .debug_struct("Resize")
@@ -432,8 +470,7 @@ impl ServoAction {
                 y,
                 pointer_id,
             } => Self::dispatch_touch_event(servo, *kind, *x, *y, *pointer_id),
-            KeyUp(k) => servo.key_up(k.clone()),
-            KeyDown(k) => servo.key_down(k.clone()),
+            KeyEvent(k) => servo.key_event(k.clone()),
             InsertText(text) => servo.ime_insert_text(text.clone()),
             ImeDeleteForward(len) => {
                 for _ in 0..*len {
@@ -450,6 +487,10 @@ impl ServoAction {
             ImeSendEnter => {
                 servo.key_down(Key::Named(NamedKey::Enter));
                 servo.key_up(Key::Named(NamedKey::Enter));
+                servo.ime_dismissed();
+            },
+            ImeDismiss => {
+                servo.ime_dismissed();
             },
             Vsync => {
                 servo.notify_vsync();
@@ -458,14 +499,12 @@ impl ServoAction {
                 servo.resize(Rect::new(Point2D::origin(), Size2D::new(*width, *height)))
             },
             FocusWindow(arkts_index, arkts_ids) => {
-                let windows = servo.state.windows();
                 if let Some(window) = arkts_ids
                     .get(*arkts_index as usize)
-                    .and_then(|value| windows.get(&ServoShellWindowId::from(*value as u64)))
+                    .and_then(|value| servo.state.window(ServoShellWindowId::from(*value as u64)))
                 {
-                    servo.state.focus_window(window.clone());
+                    servo.state.set_window_has_focus(window.clone(), true);
                     if let Some(webview) = window.active_webview() {
-                        webview.focus();
                         if let Some(url) = webview.url() {
                             SET_URL_BAR_CB.get().map(|f| {
                                 f.call(url.to_string(), ThreadsafeFunctionCallMode::Blocking)
@@ -477,7 +516,12 @@ impl ServoAction {
                         "Could not find window to activate. Arkts_index {}, arkts_ids {:?}, window_ids {:?}",
                         arkts_index,
                         arkts_ids,
-                        windows.keys().collect::<Vec<_>>(),
+                        servo
+                            .state
+                            .windows()
+                            .iter()
+                            .map(|window| window.id())
+                            .collect::<Vec<_>>(),
                     );
                 }
             },
@@ -488,7 +532,12 @@ impl ServoAction {
                 let display_handle = unsafe { DisplayHandle::borrow_raw(display_handle) };
                 let window_handle = unsafe { WindowHandle::borrow_raw(window_handle) };
 
-                let hidpi_factor = Scale::new(get_display_density());
+                let hidpi_factor = Scale::new(
+                    servo
+                        .servoshell_preferences()
+                        .device_pixel_ratio_override
+                        .unwrap_or_else(get_display_density),
+                );
                 servo.add_platform_window(
                     display_handle,
                     window_handle,
@@ -500,19 +549,15 @@ impl ServoAction {
                 );
             },
             RemovePlatformWindow(arkts_index, arkts_ids) => {
-                let windows = servo.state.windows();
                 if let Some(window_to_remove) = arkts_ids
                     .get(*arkts_index as usize)
                     .map(|id| ServoShellWindowId::from(*id as u64))
-                    .and_then(|window_id| windows.get(&window_id))
+                    .and_then(|window_id| servo.state.window(window_id))
                 {
-                    if let Some(window_to_focus) =
-                        servo.state.windows().get(&ServoShellWindowId::from(0))
-                    {
-                        servo.state.focus_window(window_to_focus.clone());
-                        if let Some(webview) = window_to_focus.active_webview() {
-                            webview.focus();
-                        }
+                    if let Some(window_to_focus) = servo.state.window(ServoShellWindowId::from(0)) {
+                        servo
+                            .state
+                            .set_window_has_focus(window_to_focus.clone(), true);
                         window_to_remove.schedule_close();
                     } else {
                         error!("Window is already closed.");
@@ -523,26 +568,28 @@ impl ServoAction {
     }
 }
 
-/// Vsync callback
+/// Ask the OHOS framework to invoke [`on_vsync_cb`] once on the next vsync.
 ///
-/// # Safety
-///
-/// The caller should pass a valid raw NativeVsync object to us via
-/// `native_vsync.request_raw_callback_with_self(Some(on_vsync_cb))`
+/// Calling this multiple times in the same vsync period will result in
+/// one callback execution.
+pub(crate) fn request_vsync_callback(native_vsync: &ohos_vsync::NativeVsync) {
+    // SAFETY: We don't pass any data, and `on_vsync_cb` is a function with static lifetime.
+    if let Err(e) =
+        unsafe { native_vsync.request_raw_callback(Some(on_vsync_cb), std::ptr::null_mut()) }
+    {
+        warn!("Failed to request vsync callback: {e:?}");
+    }
+}
+
+/// Vsync callback. Runs on the OHOS framework's vsync helper thread
 unsafe extern "C" fn on_vsync_cb(
     timestamp: ::core::ffi::c_longlong,
-    data: *mut ::core::ffi::c_void,
+    _data: *mut ::core::ffi::c_void,
 ) {
     trace!("Vsync callback at time {timestamp}");
-    // SAFETY: We require the function registering us as a callback provides a valid
-    //  `OH_NativeVSync` object. We do not use `data` after this point.
-    let native_vsync = unsafe { ohos_vsync::NativeVsync::from_raw(data.cast()) };
-    call(ServoAction::Vsync).unwrap();
-    // Todo: Do we have a callback for when the frame finished rendering?
-    unsafe {
-        native_vsync
-            .request_raw_callback_with_self(Some(on_vsync_cb))
-            .unwrap();
+    // Let's not panic here, that's been a source of confusion.
+    if let Err(e) = call(ServoAction::Vsync) {
+        error!("Failed to send Vsync event: {e:?} - Main thread died?");
     }
 }
 
@@ -588,15 +635,6 @@ extern "C" fn on_surface_created_cb(xcomponent: *mut OH_NativeXComponent, window
             window_wrapper,
         ))
         .expect("Servo main thread channel not initialized");
-
-        let native_vsync =
-            ohos_vsync::NativeVsync::new("ServoVsync").expect("Failed to create NativeVsync");
-        unsafe {
-            native_vsync
-                .request_raw_callback_with_self(Some(on_vsync_cb))
-                .expect("Failed to request vsync callback")
-        }
-        info!("Enabled Vsync!");
     } else {
         call(ServoAction::CreatePlatformWindow(
             xc_wrapper,
@@ -718,6 +756,11 @@ extern "C" fn on_dispatch_touch_event_cb(component: *mut OH_NativeXComponent, wi
 }
 
 extern "C" fn on_dispatch_key_event(xc: *mut OH_NativeXComponent, _window: *mut c_void) {
+    // See <https://docs.rs/arkui-sys/latest/arkui_sys/ui_input_event/struct.ArkUI_ModifierKeyName.html#impl-ArkUI_ModifierKeyName>
+    const MODIFIER_KEY_CTRL: u64 = 1;
+    const MODIFIER_KEY_SHIFT: u64 = 2;
+    const MODIFIER_KEY_ALT: u64 = 4;
+
     info!("DispatchKeyEvent");
     let mut event: *mut OH_NativeXComponent_KeyEvent = core::ptr::null_mut();
     let res = unsafe { OH_NativeXComponent_GetKeyEvent(xc, &mut event as *mut *mut _) };
@@ -731,22 +774,40 @@ extern "C" fn on_dispatch_key_event(xc: *mut OH_NativeXComponent, _window: *mut 
     let res = unsafe { OH_NativeXComponent_GetKeyEventCode(event, &mut keycode as *mut _) };
     assert_eq!(res, 0);
 
-    // Simplest possible impl, just for testing purposes
-    let code: keyboard_types::Code = keycode.into();
-    // There currently doesn't seem to be an API to query keymap / keyboard layout, so
-    // we don't even bother implementing modifier support for now, since we expect to be using the
-    // IME most of the time anyway. We can revisit this when someone has an OH device with a
-    // physical keyboard.
-    let char = code.to_string();
-    let key = Key::Character(char);
-    match action {
-        OH_NativeXComponent_KeyAction::OH_NATIVEXCOMPONENT_KEY_ACTION_UP => {
-            call(ServoAction::KeyUp(key)).expect("Call failed")
+    let mut modifier_bits: u64 = 0;
+    let res =
+        unsafe { OH_NativeXComponent_GetKeyEventModifierKeyStates(event, &raw mut modifier_bits) };
+    if res != 0 {
+        warn!("GetKeyEventModifierKeyStates failed with {res}");
+    }
+    let mut caps_lock = false;
+    let mut num_lock = false;
+    let mut scroll_lock = false;
+    unsafe {
+        OH_NativeXComponent_GetKeyEventCapsLockState(event, &raw mut caps_lock);
+        OH_NativeXComponent_GetKeyEventNumLockState(event, &raw mut num_lock);
+        OH_NativeXComponent_GetKeyEventScrollLockState(event, &raw mut scroll_lock);
+    }
+    let modifiers = ModifierState {
+        shift: modifier_bits & MODIFIER_KEY_SHIFT != 0,
+        ctrl: modifier_bits & MODIFIER_KEY_CTRL != 0,
+        alt: modifier_bits & MODIFIER_KEY_ALT != 0,
+        meta: None,
+        caps_lock,
+        num_lock,
+        scroll_lock,
+    };
+
+    let converted = KEY_EVENT_CONVERTER
+        .lock()
+        .unwrap()
+        .convert(action, keycode, modifiers);
+    match converted {
+        Some(key_event) => {
+            debug!("Dispatching key event {key_event:?}");
+            call(ServoAction::KeyEvent(key_event)).expect("Call failed")
         },
-        OH_NativeXComponent_KeyAction::OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN => {
-            call(ServoAction::KeyDown(key)).expect("Call failed")
-        },
-        _ => error!("Unknown key action {:?}", action),
+        None => error!("Unknown key action {:?}", action),
     }
 }
 
@@ -1085,8 +1146,8 @@ impl HostCallbacks {
             .enterkey_type(options.enterkey_type)
             .build();
         let editor = RawTextEditorProxy::new(Box::new(ServoIme { text_config }))
-            .map_err(|e| ImeError::TextEditorProxy(e))?;
-        ImeProxy::new(editor, attach_options).map_err(|e| ImeError::ImeProxy(e))
+            .map_err(ImeError::TextEditorProxy)?;
+        ImeProxy::new(editor, attach_options).map_err(ImeError::ImeProxy)
     }
 }
 
@@ -1110,6 +1171,12 @@ impl Ime for ServoIme {
 
     fn send_enter_key(&self, _enter_key: InputMethod_EnterKeyType) {
         call(ServoAction::ImeSendEnter).unwrap()
+    }
+
+    fn keyboard_status_changed(&self, status: KeyboardStatus) {
+        if let KeyboardStatus::Hidden = status {
+            call(ServoAction::ImeDismiss).unwrap()
+        }
     }
 }
 
@@ -1240,6 +1307,8 @@ impl HostTrait for HostCallbacks {
     ) {
         warn!("on_media_session_set_position_state not implemented");
     }
+
+    fn on_show_select_element(&self, _webview_id: WebViewId, _prompt: SelectElement) {}
 
     fn on_panic(&self, reason: String, backtrace: Option<String>) {
         error!("Panic: {reason},");

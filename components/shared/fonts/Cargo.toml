@@ -25,6 +25,7 @@ parking_lot = { workspace = true }
 profile_traits = { workspace = true }
 read-fonts = { workspace = true }
 serde = { workspace = true }
+servo_arc = { workspace = true }
 servo-base = { workspace = true }
 servo-url = { workspace = true }
 stylo = { workspace = true }
@@ -33,3 +34,6 @@ webrender_api = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 dwrote = { workspace = true }
+
+[lints]
+workspace = true

@@ -2,11 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::f32;
-
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
-use servo_media::audio::node::AudioNodeType;
+use servo_media::audio::audio_node::AudioNodeType;
 use servo_media::audio::param::{ParamDir, ParamType};
 
 use crate::dom::audio::audioparam::AudioParam;
@@ -19,7 +18,6 @@ use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct AudioListener {
@@ -36,10 +34,16 @@ pub(crate) struct AudioListener {
 }
 
 impl AudioListener {
-    fn new_inherited(window: &Window, context: &BaseAudioContext, can_gc: CanGc) -> AudioListener {
+    fn new_inherited(
+        cx: &mut JSContext,
+        window: &Window,
+        context: &BaseAudioContext,
+    ) -> AudioListener {
         let node = context.listener();
 
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-positionx>
         let position_x = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -49,9 +53,10 @@ impl AudioListener {
             0.,       // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-positiony>
         let position_y = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -61,9 +66,10 @@ impl AudioListener {
             0.,       // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-positionz>
         let position_z = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -73,9 +79,10 @@ impl AudioListener {
             0.,       // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardx>
         let forward_x = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -85,9 +92,10 @@ impl AudioListener {
             0.,       // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardy>
         let forward_y = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -97,9 +105,10 @@ impl AudioListener {
             0.,       // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardz>
         let forward_z = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -109,9 +118,10 @@ impl AudioListener {
             -1.,      // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-upx>
         let up_x = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -121,9 +131,10 @@ impl AudioListener {
             0.,       // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-upy>
         let up_y = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -133,9 +144,10 @@ impl AudioListener {
             1.,       // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
+        // <https://webaudio.github.io/web-audio-api/#dom-audiolistener-upz>
         let up_z = AudioParam::new(
+            cx,
             window,
             context,
             Some(node),
@@ -145,7 +157,6 @@ impl AudioListener {
             0.,       // default value
             f32::MIN, // min value
             f32::MAX, // max value
-            can_gc,
         );
 
         AudioListener {
@@ -164,12 +175,12 @@ impl AudioListener {
 
     #[cfg_attr(crown, expect(crown::unrooted_must_root))]
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         context: &BaseAudioContext,
-        can_gc: CanGc,
     ) -> DomRoot<AudioListener> {
-        let node = AudioListener::new_inherited(window, context, can_gc);
-        reflect_dom_object(Box::new(node), window, can_gc)
+        let node = AudioListener::new_inherited(cx, window, context);
+        reflect_dom_object(cx, Box::new(node), window)
     }
 }
 

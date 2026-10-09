@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![deny(unsafe_code)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::panic)]
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -13,15 +15,12 @@ use paint_api::{PaintMessage, PaintProxy};
 use profile_traits::{mem, time};
 use servo_base::generic_channel::RoutedReceiver;
 use servo_constellation_traits::EmbedderToConstellationMessage;
-#[cfg(feature = "webxr")]
-use webxr::WebXrRegistry;
 
 pub use crate::paint::{Paint, ViewportScrollExtent, WebRenderDebugOption};
 
 #[macro_use]
 mod tracing;
 
-mod largest_contentful_paint_calculator;
 mod paint;
 mod painter;
 mod pinch_zoom;
@@ -31,6 +30,7 @@ mod render_notifier;
 mod screenshot;
 mod touch;
 mod web_content_animation;
+#[cfg(feature = "webgl")]
 mod webrender_external_images;
 mod webview_renderer;
 
@@ -52,7 +52,4 @@ pub struct InitialPaintState {
     /// An [`EventLoopWaker`] used in order to wake up the embedder when it is
     /// time to paint.
     pub event_loop_waker: Box<dyn EventLoopWaker>,
-    /// If WebXR is enabled, a [`WebXrRegistry`] to register WebXR threads.
-    #[cfg(feature = "webxr")]
-    pub webxr_registry: Box<dyn WebXrRegistry>,
 }

@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use app_units::Au;
-use layout_api::AxesOverflow;
+use layout_api::{AxesOverflow, LayoutElementType, LayoutNode, LayoutNodeType};
 use malloc_size_of_derive::MallocSizeOf;
 use style::Zero;
 use style::color::AbsoluteColor;
@@ -36,7 +36,7 @@ use unicode_bidi::Level;
 use webrender_api as wr;
 use webrender_api::units::LayoutTransform;
 
-use crate::dom_traversal::Contents;
+use crate::dom_traversal::{Contents, NodeAndStyleInfo};
 use crate::fragment_tree::FragmentFlags;
 use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, LogicalSides, LogicalSides1D, LogicalVec2, PhysicalSides,
@@ -72,7 +72,11 @@ impl DisplayGeneratingBox {
         }
     }
 
-    pub(crate) fn used_value_for_contents(&self, contents: &Contents) -> Self {
+    pub(crate) fn used_value_for_contents(
+        &self,
+        contents: &Contents,
+        info: &NodeAndStyleInfo,
+    ) -> Self {
         // From <https://www.w3.org/TR/css-display-3/#layout-specific-display>:
         // > When the display property of a replaced element computes to one of
         // > the layout-internal values, it is handled as having a used value of
@@ -85,10 +89,21 @@ impl DisplayGeneratingBox {
                 },
             }
         } else if matches!(contents, Contents::Widget(_)) {
-            // If it's a widget, make sure the display-inside is flow-root.
             // <https://html.spec.whatwg.org/multipage/#form-controls>
-            // TODO: Do we want flow-root, or just an independent formatting context?
-            if let DisplayGeneratingBox::OutsideInside { outside, .. } = self {
+            // Widgets should establish an independent formatting context. Therefore,
+            // replace a `flow` inner display type with `flow-root`, or just use
+            // `flow-root` unconditionally, depending on the element.
+            // Also, prevent it from being a list item, like Blink and WebKit, but
+            // unlike Gecko. See https://github.com/w3c/csswg-drafts/issues/14187
+            if let DisplayGeneratingBox::OutsideInside { outside, inside } = self &&
+                (matches!(
+                    inside,
+                    DisplayInside::Flow { .. } | DisplayInside::FlowRoot { .. }
+                ) || info.node.type_id() !=
+                    Some(LayoutNodeType::Element(
+                        LayoutElementType::HTMLButtonElement,
+                    )))
+            {
                 DisplayGeneratingBox::OutsideInside {
                     outside: *outside,
                     inside: DisplayInside::FlowRoot {
@@ -333,11 +348,13 @@ pub(crate) trait ComputedValuesExt {
     fn z_index_applies(&self, fragment_flags: FragmentFlags) -> bool;
     fn effective_z_index(&self, fragment_flags: FragmentFlags) -> i32;
     fn effective_overflow(&self, fragment_flags: FragmentFlags) -> AxesOverflow;
+    fn used_transform_style(&self, fragment_flags: FragmentFlags) -> ComputedTransformStyle;
     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_stacking_context(&self, fragment_flags: FragmentFlags) -> bool;
     /// Whether `mask-image` has at least one layer with an image.
     fn has_mask_image(&self) -> bool;
     fn establishes_scroll_container(&self, fragment_flags: FragmentFlags) -> bool;
+    fn establishes_or_extends_3d_rendering_context(&self, fragment_flags: FragmentFlags) -> bool;
     fn establishes_containing_block_for_absolute_descendants(
         &self,
         fragment_flags: FragmentFlags,
@@ -352,7 +369,7 @@ pub(crate) trait ComputedValuesExt {
         padding_border_sums: &LogicalVec2<Au>,
     ) -> Option<AspectRatio>;
     fn background_is_transparent(&self) -> bool;
-    fn get_webrender_primitive_flags(&self) -> wr::PrimitiveFlags;
+    fn webrender_primitive_flags(&self) -> wr::PrimitiveFlags;
     fn bidi_control_chars(&self) -> (&'static str, &'static str);
     fn resolve_align_self(
         &self,
@@ -401,10 +418,7 @@ impl ComputedValuesExt for ComputedValues {
     ) -> LogicalVec2<Size<LengthPercentage>> {
         let position = self.get_position();
         LogicalVec2::from_physical_size(
-            &PhysicalSize::new(
-                position.clone_width().into(),
-                position.clone_height().into(),
-            ),
+            &PhysicalSize::new(position.get_width().into(), position.get_height().into()),
             containing_block_writing_mode,
         )
     }
@@ -416,8 +430,8 @@ impl ComputedValuesExt for ComputedValues {
         let position = self.get_position();
         LogicalVec2::from_physical_size(
             &PhysicalSize::new(
-                position.clone_min_width().into(),
-                position.clone_min_height().into(),
+                position.get_min_width().into(),
+                position.get_min_height().into(),
             ),
             containing_block_writing_mode,
         )
@@ -430,8 +444,8 @@ impl ComputedValuesExt for ComputedValues {
         let position = self.get_position();
         LogicalVec2::from_physical_size(
             &PhysicalSize::new(
-                position.clone_max_width().into(),
-                position.clone_max_height().into(),
+                position.get_max_width().into(),
+                position.get_max_height().into(),
             ),
             containing_block_writing_mode,
         )
@@ -488,9 +502,9 @@ impl ComputedValuesExt for ComputedValues {
         &self,
         containing_block_writing_mode: WritingMode,
     ) -> LogicalSides<BorderStyleColor> {
-        let current_color = self.get_inherited_text().clone_color();
+        let current_color = self.get_color();
         LogicalSides::from_physical(
-            &BorderStyleColor::from_border(self.get_border(), &current_color),
+            &BorderStyleColor::from_border(self.get_border(), current_color),
             containing_block_writing_mode,
         )
     }
@@ -522,13 +536,19 @@ impl ComputedValuesExt for ComputedValues {
     }
 
     fn is_inline_box(&self, fragment_flags: FragmentFlags) -> bool {
-        self.get_box().display.is_inline_flow() &&
-            !fragment_flags.intersects(FragmentFlags::IS_REPLACED | FragmentFlags::IS_WIDGET)
+        (self.get_box().display.is_inline_flow() &&
+            !fragment_flags.intersects(
+                FragmentFlags::IS_REPLACED |
+                    FragmentFlags::IS_WIDGET |
+                    FragmentFlags::IS_FLEX_OR_GRID_ITEM,
+            )) ||
+            matches!(self.pseudo(), Some(PseudoElement::FirstLetter))
     }
 
     fn is_atomic_inline_level(&self, fragment_flags: FragmentFlags) -> bool {
         self.get_box().display.outside() == stylo::DisplayOutside::Inline &&
-            !self.is_inline_box(fragment_flags)
+            !self.is_inline_box(fragment_flags) &&
+            !fragment_flags.intersects(FragmentFlags::IS_FLEX_OR_GRID_ITEM)
     }
 
     /// Returns true if this is a transformable element.
@@ -653,6 +673,50 @@ impl ComputedValuesExt for ComputedValues {
         overflow
     }
 
+    /// Get the used `transform-style` value according to the the rules in
+    /// <https://drafts.csswg.org/css-transforms/#grouping-property-values>.
+    fn used_transform_style(&self, fragment_flags: FragmentFlags) -> ComputedTransformStyle {
+        // The check for flat here is to avoid having to check all of the properties below when
+        // possible.
+        let box_style = self.get_box();
+        if box_style.transform_style == ComputedTransformStyle::Flat {
+            return ComputedTransformStyle::Flat;
+        }
+
+        // https://drafts.csswg.org/css-transforms-2/#grouping-property-values
+        //  * overflow: any value other than visible or clip.
+        //  * opacity: any value less than 1.
+        //  * filter: any value other than none.
+        //  * clip: any value other than auto.
+        //  * clip-path: any value other than none.
+        //  * isolation: used value of isolate.
+        //  * mask-image: any value other than none.
+        //  * mask-border-source: any value other than none.
+        //  * mix-blend-mode: any value other than normal.
+        //  * contain: paint and any other property/value combination that causes
+        //    paint containment. Note: this includes any property that affect the
+        //    used value of the contain property, such as content-visibility:
+        //    hidden.
+        //
+        // TODO: Support `mask-image`, `mask-border-source`, and `contain`.
+        let effects = self.get_effects();
+        let overflow = self.effective_overflow(fragment_flags);
+        if !matches!(overflow.x, Overflow::Visible | Overflow::Clip) ||
+            !matches!(overflow.y, Overflow::Visible | Overflow::Clip) ||
+            effects.opacity < 1.0 ||
+            !effects.filter.0.is_empty() ||
+            !effects.clip.is_auto() ||
+            self.get_svg().clip_path != ClipPath::None ||
+            self.get_box().isolation == ComputedIsolation::Isolate ||
+            effects.mix_blend_mode != ComputedMixBlendMode::Normal
+        {
+            return ComputedTransformStyle::Flat;
+        }
+
+        // Return the computed value if not overridden by the above exceptions
+        box_style.transform_style
+    }
+
     /// Return true if this style is a normal block and establishes
     /// a new block formatting context.
     ///
@@ -691,6 +755,16 @@ impl ComputedValuesExt for ComputedValues {
             .establishes_scroll_container()
     }
 
+    /// Returns true if this fragment establishes or extends a 3D rendering context.
+    fn establishes_or_extends_3d_rendering_context(&self, fragment_flags: FragmentFlags) -> bool {
+        // > A 3D rendering context is established by a transformable element whose used
+        // > value for transform-style is preserve-3d and which itself is not part of a 3D
+        // > rendering context. An element that establishes a 3D rendering context also
+        // > participates in that context.
+        self.is_transformable(fragment_flags) &&
+            self.used_transform_style(fragment_flags) == ComputedTransformStyle::Preserve3d
+    }
+
     /// Returns true if this fragment establishes a new stacking context and false otherwise.
     fn has_mask_image(&self) -> bool {
         self.get_svg()
@@ -704,7 +778,7 @@ impl ComputedValuesExt for ComputedValues {
         // From <https://www.w3.org/TR/css-will-change/#valdef-will-change-custom-ident>:
         // > If any non-initial value of a property would create a stacking context on the element,
         // > specifying that property in will-change must create a stacking context on the element.
-        let will_change_bits = self.clone_will_change().bits;
+        let will_change_bits = self.get_will_change().bits;
         if will_change_bits
             .intersects(WillChangeBits::STACKING_CONTEXT_UNCONDITIONAL | WillChangeBits::OPACITY)
         {
@@ -745,7 +819,8 @@ impl ComputedValuesExt for ComputedValues {
         // > establishes both a stacking context and a containing block for all descendants.
         if self.is_transformable(fragment_flags) &&
             (self.has_transform_or_perspective_style() ||
-                self.get_box().transform_style == ComputedTransformStyle::Preserve3d ||
+                self.used_transform_style(fragment_flags) ==
+                    ComputedTransformStyle::Preserve3d ||
                 will_change_bits
                     .intersects(WillChangeBits::TRANSFORM | WillChangeBits::PERSPECTIVE))
         {
@@ -823,14 +898,14 @@ impl ComputedValuesExt for ComputedValues {
         // > generate a containing block for absolutely positioned elements, specifying that property in
         // > will-change must cause the element to generate a containing block for absolutely positioned elements.
         if self
-            .clone_will_change()
+            .get_will_change()
             .bits
             .intersects(WillChangeBits::POSITION)
         {
             return true;
         }
 
-        self.clone_position() != ComputedPosition::Static
+        self.get_box().position != ComputedPosition::Static
     }
 
     /// Returns true if this style establishes a containing block for
@@ -845,7 +920,7 @@ impl ComputedValuesExt for ComputedValues {
         // > If any non-initial value of a property would cause the element to generate a
         // > containing block for fixed positioned elements, specifying that property in will-change
         // > must cause the element to generate a containing block for fixed positioned elements.
-        let will_change_bits = self.clone_will_change().bits;
+        let will_change_bits = self.get_will_change().bits;
 
         // From <https://drafts.csswg.org/css-transforms-1/#transform-rendering>:
         // > any value other than `none` for the `transform` property also causes the element
@@ -864,7 +939,8 @@ impl ComputedValuesExt for ComputedValues {
         // > establishes both a stacking context and a containing block for all descendants.
         if self.is_transformable(fragment_flags) &&
             (self.has_transform_or_perspective_style() ||
-                self.get_box().transform_style == ComputedTransformStyle::Preserve3d ||
+                self.used_transform_style(fragment_flags) ==
+                    ComputedTransformStyle::Preserve3d ||
                 will_change_bits
                     .intersects(WillChangeBits::TRANSFORM | WillChangeBits::PERSPECTIVE))
         {
@@ -894,10 +970,10 @@ impl ComputedValuesExt for ComputedValues {
         natural_aspect_ratio: Option<CSSFloat>,
         padding_border_sums: &LogicalVec2<Au>,
     ) -> Option<AspectRatio> {
-        let GenericAspectRatio {
-            auto,
+        let &GenericAspectRatio {
+            ref auto,
             ratio: mut preferred_ratio,
-        } = self.clone_aspect_ratio();
+        } = self.get_aspect_ratio();
 
         // For all cases where a ratio is specified:
         // "If the <ratio> is degenerate, the property instead behaves as auto."
@@ -942,7 +1018,7 @@ impl ComputedValuesExt for ComputedValues {
             (false, PreferredRatio::Ratio(preferred_ratio)) => {
                 // If the `box-sizing` is `border-box`, use the padding and
                 // border when calculating the aspect ratio.
-                let box_sizing_adjustment = match self.clone_box_sizing() {
+                let box_sizing_adjustment = match self.get_box_sizing() {
                     BoxSizing::ContentBox => LogicalVec2::zero(),
                     BoxSizing::BorderBox => *padding_border_sums,
                 };
@@ -968,7 +1044,7 @@ impl ComputedValuesExt for ComputedValues {
 
     /// Generate appropriate WebRender `PrimitiveFlags` that should be used
     /// for display items generated by the `Fragment` which owns this style.
-    fn get_webrender_primitive_flags(&self) -> wr::PrimitiveFlags {
+    fn webrender_primitive_flags(&self) -> wr::PrimitiveFlags {
         match self.get_box().backface_visibility {
             BackfaceVisiblity::Visible => wr::PrimitiveFlags::default(),
             BackfaceVisiblity::Hidden => wr::PrimitiveFlags::empty(),
@@ -1005,7 +1081,7 @@ impl ComputedValuesExt for ComputedValues {
         resolved_auto_value: ItemPlacement,
         resolved_normal_value: AlignFlags,
     ) -> SelfAlignment {
-        SelfAlignment(match self.clone_align_self().0 {
+        SelfAlignment(match self.get_align_self().0 {
             AlignFlags::AUTO => resolved_auto_value.0,
             AlignFlags::NORMAL => resolved_normal_value,
             value => value,
@@ -1285,6 +1361,7 @@ impl From<stylo::Display> for Display {
             },
             stylo::DisplayInside::Flex => DisplayInside::Flex,
             stylo::DisplayInside::Grid => DisplayInside::Grid,
+            stylo::DisplayInside::GridLanes => unreachable!("Should be disabled behind a pref"),
             stylo::DisplayInside::Table => DisplayInside::Table,
 
             // These should not be values of DisplayInside, but oh well

@@ -6,57 +6,103 @@ use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 use std::{iter, str};
 
 use app_units::Au;
+use atomic_refcell::AtomicRef;
 use bitflags::bitflags;
 use euclid::default::{Point2D, Rect};
 use euclid::num::Zero;
+use font_types::NameId;
 use fonts_traits::FontDescriptor;
-use icu_locid::subtags::Language;
+use icu_locale_core::subtags::Language;
+use icu_properties::props::{EnumeratedProperty, GeneralCategory};
 use log::debug;
 use malloc_size_of_derive::MallocSizeOf;
 use parking_lot::RwLock;
+use read_fonts::collections::int_set::Domain;
+use read_fonts::tables::fvar::Fvar;
+use read_fonts::tables::name::Name as NameTable;
 use read_fonts::tables::os2::{Os2, SelectionFlags};
 use read_fonts::types::Tag;
+use read_fonts::{FontRead, ReadError};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_base::id::PainterId;
 use servo_base::text::{UnicodeBlock, UnicodeBlockMethod};
+use skrifa::string::LocalizedString;
 use smallvec::SmallVec;
+use style::Atom;
+use style::computed_values::font_optical_sizing::T as FontOpticalSizing;
 use style::computed_values::font_variant_caps;
+use style::computed_values::font_variant_position::T as FontVariantPosition;
 use style::properties::style_structs::Font as FontStyleStruct;
 use style::values::computed::font::{
     FamilyName, FontFamilyNameSyntax, GenericFontFamily, SingleFontFamily,
 };
-use style::values::computed::{FontStretch, FontStyle, FontSynthesis, FontWeight};
+use style::values::computed::{
+    FontFeatureSettings, FontStyle, FontSynthesis, FontVariantEastAsian, FontVariantLigatures,
+    FontVariantNumeric, FontWeight, FontWidth,
+};
 use unicode_script::Script;
-use webrender_api::{FontInstanceFlags, FontInstanceKey, FontVariation};
+use webrender_api::{
+    FontInstanceFlags, FontInstanceKey, FontInstancePlatformOptions, FontVariation,
+};
 
+use crate::font_feature_values::ResolvedFontVariantAlternates;
 use crate::platform::font::{FontTable, PlatformFont};
 use crate::platform::font_list::fallback_font_families;
 use crate::{
     EmojiPresentationPreference, FallbackFontSelectionOptions, FontContext, FontData,
     FontDataAndIndex, FontDataError, FontIdentifier, FontTemplateDescriptor, FontTemplateRef,
     FontTemplateRefMethods, GlyphId, LocalFontIdentifier, ShapedGlyph, ShapedText, Shaper,
+    compute_used_font_features,
 };
 
+pub(crate) const AFRC: Tag = Tag::new(b"afrc");
+pub(crate) const BASE: Tag = Tag::new(b"BASE");
+pub(crate) const CALT: Tag = Tag::new(b"calt");
+pub(crate) const CBDT: Tag = Tag::new(b"CBDT");
+pub(crate) const CLIG: Tag = Tag::new(b"clig");
+pub(crate) const COLR: Tag = Tag::new(b"COLR");
+pub(crate) const CWSH: Tag = Tag::new(b"cwsh");
+pub(crate) const FRAC: Tag = Tag::new(b"frac");
+pub(crate) const DLIG: Tag = Tag::new(b"dlig");
+pub(crate) const FVAR: Tag = Tag::new(b"fvar");
+pub(crate) const FWID: Tag = Tag::new(b"fwid");
 pub(crate) const GPOS: Tag = Tag::new(b"GPOS");
 pub(crate) const GSUB: Tag = Tag::new(b"GSUB");
+pub(crate) const HIST: Tag = Tag::new(b"hist");
+pub(crate) const HLIG: Tag = Tag::new(b"hlig");
+pub(crate) const ITAL: Tag = Tag::new(b"ital");
+pub(crate) const JP04: Tag = Tag::new(b"jp04");
+pub(crate) const JP78: Tag = Tag::new(b"jp78");
+pub(crate) const JP83: Tag = Tag::new(b"jp83");
+pub(crate) const JP90: Tag = Tag::new(b"jp90");
 pub(crate) const KERN: Tag = Tag::new(b"kern");
-pub(crate) const SBIX: Tag = Tag::new(b"sbix");
-pub(crate) const CBDT: Tag = Tag::new(b"CBDT");
-pub(crate) const COLR: Tag = Tag::new(b"COLR");
-pub(crate) const BASE: Tag = Tag::new(b"BASE");
 pub(crate) const LIGA: Tag = Tag::new(b"liga");
+pub(crate) const LNUM: Tag = Tag::new(b"lnum");
+pub(crate) const NALT: Tag = Tag::new(b"nalt");
+pub(crate) const NAME: Tag = Tag::new(b"name");
+pub(crate) const ONUM: Tag = Tag::new(b"onum");
+pub(crate) const ORNM: Tag = Tag::new(b"ornm");
+pub(crate) const ORDN: Tag = Tag::new(b"ordn");
+pub(crate) const PNUM: Tag = Tag::new(b"pnum");
+pub(crate) const PWID: Tag = Tag::new(b"pwid");
+pub(crate) const RUBY: Tag = Tag::new(b"ruby");
+pub(crate) const SALT: Tag = Tag::new(b"salt");
+pub(crate) const SBIX: Tag = Tag::new(b"sbix");
+pub(crate) const SLNT: Tag = Tag::new(b"slnt");
+pub(crate) const SMPL: Tag = Tag::new(b"smpl");
+pub(crate) const SUBS: Tag = Tag::new(b"subs");
+pub(crate) const SUPS: Tag = Tag::new(b"sups");
+pub(crate) const SWSH: Tag = Tag::new(b"swsh");
+pub(crate) const TNUM: Tag = Tag::new(b"tnum");
+pub(crate) const TRAD: Tag = Tag::new(b"trad");
+pub(crate) const ZERO: Tag = Tag::new(b"zero");
 
 pub const LAST_RESORT_GLYPH_ADVANCE: FractionalPixel = 10.0;
-
-/// Nanoseconds spent shaping text across all layout threads.
-static TEXT_SHAPING_PERFORMANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // PlatformFont encapsulates access to the platform's font API,
 // e.g. quartz, FreeType. It provides access to metrics and tables
@@ -68,7 +114,6 @@ pub trait PlatformFontMethods: Sized {
     fn new_from_template(
         template: FontTemplateRef,
         pt_size: Option<Au>,
-        variations: &[FontVariation],
         data: &Option<FontData>,
         synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str> {
@@ -76,18 +121,14 @@ pub trait PlatformFontMethods: Sized {
         let font_identifier = template.identifier.clone();
 
         match font_identifier {
-            FontIdentifier::Local(font_identifier) => Self::new_from_local_font_identifier(
-                font_identifier,
-                pt_size,
-                variations,
-                synthetic_bold,
-            ),
+            FontIdentifier::Local(font_identifier) => {
+                Self::new_from_local_font_identifier(font_identifier, pt_size, synthetic_bold)
+            },
             FontIdentifier::Web(_) | FontIdentifier::ArrayBuffer(_) => Self::new_from_data(
                 font_identifier,
                 data.as_ref()
                     .expect("Should never create a web font without data."),
                 pt_size,
-                variations,
                 synthetic_bold,
             ),
         }
@@ -96,7 +137,6 @@ pub trait PlatformFontMethods: Sized {
     fn new_from_local_font_identifier(
         font_identifier: LocalFontIdentifier,
         pt_size: Option<Au>,
-        variations: &[FontVariation],
         synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str>;
 
@@ -104,9 +144,19 @@ pub trait PlatformFontMethods: Sized {
         font_identifier: FontIdentifier,
         data: &FontData,
         pt_size: Option<Au>,
-        variations: &[FontVariation],
         synthetic_bold: bool,
     ) -> Result<PlatformFont, &'static str>;
+
+    /// Create a platform font with the given variations from a existing font.
+    ///
+    /// `self` is consumed to work around platform differences. On some platforms, changing the
+    /// variations requires creating an entirely new font face, whereas on others the returned
+    /// font is `self`.
+    fn copy_with_variations(
+        self,
+        _font_identifer: &FontIdentifier,
+        _variations: &[FontVariation],
+    ) -> Result<Self, &'static str>;
 
     /// Get a [`FontTemplateDescriptor`] from a [`PlatformFont`]. This is used to get
     /// descriptors for web fonts.
@@ -120,8 +170,13 @@ pub trait PlatformFontMethods: Sized {
     fn table_for_tag(&self, _: Tag) -> Option<FontTable>;
     fn typographic_bounds(&self, _: GlyphId) -> Rect<f32>;
 
-    /// Get the necessary [`FontInstanceFlags`]` for this font.
+    /// Get the necessary [`FontInstanceFlags`] for this font.
     fn webrender_font_instance_flags(&self) -> FontInstanceFlags;
+
+    /// Get the necessary [`FontInstancePlatformOptions`] for this font.
+    fn webrender_font_instance_platform_options(&self) -> FontInstancePlatformOptions {
+        Default::default()
+    }
 
     /// Return all the variation values that the font was instantiated with.
     fn variations(&self) -> &[FontVariation];
@@ -133,20 +188,20 @@ pub trait PlatformFontMethods: Sized {
         }
 
         let weight = FontWeight::from_float(os2.us_weight_class() as f32);
-        let stretch = match os2.us_width_class() {
-            1 => FontStretch::ULTRA_CONDENSED,
-            2 => FontStretch::EXTRA_CONDENSED,
-            3 => FontStretch::CONDENSED,
-            4 => FontStretch::SEMI_CONDENSED,
-            5 => FontStretch::NORMAL,
-            6 => FontStretch::SEMI_EXPANDED,
-            7 => FontStretch::EXPANDED,
-            8 => FontStretch::EXTRA_EXPANDED,
-            9 => FontStretch::ULTRA_EXPANDED,
-            _ => FontStretch::NORMAL,
+        let width = match os2.us_width_class() {
+            1 => FontWidth::ULTRA_CONDENSED,
+            2 => FontWidth::EXTRA_CONDENSED,
+            3 => FontWidth::CONDENSED,
+            4 => FontWidth::SEMI_CONDENSED,
+            5 => FontWidth::NORMAL,
+            6 => FontWidth::SEMI_EXPANDED,
+            7 => FontWidth::EXPANDED,
+            8 => FontWidth::EXTRA_EXPANDED,
+            9 => FontWidth::ULTRA_EXPANDED,
+            _ => FontWidth::NORMAL,
         };
 
-        FontTemplateDescriptor::new(weight, stretch, style)
+        FontTemplateDescriptor::new(weight, width, style)
     }
 }
 
@@ -155,6 +210,12 @@ pub(crate) type FractionalPixel = f64;
 
 pub(crate) trait FontTableMethods {
     fn buffer(&self) -> &[u8];
+    fn parse_as_specific_table<'a, Table>(&'a self) -> Result<Table, ReadError>
+    where
+        Table: FontRead<'a, Args = ()>,
+    {
+        Table::read(read_fonts::FontData::new(self.buffer()))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
@@ -197,8 +258,8 @@ impl FontMetrics {
 
 #[derive(Debug, Default)]
 struct CachedShapeData {
-    glyph_advances: HashMap<GlyphId, FractionalPixel>,
-    glyph_indices: HashMap<char, Option<GlyphId>>,
+    glyph_advances: FxHashMap<GlyphId, FractionalPixel>,
+    glyph_indices: FxHashMap<char, Option<GlyphId>>,
     shaped_text: HashMap<ShapeCacheEntry, Arc<ShapedText>>,
 }
 
@@ -218,7 +279,7 @@ impl malloc_size_of::MallocSizeOf for CachedShapeData {
 pub struct Font {
     pub(crate) handle: PlatformFont,
     pub(crate) template: FontTemplateRef,
-    pub metrics: Arc<FontMetrics>,
+    pub metrics: OnceLock<Arc<FontMetrics>>,
     pub descriptor: FontDescriptor,
 
     /// The data for this font. And the index of the font within the data (in case it's a TTC)
@@ -246,7 +307,19 @@ pub struct Font {
     /// FIXME: This should be removed entirely in favor of better caching if necessary.
     /// See <https://github.com/servo/servo/pull/11273#issuecomment-222332873>.
     can_do_fast_shaping: OnceLock<bool>,
+
+    /// The family name of the font.
+    ///
+    /// This is the name as it is declared in the `name` table, *not* the name provided by the system
+    /// font service.
+    family_name: OnceLock<Result<Atom, NoUsableFamilyName>>,
 }
+
+/// An error indicating that the `name` table contained no usable family names.
+///
+/// For example, this can happen if the family name uses an incompatible or unknown encoding.
+#[derive(Clone)]
+struct NoUsableFamilyName;
 
 impl std::fmt::Debug for Font {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -262,7 +335,8 @@ impl malloc_size_of::MallocSizeOf for Font {
         // TODO: Collect memory usage for platform fonts and for shapers.
         // This skips the template, because they are already stored in the template cache.
 
-        self.metrics.size_of(ops) +
+        let metrics_size = self.metrics.get().map_or(0, |metrics| metrics.size_of(ops));
+        metrics_size +
             self.descriptor.size_of(ops) +
             self.cached_shape_data.read().size_of(ops) +
             self.font_instance_key
@@ -290,16 +364,25 @@ impl Font {
         let handle = PlatformFont::new_from_template(
             template.clone(),
             Some(descriptor.pt_size),
-            &descriptor.variation_settings,
             &data,
             synthetic_bold,
         )?;
-        let metrics = Arc::new(handle.metrics());
+        let variation_axes = VariationAxes::from_platform_font(&handle);
+
+        // Compute and apply the OpenType variations
+        let handle = if servo_config::pref!(layout_variable_fonts_enabled) &&
+            variation_axes.contains(VariationAxes::IS_VARIABLE)
+        {
+            let used_variations = compute_variations(&descriptor, &template, variation_axes);
+            handle.copy_with_variations(&template.identifier(), &used_variations)?
+        } else {
+            handle
+        };
 
         Ok(Font {
             handle,
             template,
-            metrics,
+            metrics: OnceLock::new(),
             descriptor,
             data_and_index: data
                 .map(|data| OnceLock::from(FontDataAndIndex { data, index: 0 }))
@@ -310,16 +393,25 @@ impl Font {
             synthesized_small_caps,
             has_color_bitmap_or_colr_table: OnceLock::new(),
             can_do_fast_shaping: OnceLock::new(),
+            family_name: Default::default(),
         })
     }
 
     /// A unique identifier for the font, allowing comparison.
-    pub fn identifier(&self) -> FontIdentifier {
+    pub fn identifier(&self) -> AtomicRef<'_, FontIdentifier> {
         self.template.identifier()
+    }
+
+    pub fn metrics(&self) -> &Arc<FontMetrics> {
+        self.metrics.get_or_init(|| Arc::new(self.handle.metrics()))
     }
 
     pub(crate) fn webrender_font_instance_flags(&self) -> FontInstanceFlags {
         self.handle.webrender_font_instance_flags()
+    }
+
+    pub(crate) fn webrender_font_instance_platform_options(&self) -> FontInstancePlatformOptions {
+        self.handle.webrender_font_instance_platform_options()
     }
 
     pub(crate) fn has_color_bitmap_or_colr_table(&self) -> bool {
@@ -345,7 +437,7 @@ impl Font {
             return Ok(data_and_index);
         }
 
-        let FontIdentifier::Local(local_font_identifier) = self.identifier() else {
+        let FontIdentifier::Local(local_font_identifier) = &*self.identifier() else {
             unreachable!("All web fonts should already have initialized data");
         };
         let Some(data_and_index) = local_font_identifier.font_data_and_index() else {
@@ -364,8 +456,6 @@ impl Font {
 bitflags! {
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub struct ShapingFlags: u8 {
-        /// Set if we are to ignore ligatures.
-        const IGNORE_LIGATURES_SHAPING_FLAG = 1 << 2;
         /// Set if we are to disable kerning.
         const DISABLE_KERNING_SHAPING_FLAG = 1 << 3;
         /// Text direction is right-to-left.
@@ -376,33 +466,44 @@ bitflags! {
 }
 
 /// Various options that control text shaping.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ShapingOptions {
     /// Spacing to add between each letter. Corresponds to the CSS 2.1 `letter-spacing` property.
-    /// NB: You will probably want to set the `IGNORE_LIGATURES_SHAPING_FLAG` if this is non-null.
     ///
     /// Letter spacing is not applied to all characters. Use [Self::letter_spacing_for_character] to
     /// determine the amount of spacing to apply.
-    pub letter_spacing: Option<Au>,
+    pub letter_spacing: Au,
     /// Spacing to add between each word. Corresponds to the CSS 2.1 `word-spacing` property.
-    pub word_spacing: Option<Au>,
+    pub word_spacing: Au,
     /// The Unicode script property of the characters in this run.
     pub script: Script,
     /// The preferred language, obtained from the `lang` attribute.
     pub language: Language,
+    /// The value of the `font-variant-ligatures` property.
+    pub ligatures: FontVariantLigatures,
+    /// The value of the `font-variant-numeric` property.
+    pub numeric: FontVariantNumeric,
+    /// The value of the `font-variant-east-asian` property.
+    pub east_asian: FontVariantEastAsian,
+    /// The value of the `font-feature-settings` property.
+    pub feature_settings: FontFeatureSettings,
+    /// The value of the `font-variant-position` property.
+    pub position: FontVariantPosition,
+    /// The value of the `font-variant-alternates` property.
+    pub alternates: ResolvedFontVariantAlternates,
     /// Various flags.
     pub flags: ShapingFlags,
 }
 
 impl ShapingOptions {
-    pub(crate) fn letter_spacing_for_character(&self, character: char) -> Option<Au> {
+    pub(crate) fn letter_spacing_for_character(&self, character: char) -> Au {
         // https://drafts.csswg.org/css-text/#letter-spacing-property
         // Letter spacing ignores invisible zero-width formatting characters (such as those from the Unicode Cf category).
         // Spacing must be added as if those characters did not exist in the document.
-        self.letter_spacing.filter(|_| {
-            icu_properties::maps::general_category().get(character) !=
-                icu_properties::GeneralCategory::Format
-        })
+        if GeneralCategory::for_char(character) == GeneralCategory::Format {
+            return Au::zero();
+        }
+        self.letter_spacing
     }
 }
 
@@ -410,41 +511,49 @@ impl ShapingOptions {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ShapeCacheEntry {
     text: String,
-    options: ShapingOptions,
+    letter_spacing: Au,
+    word_spacing: Au,
+    script: Script,
+    language: Language,
+    font_features: Box<[(Tag, u32)]>,
+    flags: ShapingFlags,
 }
 
 impl Font {
+    #[servo_tracing::instrument(name = "Font::shape_text", skip_all)]
     pub fn shape_text(&self, text: &str, options: &ShapingOptions) -> Arc<ShapedText> {
+        let font_features =
+            compute_used_font_features(options, self.template.borrow().font_face_rule.as_deref())
+                .collect();
         let lookup_key = ShapeCacheEntry {
             text: text.to_owned(),
-            options: *options,
+            letter_spacing: options.letter_spacing,
+            word_spacing: options.word_spacing,
+            script: options.script,
+            language: options.language,
+            flags: options.flags,
+            font_features,
         };
-        {
-            let cache = self.cached_shape_data.read();
-            if let Some(shaped_text) = cache.shaped_text.get(&lookup_key) {
-                return shaped_text.clone();
-            }
+
+        if let Some(shaped_text) = self.cached_shape_data.read().shaped_text.get(&lookup_key) {
+            return shaped_text.clone();
         }
 
-        let start_time = Instant::now();
         let glyphs = if self.can_do_fast_shaping(text, options) {
             debug!("shape_text: Using ASCII fast path.");
             self.shape_text_fast(text, options)
         } else {
             debug!("shape_text: Using Harfbuzz.");
-            self.shaper
-                .get_or_init(|| Shaper::new(self))
-                .shape_text(text, options)
+            self.shaper.get_or_init(|| Shaper::new(self)).shape_text(
+                text,
+                options,
+                &lookup_key.font_features,
+            )
         };
 
         let shaped_text = Arc::new(glyphs);
         let mut cache = self.cached_shape_data.write();
         cache.shaped_text.insert(lookup_key, shaped_text.clone());
-
-        TEXT_SHAPING_PERFORMANCE_COUNTER.fetch_add(
-            ((Instant::now() - start_time).as_nanos()) as usize,
-            Ordering::Relaxed,
-        );
 
         shaped_text
     }
@@ -531,7 +640,7 @@ impl Font {
         glyph_index
     }
 
-    pub(crate) fn has_glyph_for(&self, codepoint: char) -> bool {
+    pub fn has_glyph_for(&self, codepoint: char) -> bool {
         self.glyph_index(codepoint).is_some()
     }
 
@@ -575,6 +684,65 @@ impl Font {
         _: &FallbackFontSelectionOptions,
     ) -> Option<FontRef> {
         None
+    }
+
+    fn get_family_name_from_font_data(&self) -> Result<Atom, NoUsableFamilyName> {
+        let name_table = self.table_for_tag(NAME).ok_or(NoUsableFamilyName)?;
+        let name_table = NameTable::read(read_fonts::FontData::new(name_table.buffer()))
+            .map_err(|_| NoUsableFamilyName)?;
+
+        // Find the most usable family name entry, preferring "en-US" > "en" > "everything else".
+        // TODO: If we ever have a way to get a read_fonts::FontRef out of a PlatformFont then skrifa can
+        // do this for us with LocalizedStrings::english_or_first.
+        //
+        // https://docs.rs/skrifa/latest/skrifa/string/struct.LocalizedStrings.html#method.english_or_first
+        let mut best_rank = -1;
+        let mut best_string = None;
+        for (index, name_record) in name_table
+            .name_record()
+            .iter()
+            .filter(|name_record| name_record.name_id() == NameId::FAMILY_NAME)
+            .enumerate()
+        {
+            let localized_string = LocalizedString::new(&name_table, name_record);
+            let rank = match (index, localized_string.language()) {
+                (_, Some("en-US")) => {
+                    best_string = Some(localized_string);
+                    break;
+                },
+                (_, Some("en")) => 2,
+                (_, None) => 1,
+                (0, _) => 0,
+                _ => continue,
+            };
+            if rank > best_rank {
+                best_rank = rank;
+                best_string = Some(localized_string);
+            }
+        }
+
+        best_string
+            .map(|best_string| best_string.chars().collect::<String>().into())
+            .ok_or(NoUsableFamilyName)
+    }
+
+    /// Return the font's declared family name:
+    ///  - Platform: fonts: A value from OpenType `name` table, or `None` if either the platform
+    ///    does not support that query or the font does not have a usable name.
+    ///  - Web fonts: the family name specified in the `@font-face` rule
+    pub fn family_name(&self) -> Option<Atom> {
+        self.template
+            .font_face_rule()
+            .and_then(|font_face_rule| {
+                AtomicRef::filter_map(font_face_rule, |rule| rule.descriptors.font_family.as_ref())
+            })
+            .map(|font_family| font_family.name.clone())
+            .or_else(|| {
+                self.family_name
+                    .get_or_init(|| self.get_family_name_from_font_data())
+                    .clone()
+                    .ok()
+            })
     }
 }
 
@@ -948,7 +1116,7 @@ pub struct FontBaseline {
 /// by creating an array as below. Values that fall between two mapped
 /// values, will be adjusted by the weighted mean.
 ///
-/// ```rust
+/// ```ignore
 /// let mapping = [
 ///     (0., 0.),
 ///     (FC_WEIGHT_REGULAR as f64, 400 as f64),
@@ -977,4 +1145,198 @@ pub(crate) fn map_platform_values_to_style_values(mapping: &[(f64, f64)], value:
     }
 
     mapping[mapping.len() - 1].1
+}
+
+/// <https://drafts.csswg.org/css-fonts-4/#apply-font-matching-variations>
+fn compute_variations(
+    descriptor: &FontDescriptor,
+    template: &FontTemplateRef,
+    variation_axes: VariationAxes,
+) -> Vec<FontVariation> {
+    let font_face_rule = template.font_face_rule();
+
+    // The steps in this algorithm are inverted order because they are listed in ascending order of precedence.
+    let mut variations: Vec<FontVariation> = vec![];
+
+    let mut add_variation = |variation: FontVariation| {
+        if !variations
+            .iter()
+            .any(|existing_variation| existing_variation.tag == variation.tag)
+        {
+            variations.push(variation);
+        }
+    };
+
+    // Step 12. Font variations implied by the value of the font-variation-settings property are applied.
+    // These values should be clamped to the values that are supported by the font.
+    // NOTE: Clamping happens inside the PlatformFont.
+    descriptor
+        .variation_settings
+        .iter()
+        .copied()
+        .for_each(&mut add_variation);
+
+    // Step 9. Font variations implied by the value of the font-optical-sizing property are applied.
+    // NOTE The precise behaviour of font-optical-sizing:auto is not defined.
+    // We choose to set "opsz" to the font size if it's not already set elsewhere. This is the easiest
+    // at the end of this function, so we move this step down.
+
+    if let Some(font_face_rule) = &font_face_rule {
+        // Step 6. If the font is defined via an @font-face rule, the font variations implied by the font-variation-settings
+        // descriptor in the @font-face rule are applied.
+        if let Some(variation_settings) =
+            font_face_rule.descriptors.font_variation_settings.as_ref()
+        {
+            variation_settings
+                .0
+                .iter()
+                .map(|variation| FontVariation {
+                    tag: variation.tag.0,
+                    value: variation.value.get().expect(
+                        "The value is enforced to be resolvable at parse time \
+                        (see FontVariationSettings::parse_for_font_face_rule).",
+                    ),
+                })
+                .for_each(&mut add_variation);
+        }
+    }
+
+    // Step 2. Font variations as enabled by the font-weight, font-width, and font-style properties are applied.
+    //
+    // The application of the value enabled by font-style is affected by font selection, because this property might
+    // select an italic or an oblique font. The value applied is the closest matching value as determined by the font
+    // matching algorithm. User agents must apply at most one value due to the font-style property; both "ital" and
+    // "slnt" values must not be set together.
+    //
+    // If the selected font is defined in an @font-face rule, then the values applied at this step should be clamped
+    // to the value of the font-weight, font-width, and font-style descriptors in that @font-face rule.
+    // TODO: Clamp weight/width to the descriptors from the @font-face rule, if any
+    add_variation(FontVariation {
+        tag: Tag::new(b"wght").to_u32(),
+        value: descriptor.weight.value(),
+    });
+
+    add_variation(FontVariation {
+        tag: Tag::new(b"wdth").to_u32(),
+        value: descriptor.width.0.to_float(),
+    });
+
+    if variation_axes.intersects(VariationAxes::ITAL | VariationAxes::SLNT) {
+        let clamped_font_style = font_face_rule
+            .as_ref()
+            .and_then(|font_face_rule| font_face_rule.descriptors.font_style.as_ref())
+            .map(|font_style_range| {
+                let computed_font_style_range =
+                    font_style_range.compute().expect("never returns None");
+
+                if computed_font_style_range.0 == FontStyle::ITALIC {
+                    debug_assert_eq!(computed_font_style_range.1, FontStyle::ITALIC);
+                    return FontStyle::ITALIC;
+                }
+                debug_assert_ne!(computed_font_style_range.1, FontStyle::ITALIC);
+
+                let specified_angle = if descriptor.style == FontStyle::ITALIC {
+                    FontStyle::DEFAULT_OBLIQUE_DEGREES as f32
+                } else {
+                    descriptor.style.oblique_degrees()
+                };
+
+                let clamped_angle = specified_angle
+                    .min(computed_font_style_range.1.oblique_degrees())
+                    .max(computed_font_style_range.0.oblique_degrees());
+                FontStyle::oblique(clamped_angle)
+            })
+            .unwrap_or(descriptor.style);
+
+        // TODO: We should recognize when a font has neither a ital nor a slnt axis and then
+        // synthesize an appropriate font face if allowed by font-synthesis.
+
+        // When both a `ital` and a `slnt` axis are available then we prefer `ital` for
+        // `font-style: italic` and `slnt` for `font-style: oblique`.
+        let use_ital_axis = (variation_axes.contains(VariationAxes::ITAL) &&
+            clamped_font_style == FontStyle::ITALIC) ||
+            !variation_axes.contains(VariationAxes::SLNT);
+        if use_ital_axis {
+            add_variation(FontVariation {
+                tag: ITAL.to_u32(),
+                value: (clamped_font_style != FontStyle::NORMAL) as u32 as f32,
+            });
+        } else {
+            // Note: CSS and OpenType measure slnt in opposite directions, so we need to negate the
+            // angles.
+            if clamped_font_style == FontStyle::ITALIC {
+                add_variation(FontVariation {
+                    tag: SLNT.to_u32(),
+                    value: (-FontStyle::DEFAULT_OBLIQUE_DEGREES) as f32,
+                });
+            } else {
+                add_variation(FontVariation {
+                    tag: SLNT.to_u32(),
+                    value: -clamped_font_style.oblique_degrees(),
+                });
+            }
+        }
+    }
+
+    // This is the implementation for Step 9. Refer to the note on Step 9 for an explanation of why it's here.
+    if descriptor.optical_sizing == FontOpticalSizing::Auto {
+        add_variation(FontVariation {
+            tag: Tag::new(b"opsz").to_u32(),
+            value: descriptor.pt_size.to_f32_px(),
+        });
+    }
+
+    variations
+}
+
+bitflags! {
+    #[derive(Clone, Copy, Debug)]
+    struct VariationAxes: u8 {
+        /// Whether the font has any variation axes at all.
+        const IS_VARIABLE = 1;
+
+        /// Whether the font as a `ital` axis.
+        ///
+        /// Never set without `IS_VARIABLE`.
+        const ITAL = 1 << 1;
+
+        /// Whether the font as a `slnt` axis.
+        ///
+        /// Never set without `IS_VARIABLE`.
+        const SLNT = 1 << 2;
+    }
+}
+
+impl VariationAxes {
+    fn from_platform_font(platform_font: &PlatformFont) -> Self {
+        let Some(fvar_table) = platform_font.table_for_tag(FVAR) else {
+            // This is not a variable font.
+            return VariationAxes::empty();
+        };
+
+        let Some(variation_axes) = fvar_table
+            .parse_as_specific_table::<Fvar<'_>>()
+            .ok()
+            .and_then(|fvar: Fvar<'_>| fvar.axis_instance_arrays().ok())
+            .map(|instance_arrays| instance_arrays.axes())
+        else {
+            // The fvar table is malformed.
+            return VariationAxes::empty();
+        };
+
+        if variation_axes.is_empty() {
+            return VariationAxes::empty();
+        }
+
+        let mut result = VariationAxes::IS_VARIABLE;
+        for axis in variation_axes {
+            match axis.axis_tag() {
+                ITAL => result |= VariationAxes::ITAL,
+                SLNT => result |= VariationAxes::SLNT,
+                _ => {},
+            }
+        }
+
+        result
+    }
 }

@@ -4,12 +4,12 @@
 
 // https://www.khronos.org/registry/webgl/specs/latest/1.0/webgl.idl
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::WebGLShaderPrecisionFormatBinding::WebGLShaderPrecisionFormatMethods;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct WebGLShaderPrecisionFormat {
@@ -30,18 +30,18 @@ impl WebGLShaderPrecisionFormat {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         range_min: i32,
         range_max: i32,
         precision: i32,
-        can_gc: CanGc,
     ) -> DomRoot<WebGLShaderPrecisionFormat> {
         reflect_dom_object(
+            cx,
             Box::new(WebGLShaderPrecisionFormat::new_inherited(
                 range_min, range_max, precision,
             )),
             window,
-            can_gc,
         )
     }
 }

@@ -19,7 +19,7 @@ from . import testloader
 from . import wptcommandline
 from . import wptlogging
 from . import wpttest
-from mozlog import capture, handlers
+from mozlog import capture, handlers, structuredlog
 from .font import FontInstaller
 from .testrunner import ManagerGroup, TestImplementation
 
@@ -43,10 +43,25 @@ format. This manifest is used directly to determine which tests exist. Local
 metadata files are used to store the expected test results.
 """
 
-def setup_logging(*args, **kwargs):
-    global logger
-    logger = wptlogging.setup(*args, **kwargs)
-    return logger
+def setup_logging(wptrunner_kwargs, defaults, formatter_defaults=None):
+    # Legacy entry point
+    return GlobalLogger(wptrunner_kwargs, defaults, formatter_defaults).__enter__()
+
+
+class GlobalLogger(wptlogging.LoggerManager):
+    def __enter__(self) -> structuredlog.StructuredLogger:
+        global logger
+        if logger is not None:
+            raise ValueError("logger is already configured")
+        logger = super().__enter__()
+        assert logger is not None
+        return self._logger
+
+    def __exit__(self, *args: Any, **kwargs: Any) -> None:
+        global logger
+        assert logger is not None
+        super().__exit__(*args, **kwargs)
+        logger = None
 
 
 def get_loader(test_paths: wptcommandline.TestPaths,
@@ -75,7 +90,8 @@ def get_loader(test_paths: wptcommandline.TestPaths,
     else:
         test_groups = None
 
-    test_manifests = testloader.ManifestLoader(test_paths,
+    test_manifests = testloader.ManifestLoader(logger,
+                                               test_paths,
                                                force_manifest_update=kwargs["manifest_update"],
                                                manifest_download=kwargs["manifest_download"]).load()
 
@@ -110,7 +126,8 @@ def get_loader(test_paths: wptcommandline.TestPaths,
                                                                            test_groups=test_groups,
                                                                            **kwargs)
 
-    test_loader = testloader.TestLoader(test_manifests=test_manifests,
+    test_loader = testloader.TestLoader(logger=logger,
+                                        test_manifests=test_manifests,
                                         test_types=kwargs["test_types"],
                                         base_run_info=base_run_info,
                                         subsuites=subsuites,
@@ -480,7 +497,8 @@ def run_tests(config, product, test_paths, **kwargs):
                                  mojojs_path,
                                  inject_script,
                                  kwargs["suppress_handler_traceback"],
-                                 kwargs["ws_extra"]) as test_environment:
+                                 kwargs["ws_extra"],
+                                 logger=logger) as test_environment:
             recording.set(["startup", "ensure_environment"])
             try:
                 test_environment.ensure_started()
@@ -590,7 +608,6 @@ def start(**kwargs: Any) -> int:
         else:
             rv = int(not run_tests(**kwargs)[0])
     finally:
-        logger.shutdown()
         logger.remove_handler(handler)
 
     # Reserve everything above 64 for our global usage.
@@ -610,9 +627,8 @@ def main():
         if kwargs["prefs_root"] is None:
             kwargs["prefs_root"] = os.path.abspath(os.path.join(here, "prefs"))
 
-        setup_logging(kwargs, {"raw": sys.stdout})
-
-        return start(**kwargs)
+        with GlobalLogger(kwargs, {"raw": sys.stdout}):
+            return start(**kwargs)
     except Exception:
         if kwargs["pdb"]:
             import pdb

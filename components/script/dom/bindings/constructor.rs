@@ -2,16 +2,18 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
+
 use std::ptr;
 
 use html5ever::interface::QualName;
 use html5ever::{LocalName, local_name, ns};
+use js::conversions::ToJSValConvertible;
 use js::glue::{UnwrapObjectDynamic, UnwrapObjectStatic};
 use js::jsapi::{CallArgs, JSObject};
 use js::realm::AutoRealm;
 use js::rust::wrappers2::{JS_SetPrototype, JS_WrapObject};
 use js::rust::{HandleObject, MutableHandleObject, MutableHandleValue};
-use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::interface::get_desired_proto;
 use script_bindings::reflector::DomObject;
 
@@ -47,13 +49,12 @@ use crate::dom::bindings::conversions::DerivedFrom;
 use crate::dom::bindings::error::{Error, throw_dom_exception};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::create::create_native_html_element;
 use crate::dom::customelementregistry::{ConstructionStackEntry, CustomElementState};
+use crate::dom::element::create::create_native_html_element;
 use crate::dom::element::{Element, ElementCreator};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 /// <https://html.spec.whatwg.org/multipage/#htmlconstructor>
 fn html_constructor(
@@ -68,7 +69,7 @@ fn html_constructor(
     let document = window.Document();
 
     // Step 1. Let registry be current global object's custom element registry.
-    let registry = window.CustomElements();
+    let registry = window.CustomElements(cx);
 
     // Step 2 https://html.spec.whatwg.org/multipage/#htmlconstructor
     // The custom element definition cannot use an element interface as its constructor
@@ -79,21 +80,11 @@ fn html_constructor(
         UnwrapObjectDynamic(call_args.new_target().to_object(), cx.raw_cx(), true)
     });
     if new_target_unwrapped.is_null() {
-        throw_dom_exception(
-            cx.into(),
-            global,
-            Error::Type(c"new.target is null".to_owned()),
-            CanGc::from_cx(cx),
-        );
+        throw_dom_exception(cx, global, Error::Type(c"new.target is null".to_owned()));
         return Err(());
     }
     if call_args.callee() == new_target_unwrapped.get() {
-        throw_dom_exception(
-            cx.into(),
-            global,
-            Error::Type(c"Illegal constructor.".to_owned()),
-            CanGc::from_cx(cx),
-        );
+        throw_dom_exception(cx, global, Error::Type(c"Illegal constructor.".to_owned()));
         return Err(());
     }
 
@@ -104,10 +95,9 @@ fn html_constructor(
         Some(definition) => definition,
         None => {
             throw_dom_exception(
-                cx.into(),
+                cx,
                 global,
                 Error::Type(c"No custom element definition found for new.target".to_owned()),
-                CanGc::from_cx(cx),
             );
             return Err(());
         },
@@ -118,7 +108,7 @@ fn html_constructor(
 
     rooted!(&in(cx) let callee = unsafe { UnwrapObjectStatic(call_args.callee()) });
     if callee.is_null() {
-        throw_dom_exception(cx.into(), global, Error::Security(None), CanGc::from_cx(cx));
+        throw_dom_exception(cx, global, Error::Security(None));
         return Err(());
     }
 
@@ -149,10 +139,9 @@ fn html_constructor(
         // Callee must be the same as the element interface's constructor object.
         if constructor.get() != callee.get() {
             throw_dom_exception(
-                cx.into(),
+                cx,
                 global,
                 Error::Type(c"Custom element does not extend the proper interface".to_owned()),
-                CanGc::from_cx(cx),
             );
             return Err(());
         }
@@ -186,10 +175,10 @@ fn html_constructor(
             // Step 7.2-7.5 are performed in the generated caller code.
 
             // Step 7.6 Set element's custom element state to "custom".
-            element.set_custom_element_state(CustomElementState::Custom);
+            element.set_custom_element_state(CustomElementState::Custom, cx.no_gc());
 
             // Step 7.7 Set element's custom element definition to definition.
-            element.set_custom_element_definition(definition);
+            element.set_custom_element_definition(definition, cx.no_gc());
 
             // Step 7.8 Set element's is value to isValue.
             if let Some(is_value) = is_value {
@@ -197,12 +186,7 @@ fn html_constructor(
             }
 
             if !check_type(&element) {
-                throw_dom_exception(
-                    cx.into(),
-                    global,
-                    Error::InvalidState(None),
-                    CanGc::from_cx(cx),
-                );
+                throw_dom_exception(cx, global, Error::InvalidState(None));
                 return Err(());
             } else {
                 // Step 7.9 Return element.
@@ -214,18 +198,16 @@ fn html_constructor(
             // Step 11 is performed in the generated caller code.
 
             // Step 12
-            let mut construction_stack = definition.construction_stack.borrow_mut();
-            construction_stack.pop();
-            construction_stack.push(ConstructionStackEntry::AlreadyConstructedMarker);
+            {
+                let mut construction_stack =
+                    definition.construction_stack.safe_borrow_mut(cx.no_gc());
+                construction_stack.pop();
+                construction_stack.push(ConstructionStackEntry::AlreadyConstructedMarker);
+            }
 
             // Step 13
             if !check_type(&element) {
-                throw_dom_exception(
-                    cx.into(),
-                    global,
-                    Error::InvalidState(None),
-                    CanGc::from_cx(cx),
-                );
+                throw_dom_exception(cx, global, Error::InvalidState(None));
                 return Err(());
             } else {
                 element
@@ -236,7 +218,7 @@ fn html_constructor(
             let s = c"Top of construction stack marked AlreadyConstructed due to \
                      a custom element constructor constructing itself after super()"
                 .to_owned();
-            throw_dom_exception(cx.into(), global, Error::Type(s), CanGc::from_cx(cx));
+            throw_dom_exception(cx, global, Error::Type(s));
             return Err(());
         },
     };
@@ -247,13 +229,11 @@ fn html_constructor(
             return Err(());
         }
 
-        JS_SetPrototype(cx, element.handle(), prototype.handle());
+        if !JS_SetPrototype(cx, element.handle(), prototype.handle()) {
+            return Err(());
+        }
 
-        result.safe_to_jsval(
-            cx.into(),
-            MutableHandleValue::from_raw(call_args.rval()),
-            CanGc::from_cx(cx),
-        );
+        result.to_jsval(cx, MutableHandleValue::from_raw(call_args.rval()));
     }
     Ok(())
 }

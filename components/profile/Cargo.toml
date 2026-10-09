@@ -32,7 +32,5 @@ regex = { workspace = true }
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 libc = { workspace = true }
 
-[target.'cfg(not(any(target_os = "windows", target_env = "ohos")))'.dependencies]
-# `stats` builds jemalloc with its counters: without them `stats.allocated` and
-# the rest do not exist, and the memory report has no figures for the heap.
-tikv-jemalloc-sys = { workspace = true, features = ["stats", "profiling"] }
+[lints]
+workspace = true

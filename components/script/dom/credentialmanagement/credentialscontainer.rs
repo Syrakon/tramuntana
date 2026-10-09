@@ -1,8 +1,6 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-use std::rc::Rc;
-
 use dom_struct::dom_struct;
 use embedder_traits::{EmbedderMsg, PasskeyOperation, PasskeyResponse};
 use js::context::JSContext;
@@ -32,7 +30,7 @@ use crate::dom::credentialmanagement::authenticatorresponse::AuthenticatorRespon
 use crate::dom::credentialmanagement::credential::Credential;
 use crate::dom::credentialmanagement::publickeycredential::PublicKeyCredential;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise};
 use crate::routed_promise::{RoutedPromiseListener, callback_promise};
 use crate::script_runtime::CanGc;
 
@@ -78,12 +76,8 @@ impl CredentialsContainer {
         }
     }
 
-    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<CredentialsContainer> {
-        reflect_dom_object(
-            Box::new(CredentialsContainer::new_inherited()),
-            global,
-            can_gc,
-        )
+    pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<CredentialsContainer> {
+        reflect_dom_object(cx, Box::new(CredentialsContainer::new_inherited()), global)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#abstract-opdef-request-a-credential>
@@ -91,20 +85,24 @@ impl CredentialsContainer {
         &self,
         cx: &mut CurrentRealm,
         options: &CredentialRequestOptions<DomTypeHolder>,
-    ) -> Fallible<Rc<Promise>> {
+    ) -> Fallible<RootedPromise> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
         // Step 2. Assert: settings is a secure context.
         assert!(global.is_secure_context());
         // Step 3. Let document be settings’s relevant global object's associated Document.
         let document = global.as_window().Document();
+
+        let promise = Promise::new_in_realm(cx);
         // Step 4. If document is not fully active, then return a promise rejected with an "InvalidStateError" DOMException.
         if !document.is_fully_active() {
-            return Err(Error::InvalidState(None));
+            promise.reject_error(cx, Error::InvalidState(None));
+            return Ok(promise);
         }
         // Step 5. If options.signal is aborted, then return a promise rejected with options.signal’s abort reason.
         if options.signal.as_ref().is_some_and(|s| s.aborted()) {
-            return Err(Error::Abort(None));
+            promise.reject_error(cx, Error::Abort(None));
+            return Ok(promise);
         }
         // <https://www.w3.org/TR/webauthn-2/#sctn-discover-from-external-source>
         let Some(public_key) = options.publicKey.as_ref() else {
@@ -135,13 +133,13 @@ impl CredentialsContainer {
         cx: &mut CurrentRealm,
         global: &GlobalScope,
         operation: PasskeyOperation,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         let promise = Promise::new_in_realm(cx);
         let origin = global.origin().immutable();
         let webview_id = match global.webview_id() {
             Some(id) if global.as_window().is_top_level() && origin.is_tuple() => id,
             _ => {
-                promise.reject_error(Error::NotAllowed(None), CanGc::from_cx(cx));
+                promise.reject_error(cx, Error::NotAllowed(None));
                 return promise;
             },
         };
@@ -161,24 +159,28 @@ impl CredentialsContainer {
         &self,
         cx: &mut CurrentRealm,
         _credential: &Credential,
-    ) -> Fallible<Rc<Promise>> {
+    ) -> Fallible<RootedPromise> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
         // Step 2. Assert: settings is a secure context.
         assert!(global.is_secure_context());
+
+        let promise = Promise::new_in_realm(cx);
         // Step 3. If settings’s relevant global object's associated Document is not fully active, then return a promise rejected with an "InvalidStateError" DOMException.
         if !global.as_window().Document().is_fully_active() {
-            return Err(Error::InvalidState(None));
+            promise.reject_error(cx, Error::InvalidState(None));
+            return Ok(promise);
         }
-        Err(Error::NotSupported(None))
+        promise.reject_error(cx, Error::NotSupported(None));
+        Ok(promise)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#abstract-opdef-create-a-credential>
     fn create_credential(
         &self,
         cx: &mut CurrentRealm,
-        options: &CredentialCreationOptions<DomTypeHolder>,
-    ) -> Fallible<Rc<Promise>> {
+        _options: &CredentialCreationOptions<DomTypeHolder>,
+    ) -> Fallible<RootedPromise> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
         // Step 2. Assert: settings is a secure context.
@@ -186,9 +188,12 @@ impl CredentialsContainer {
         // Step 3. Let global be settings’ global object.
         // Step 4. Let document be the relevant global object’s associated Document.
         let document = global.as_window().Document();
+
+        let promise = Promise::new_in_realm(cx);
         // Step 5. If document is not fully active, then return a promise rejected with an "InvalidStateError" DOMException.
         if !document.is_fully_active() {
-            return Err(Error::InvalidState(None));
+            promise.reject_error(cx, Error::InvalidState(None));
+            return Ok(promise);
         }
         // <https://www.w3.org/TR/webauthn-2/#sctn-createCredential>
         let Some(public_key) = options.publicKey.as_ref() else {
@@ -220,10 +225,15 @@ impl CredentialsContainer {
     }
 }
 
-impl RoutedPromiseListener<PasskeyResponse> for CredentialsContainer {
+impl RoutedPromiseListener<DomTypeHolder, PasskeyResponse> for CredentialsContainer {
     /// The embedder's authenticator answered: settle the promise of
     /// [`CredentialsContainer::ask_for_passkey`].
-    fn handle_response(&self, cx: &mut JSContext, response: PasskeyResponse, promise: &Rc<Promise>) {
+    fn handle_response(
+        &self,
+        cx: &mut JSContext,
+        response: PasskeyResponse,
+        promise: &RootedPromise,
+    ) {
         let can_gc = CanGc::from_cx(cx);
         let global = self.global();
         match response {
@@ -252,7 +262,7 @@ impl RoutedPromiseListener<PasskeyResponse> for CredentialsContainer {
                     response.upcast::<AuthenticatorResponse>(),
                     can_gc,
                 );
-                promise.resolve_native(&credential, can_gc);
+                promise.resolve_native(cx, &credential);
             },
             PasskeyResponse::Asserted {
                 credential_id,
@@ -277,17 +287,17 @@ impl RoutedPromiseListener<PasskeyResponse> for CredentialsContainer {
                     response.upcast::<AuthenticatorResponse>(),
                     can_gc,
                 );
-                promise.resolve_native(&credential, can_gc);
+                promise.resolve_native(cx, &credential);
             },
-            PasskeyResponse::Refused => promise.reject_error(Error::NotAllowed(None), can_gc),
+            PasskeyResponse::Refused => promise.reject_error(cx, Error::NotAllowed(None)),
             PasskeyResponse::WrongRelyingParty => {
-                promise.reject_error(Error::Security(None), can_gc)
+                promise.reject_error(cx, Error::Security(None))
             },
             PasskeyResponse::AlreadyRegistered => {
-                promise.reject_error(Error::InvalidState(None), can_gc)
+                promise.reject_error(cx, Error::InvalidState(None))
             },
             PasskeyResponse::Unsupported => {
-                promise.reject_error(Error::NotSupported(None), can_gc)
+                promise.reject_error(cx, Error::NotSupported(None))
             },
         }
     }
@@ -298,13 +308,13 @@ impl CredentialsContainerMethods<DomTypeHolder> for CredentialsContainer {
     fn Get(
         &self,
         cx: &mut CurrentRealm,
-        options: RootedTraceableBox<CredentialRequestOptions<DomTypeHolder>>,
-    ) -> Fallible<Rc<Promise>> {
-        self.request_credential(cx, &options)
+        options: &CredentialRequestOptions<DomTypeHolder>,
+    ) -> Fallible<RootedPromise> {
+        self.request_credential(cx, options)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#dom-credentialscontainer-store>
-    fn Store(&self, cx: &mut CurrentRealm, credential: &Credential) -> Fallible<Rc<Promise>> {
+    fn Store(&self, cx: &mut CurrentRealm, credential: &Credential) -> Fallible<RootedPromise> {
         self.store_credential(cx, credential)
     }
 
@@ -312,17 +322,17 @@ impl CredentialsContainerMethods<DomTypeHolder> for CredentialsContainer {
     fn Create(
         &self,
         cx: &mut CurrentRealm,
-        options: RootedTraceableBox<CredentialCreationOptions<DomTypeHolder>>,
-    ) -> Fallible<Rc<Promise>> {
-        self.create_credential(cx, &options)
+        options: &CredentialCreationOptions<DomTypeHolder>,
+    ) -> Fallible<RootedPromise> {
+        self.create_credential(cx, options)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#dom-credentialscontainer-preventsilentaccess>
-    fn PreventSilentAccess(&self, cx: &mut CurrentRealm) -> Fallible<Rc<Promise>> {
+    fn PreventSilentAccess(&self, cx: &mut CurrentRealm) -> Fallible<RootedPromise> {
         // No credential here is ever given without asking the user, so there
         // is no silent access to prevent. Pages call this when signing out.
         let promise = Promise::new_in_realm(cx);
-        promise.resolve_native(&(), CanGc::from_cx(cx));
+        promise.resolve_native(cx, &());
         Ok(promise)
     }
 }

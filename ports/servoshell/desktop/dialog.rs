@@ -410,17 +410,19 @@ impl Dialog {
                         frame.content_ui.add_space(10.0);
 
                         let devices = request.devices();
-                        egui::ComboBox::from_label("")
-                            .selected_text(devices[*selected_device_index].name.clone())
-                            .show_ui(&mut frame.content_ui, |ui| {
-                                for (i, device) in devices.iter().enumerate() {
-                                    ui.selectable_value(
-                                        selected_device_index,
-                                        i,
-                                        device.name.clone(),
-                                    );
-                                }
-                            });
+                        let combo_box =
+                            if let Some(selected_device) = devices.get(*selected_device_index) {
+                                egui::ComboBox::from_label("")
+                                    .selected_text(selected_device.name.clone())
+                            } else {
+                                egui::ComboBox::from_label("")
+                            };
+
+                        combo_box.show_ui(&mut frame.content_ui, |ui| {
+                            for (i, device) in devices.iter().enumerate() {
+                                ui.selectable_value(selected_device_index, i, device.name.clone());
+                            }
+                        });
 
                         frame.end(ui);
                     } else {
@@ -431,8 +433,13 @@ impl Dialog {
                         ui,
                         |_ui| {},
                         |ui| {
-                            if ui.button("Ok").clicked() ||
-                                ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            let ok_button = egui::Button::new("Ok");
+                            let has_selected_device = request.as_ref().is_some_and(|request| {
+                                request.devices().get(*selected_device_index).is_some()
+                            });
+                            if ui.add_enabled(has_selected_device, ok_button).clicked() ||
+                                (has_selected_device &&
+                                    ui.input(|i| i.key_pressed(egui::Key::Enter)))
                             {
                                 let request =
                                     request.take().expect("non-None until dialog is closed");
@@ -506,15 +513,11 @@ impl Dialog {
 
                     if clickable_area.clicked() && !option.is_disabled {
                         if allow_multiple {
-                            if let Some(pos) =
-                                selected_options.iter().position(|id| *id == option.id)
-                            {
-                                selected_options.remove(pos);
-                            }
                             if let Some(position) =
                                 selected_options.iter().position(|id| *id == option.id)
                             {
                                 selected_options.remove(position);
+                            } else {
                                 selected_options.push(option.id);
                             }
                         } else {
@@ -671,15 +674,25 @@ impl Dialog {
                                                 },
                                             };
 
-                                            ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
-                                                ui.visuals().panel_fill;
-                                            ui.style_mut().visuals.widgets.inactive.bg_fill =
-                                                ui.visuals().panel_fill;
+                                            {
+                                                let panel_fill = ui.visuals().panel_fill;
+                                                let style = ui.style_mut();
+                                                let widgets = &mut style.visuals.widgets;
+
+                                                widgets.inactive.weak_bg_fill = panel_fill;
+                                                widgets.inactive.bg_fill = panel_fill;
+
+                                                // Disable stroke for all button types in the menu.
+                                                widgets.active.bg_stroke = Stroke::NONE;
+                                                widgets.inactive.bg_stroke = Stroke::NONE;
+                                                widgets.hovered.bg_stroke = Stroke::NONE;
+                                                widgets.noninteractive.bg_stroke = Stroke::NONE;
+                                            }
+
                                             let button =
                                                 Button::new(RichText::new(label).color(color))
                                                     .sense(sense)
                                                     .corner_radius(CornerRadius::ZERO)
-                                                    .stroke(Stroke::NONE)
                                                     .wrap_mode(egui::TextWrapMode::Extend)
                                                     .min_size(Vec2 {
                                                         x: MINIMUM_UI_ELEMENT_WIDTH,

@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
+use js::conversions::ToJSValConvertible;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::realm::CurrentRealm;
@@ -20,11 +21,12 @@ use js::rust::{
 use rustc_hash::FxHashMap;
 use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::GenericBindings::MessagePortBinding::MessagePortMethods;
-use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
+use script_bindings::structuredclone::StructuredData;
 use servo_base::id::{MessagePortId, MessagePortIndex};
 use servo_constellation_traits::MessagePortImpl;
 
+use crate::dom::bindings::callback::RootedCallback;
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::{
     QueuingStrategy, QueuingStrategySize,
 };
@@ -34,21 +36,19 @@ use crate::dom::bindings::conversions::ConversionResult;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
-use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::domexception::{DOMErrorName, DOMException};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageport::MessagePort;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise, TracedPromise};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::readablestream::{ReadableStream, get_type_and_value_from_message};
 use crate::dom::stream::countqueuingstrategy::{extract_high_water_mark, extract_size_algorithm};
 use crate::dom::stream::writablestreamdefaultcontroller::{
-    UnderlyingSinkType, WritableStreamDefaultController,
+    UnderlyingSinkTypeRef, WritableStreamDefaultController,
 };
 use crate::dom::stream::writablestreamdefaultwriter::WritableStreamDefaultWriter;
-use crate::realms::{InRealm, enter_auto_realm};
-use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
+use crate::realms::enter_auto_realm;
 
 impl js::gc::Rootable for AbortAlgorithmFulfillmentHandler {}
 
@@ -58,15 +58,13 @@ impl js::gc::Rootable for AbortAlgorithmFulfillmentHandler {}
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct AbortAlgorithmFulfillmentHandler {
     stream: Dom<WritableStream>,
-    #[conditional_malloc_size_of]
-    abort_request_promise: Rc<Promise>,
+    abort_request_promise: TracedPromise,
 }
 
 impl Callback for AbortAlgorithmFulfillmentHandler {
     fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
         // Resolve abortRequest’s promise with undefined.
-        self.abort_request_promise
-            .resolve_native(&(), CanGc::from_cx(cx));
+        self.abort_request_promise.resolve_native(cx, &());
 
         // Perform ! WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream).
         self.stream
@@ -83,15 +81,13 @@ impl js::gc::Rootable for AbortAlgorithmRejectionHandler {}
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct AbortAlgorithmRejectionHandler {
     stream: Dom<WritableStream>,
-    #[conditional_malloc_size_of]
-    abort_request_promise: Rc<Promise>,
+    abort_request_promise: TracedPromise,
 }
 
 impl Callback for AbortAlgorithmRejectionHandler {
     fn callback(&self, cx: &mut CurrentRealm, reason: SafeHandleValue) {
         // Reject abortRequest’s promise with reason.
-        self.abort_request_promise
-            .reject_native(&reason, CanGc::from_cx(cx));
+        self.abort_request_promise.reject_native(cx, &reason);
 
         // Perform ! WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream).
         self.stream
@@ -107,8 +103,7 @@ impl js::gc::Rootable for PendingAbortRequest {}
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct PendingAbortRequest {
     /// <https://streams.spec.whatwg.org/#pending-abort-request-promise>
-    #[conditional_malloc_size_of]
-    promise: Rc<Promise>,
+    promise: TracedPromise,
 
     /// <https://streams.spec.whatwg.org/#pending-abort-request-reason>
     #[ignore_malloc_size_of = "mozjs"]
@@ -137,8 +132,7 @@ pub struct WritableStream {
     backpressure: Cell<bool>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-closerequest>
-    #[conditional_malloc_size_of]
-    close_request: DomRefCell<Option<Rc<Promise>>>,
+    close_request: DomRefCell<Option<TracedPromise>>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-controller>
     controller: MutNullableDom<WritableStreamDefaultController>,
@@ -147,12 +141,10 @@ pub struct WritableStream {
     detached: Cell<bool>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-inflightwriterequest>
-    #[conditional_malloc_size_of]
-    in_flight_write_request: DomRefCell<Option<Rc<Promise>>>,
+    in_flight_write_request: DomRefCell<Option<TracedPromise>>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-inflightcloserequest>
-    #[conditional_malloc_size_of]
-    in_flight_close_request: DomRefCell<Option<Rc<Promise>>>,
+    in_flight_close_request: DomRefCell<Option<TracedPromise>>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-pendingabortrequest>
     pending_abort_request: DomRefCell<Option<PendingAbortRequest>>,
@@ -168,8 +160,7 @@ pub struct WritableStream {
     writer: MutNullableDom<WritableStreamDefaultWriter>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-writerequests>
-    #[conditional_malloc_size_of]
-    write_requests: DomRefCell<VecDeque<Rc<Promise>>>,
+    write_requests: DomRefCell<VecDeque<TracedPromise>>,
 }
 
 impl WritableStream {
@@ -192,16 +183,11 @@ impl WritableStream {
     }
 
     pub(crate) fn new_with_proto(
+        cx: &mut JSContext,
         global: &GlobalScope,
         proto: Option<SafeHandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<WritableStream> {
-        reflect_dom_object_with_proto(
-            Box::new(WritableStream::new_inherited()),
-            global,
-            proto,
-            can_gc,
-        )
+        reflect_dom_object_with_proto(cx, Box::new(WritableStream::new_inherited()), global, proto)
     }
 
     /// Used as part of
@@ -275,10 +261,10 @@ impl WritableStream {
         self.get_stored_error(stored_error.handle_mut());
 
         // For each writeRequest of stream.[[writeRequests]]:
-        let write_requests = mem::take(&mut *self.write_requests.borrow_mut());
-        for request in write_requests {
+        rooted!(&in(cx) let write_requests = mem::take(&mut *self.write_requests.borrow_mut()));
+        for request in write_requests.iter() {
             // Reject writeRequest with storedError.
-            request.reject(cx.into(), stored_error.handle(), CanGc::from_cx(cx));
+            request.reject(cx, stored_error.handle());
         }
 
         // Set stream.[[writeRequests]] to an empty list.
@@ -300,11 +286,9 @@ impl WritableStream {
             // If abortRequest’s was already erroring is true,
             if pending_abort_request.was_already_erroring {
                 // Reject abortRequest’s promise with storedError.
-                pending_abort_request.promise.reject(
-                    cx.into(),
-                    stored_error.handle(),
-                    CanGc::from_cx(cx),
-                );
+                pending_abort_request
+                    .promise
+                    .reject(cx, stored_error.handle());
 
                 // Perform ! WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream).
                 self.reject_close_and_closed_promise_if_needed(cx);
@@ -331,10 +315,10 @@ impl WritableStream {
             }));
 
             let handler = PromiseNativeHandler::new(
+                cx,
                 global,
                 fulfillment_handler.take().map(|h| Box::new(h) as Box<_>),
                 rejection_handler.take().map(|h| Box::new(h) as Box<_>),
-                CanGc::from_cx(cx),
             );
 
             let mut realm = enter_auto_realm(cx, global);
@@ -352,13 +336,13 @@ impl WritableStream {
         self.get_stored_error(stored_error.handle_mut());
 
         // If stream.[[closeRequest]] is not undefined
-        let close_request = self.close_request.borrow_mut().take();
-        if let Some(close_request) = close_request {
+        rooted!(&in(cx) let close_request = self.close_request.borrow_mut().take());
+        if let Some(ref close_request) = *close_request {
             // Assert: stream.[[inFlightCloseRequest]] is undefined.
             assert!(self.in_flight_close_request.borrow().is_none());
 
             // Reject stream.[[closeRequest]] with stream.[[storedError]].
-            close_request.reject_native(&stored_error.handle(), CanGc::from_cx(cx))
+            close_request.reject_native(cx, &stored_error.handle())
 
             // Set stream.[[closeRequest]] to undefined.
             // Done with `take` above.
@@ -371,7 +355,7 @@ impl WritableStream {
             writer.reject_closed_promise_with_stored_error(cx, &stored_error.handle());
 
             // Set writer.[[closedPromise]].[[PromiseIsHandled]] to true.
-            writer.set_close_promise_is_handled();
+            writer.set_close_promise_is_handled(cx);
         }
     }
 
@@ -384,14 +368,15 @@ impl WritableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-finish-in-flight-write>
-    pub(crate) fn finish_in_flight_write(&self, can_gc: CanGc) {
-        let Some(in_flight_write_request) = self.in_flight_write_request.borrow_mut().take() else {
+    pub(crate) fn finish_in_flight_write(&self, cx: &mut JSContext) {
+        rooted!(&in(cx) let in_flight_write_request = self.in_flight_write_request.borrow_mut().take());
+        let Some(ref in_flight_write_request) = *in_flight_write_request else {
             // Assert: stream.[[inFlightWriteRequest]] is not undefined.
             unreachable!("Stream should have a write request");
         };
 
         // Resolve stream.[[inFlightWriteRequest]] with undefined.
-        in_flight_write_request.resolve_native(&(), can_gc);
+        in_flight_write_request.resolve_native(cx, &());
 
         // Set stream.[[inFlightWriteRequest]] to undefined.
         // Done above with `take`.
@@ -425,7 +410,7 @@ impl WritableStream {
         // Let writer be stream.[[writer]].
         if let Some(writer) = self.writer.get() {
             // If writer is not undefined, perform ! WritableStreamDefaultWriterEnsureReadyPromiseRejected
-            writer.ensure_ready_promise_rejected(global, error, CanGc::from_cx(cx));
+            writer.ensure_ready_promise_rejected(cx, global, error);
         }
 
         // If ! WritableStreamHasOperationMarkedInFlight(stream) is false and controller.[[started]] is true
@@ -473,10 +458,8 @@ impl WritableStream {
 
         // Let writeRequest be stream.[[writeRequests]][0].
         // Remove writeRequest from stream.[[writeRequests]].
-        let write_request = write_requests.pop_front().unwrap();
-
         // Set stream.[[inFlightWriteRequest]] to writeRequest.
-        *in_flight_write_request = Some(write_request);
+        *in_flight_write_request = write_requests.pop_front();
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-mark-close-request-in-flight>
@@ -492,21 +475,20 @@ impl WritableStream {
 
         // Let closeRequest be stream.[[closeRequest]].
         // Set stream.[[closeRequest]] to undefined.
-        let close_request = close_request.take().unwrap();
-
         // Set stream.[[inFlightCloseRequest]] to closeRequest.
-        *in_flight_close_request = Some(close_request);
+        *in_flight_close_request = close_request.take();
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-finish-in-flight-close>
-    pub(crate) fn finish_in_flight_close(&self, cx: SafeJSContext, can_gc: CanGc) {
-        let Some(in_flight_close_request) = self.in_flight_close_request.borrow_mut().take() else {
+    pub(crate) fn finish_in_flight_close(&self, cx: &mut JSContext) {
+        rooted!(&in(cx) let in_flight_close_request = self.in_flight_close_request.borrow_mut().take());
+        let Some(ref in_flight_close_request) = *in_flight_close_request else {
             // Assert: stream.[[inFlightCloseRequest]] is not undefined.
             unreachable!("in_flight_close_request must be Some");
         };
 
         // Resolve stream.[[inFlightCloseRequest]] with undefined.
-        in_flight_close_request.resolve_native(&(), can_gc);
+        in_flight_close_request.resolve_native(cx, &());
 
         // Set stream.[[inFlightCloseRequest]] to undefined.
         // Done with take above.
@@ -520,10 +502,10 @@ impl WritableStream {
             self.stored_error.set(UndefinedValue());
 
             // If stream.[[pendingAbortRequest]] is not undefined,
-            rooted!(in(*cx) let pending_abort_request = self.pending_abort_request.borrow_mut().take());
+            rooted!(&in(cx) let pending_abort_request = self.pending_abort_request.borrow_mut().take());
             if let Some(pending_abort_request) = &*pending_abort_request {
                 // Resolve stream.[[pendingAbortRequest]]'s promise with undefined.
-                pending_abort_request.promise.resolve_native(&(), can_gc);
+                pending_abort_request.promise.resolve_native(cx, &());
 
                 // Set stream.[[pendingAbortRequest]] to undefined.
                 // Done above with `take`.
@@ -537,7 +519,7 @@ impl WritableStream {
         if let Some(writer) = self.writer.get() {
             // If writer is not undefined,
             // resolve writer.[[closedPromise]] with undefined.
-            writer.resolve_closed_promise_with_undefined(can_gc);
+            writer.resolve_closed_promise_with_undefined(cx);
         }
 
         // Assert: stream.[[pendingAbortRequest]] is undefined.
@@ -554,13 +536,14 @@ impl WritableStream {
         global: &GlobalScope,
         error: SafeHandleValue,
     ) {
-        let Some(in_flight_close_request) = self.in_flight_close_request.borrow_mut().take() else {
+        rooted!(&in(cx) let in_flight_close_request = self.in_flight_close_request.borrow_mut().take());
+        let Some(ref in_flight_close_request) = *in_flight_close_request else {
             // Assert: stream.[[inFlightCloseRequest]] is not undefined.
             unreachable!("Inflight close request must be defined.");
         };
 
         // Reject stream.[[inFlightCloseRequest]] with error.
-        in_flight_close_request.reject_native(&error, CanGc::from_cx(cx));
+        in_flight_close_request.reject_native(cx, &error);
 
         // Set stream.[[inFlightCloseRequest]] to undefined.
         // Done above with `take`.
@@ -572,9 +555,7 @@ impl WritableStream {
         rooted!(&in(cx) let pending_abort_request = self.pending_abort_request.borrow_mut().take());
         if let Some(pending_abort_request) = &*pending_abort_request {
             // Reject stream.[[pendingAbortRequest]]'s promise with error.
-            pending_abort_request
-                .promise
-                .reject_native(&error, CanGc::from_cx(cx));
+            pending_abort_request.promise.reject_native(cx, &error);
 
             // Set stream.[[pendingAbortRequest]] to undefined.
             // Done above with `take`.
@@ -591,13 +572,14 @@ impl WritableStream {
         global: &GlobalScope,
         error: SafeHandleValue,
     ) {
-        let Some(in_flight_write_request) = self.in_flight_write_request.borrow_mut().take() else {
+        rooted!(&in(cx) let in_flight_write_request = self.in_flight_write_request.borrow_mut().take());
+        let Some(ref in_flight_write_request) = *in_flight_write_request else {
             // Assert: stream.[[inFlightWriteRequest]] is not undefined.
             unreachable!("Inflight write request must be defined.");
         };
 
         // Reject stream.[[inFlightWriteRequest]] with error.
-        in_flight_write_request.reject_native(&error, CanGc::from_cx(cx));
+        in_flight_write_request.reject_native(cx, &error);
 
         // Set stream.[[inFlightWriteRequest]] to undefined.
         // Done above with `take`.
@@ -633,7 +615,11 @@ impl WritableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-add-write-request>
-    pub(crate) fn add_write_request(&self, global: &GlobalScope, can_gc: CanGc) -> Rc<Promise> {
+    pub(crate) fn add_write_request(
+        &self,
+        cx: &mut JSContext,
+        global: &GlobalScope,
+    ) -> RootedPromise {
         // Assert: ! IsWritableStreamLocked(stream) is true.
         assert!(self.is_locked());
 
@@ -641,10 +627,12 @@ impl WritableStream {
         assert!(self.is_writable());
 
         // Let promise be a new promise.
-        let promise = Promise::new(global, can_gc);
+        let promise = Promise::new(cx, global);
 
         // Append promise to stream.[[writeRequests]].
-        self.write_requests.borrow_mut().push_back(promise.clone());
+        self.write_requests
+            .borrow_mut()
+            .push_back(promise.to_traced());
 
         // Return promise.
         promise
@@ -661,11 +649,11 @@ impl WritableStream {
         cx: &mut CurrentRealm,
         global: &GlobalScope,
         provided_reason: SafeHandleValue,
-    ) -> Rc<Promise> {
+    ) -> RootedPromise {
         // If stream.[[state]] is "closed" or "errored",
         if self.is_closed() || self.is_errored() {
             // return a promise resolved with undefined.
-            return Promise::new_resolved(global, cx.into(), (), CanGc::from_cx(cx));
+            return Promise::new_resolved(cx, global, ());
         }
 
         // Signal abort on stream.[[controller]].[[abortController]] with reason.
@@ -681,7 +669,7 @@ impl WritableStream {
             state,
             WritableStreamState::Closed | WritableStreamState::Errored
         ) {
-            return Promise::new_resolved(global, cx.into(), (), CanGc::from_cx(cx));
+            return Promise::new_resolved(cx, global, ());
         }
 
         // If stream.[[pendingAbortRequest]] is not undefined,
@@ -693,7 +681,7 @@ impl WritableStream {
                 .as_ref()
                 .expect("Pending abort request must be Some.")
                 .promise
-                .clone();
+                .root(cx);
         }
 
         // Assert: state is "writable" or "erroring".
@@ -716,14 +704,14 @@ impl WritableStream {
         };
 
         // Let promise be a new promise.
-        let promise = Promise::new2(cx, global);
+        let promise = Promise::new(cx, global);
 
         // Set stream.[[pendingAbortRequest]] to a new pending abort request
         // whose promise is promise,
         // reason is reason,
         // and was already erroring is wasAlreadyErroring.
         *self.pending_abort_request.borrow_mut() = Some(PendingAbortRequest {
-            promise: promise.clone(),
+            promise: promise.to_traced(),
             reason: Heap::boxed(reason.get()),
             was_already_erroring,
         });
@@ -739,16 +727,13 @@ impl WritableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-close>
-    pub(crate) fn close(&self, cx: &mut JSContext, global: &GlobalScope) -> Rc<Promise> {
+    pub(crate) fn close(&self, cx: &mut JSContext, global: &GlobalScope) -> RootedPromise {
         // Let state be stream.[[state]].
         // If state is "closed" or "errored",
         if self.is_closed() || self.is_errored() {
             // return a promise rejected with a TypeError exception.
-            let promise = Promise::new2(cx, global);
-            promise.reject_error(
-                Error::Type(c"Stream is closed or errored.".to_owned()),
-                CanGc::from_cx(cx),
-            );
+            let promise = Promise::new(cx, global);
+            promise.reject_error(cx, Error::Type(c"Stream is closed or errored.".to_owned()));
             return promise;
         }
 
@@ -759,10 +744,10 @@ impl WritableStream {
         assert!(!self.close_queued_or_in_flight());
 
         // Let promise be a new promise.
-        let promise = Promise::new2(cx, global);
+        let promise = Promise::new(cx, global);
 
         // Set stream.[[closeRequest]] to promise.
-        *self.close_request.borrow_mut() = Some(promise.clone());
+        *self.close_request.borrow_mut() = Some(promise.to_traced());
 
         // Let writer be stream.[[writer]].
         // If writer is not undefined,
@@ -771,7 +756,7 @@ impl WritableStream {
             // and state is "writable",
             if self.get_backpressure() && self.is_writable() {
                 // resolve writer.[[readyPromise]] with undefined.
-                writer.resolve_ready_promise_with_undefined(CanGc::from_cx(cx));
+                writer.resolve_ready_promise_with_undefined(cx);
             }
         }
 
@@ -811,15 +796,14 @@ impl WritableStream {
     /// <https://streams.spec.whatwg.org/#acquire-writable-stream-default-writer>
     pub(crate) fn aquire_default_writer(
         &self,
-        cx: SafeJSContext,
+        cx: &mut CurrentRealm,
         global: &GlobalScope,
-        can_gc: CanGc,
     ) -> Result<DomRoot<WritableStreamDefaultWriter>, Error> {
         // Let writer be a new WritableStreamDefaultWriter object.
-        let writer = WritableStreamDefaultWriter::new(global, None, can_gc);
+        let writer = WritableStreamDefaultWriter::new(cx, global, None);
 
         // Perform ? SetUpWritableStreamDefaultWriter(writer, stream).
-        writer.setup(cx, self, can_gc)?;
+        writer.setup(cx, self)?;
 
         // Return writer.
         Ok(writer)
@@ -828,9 +812,9 @@ impl WritableStream {
     /// <https://streams.spec.whatwg.org/#writable-stream-update-backpressure>
     pub(crate) fn update_backpressure(
         &self,
+        cx: &mut JSContext,
         backpressure: bool,
         global: &GlobalScope,
-        can_gc: CanGc,
     ) {
         // Assert: stream.[[state]] is "writable".
         self.is_writable();
@@ -847,14 +831,14 @@ impl WritableStream {
                 // and backpressure is not stream.[[backpressure]],
                 if backpressure {
                     // If backpressure is true, set writer.[[readyPromise]] to a new promise.
-                    let promise = Promise::new(global, can_gc);
-                    writer.set_ready_promise(promise);
+                    let promise = Promise::new(cx, global);
+                    writer.set_ready_promise(&promise);
                 } else {
                     // Otherwise,
                     // Assert: backpressure is false.
                     assert!(!backpressure);
                     // Resolve writer.[[readyPromise]] with undefined.
-                    writer.resolve_ready_promise_with_undefined(can_gc);
+                    writer.resolve_ready_promise_with_undefined(cx);
                 }
             }
         }
@@ -877,34 +861,31 @@ impl WritableStream {
 
         // Let sizeAlgorithm be an algorithm that returns 1.
         // Re-ordered because of the need to pass it to `new`.
-        let size_algorithm =
-            extract_size_algorithm(&QueuingStrategy::default(), CanGc::from_cx(cx));
+        let size_algorithm = extract_size_algorithm(cx, &QueuingStrategy::default());
 
         // Note: other algorithms defined in the controller at call site.
 
         // Let backpressurePromise be a new promise.
-        let backpressure_promise = Rc::new(RefCell::new(Some(Promise::new(
-            &global,
-            CanGc::from_cx(cx),
-        ))));
+        let backpressure_promise = Promise::new(cx, &global);
+        rooted!(&in(cx) let backpressure_promise = RcHolder(Rc::new(RefCell::new(Some(backpressure_promise.to_traced())))));
 
         // Let controller be a new WritableStreamDefaultController.
         let controller = WritableStreamDefaultController::new(
+            cx,
             &global,
-            UnderlyingSinkType::Transfer {
-                backpressure_promise: backpressure_promise.clone(),
-                port: Dom::from_ref(port),
+            UnderlyingSinkTypeRef::Transfer {
+                backpressure_promise: &backpressure_promise.0,
+                port,
             },
             1.0,
             size_algorithm,
-            CanGc::from_cx(cx),
         );
 
         // Add a handler for port’s message event with the following steps:
         // Add a handler for port’s messageerror event with the following steps:
         rooted!(&in(cx) let cross_realm_transform_writable = CrossRealmTransformWritable {
             controller: Dom::from_ref(&controller),
-            backpressure_promise,
+            backpressure_promise: backpressure_promise.0.clone(),
         });
         global.note_cross_realm_transform_writable(&cross_realm_transform_writable, port_id);
 
@@ -926,7 +907,7 @@ impl WritableStream {
         underlying_sink_obj: SafeHandleObject,
         underlying_sink: &UnderlyingSink,
         strategy_hwm: f64,
-        strategy_size: Rc<QueuingStrategySize>,
+        strategy_size: RootedCallback<QueuingStrategySize>,
     ) -> Result<(), Error> {
         // Let controller be a new WritableStreamDefaultController.
 
@@ -954,16 +935,16 @@ impl WritableStream {
         // takes an argument reason and returns the result of invoking underlyingSinkDict["abort"]
         // with argument list « reason » and callback this value underlyingSink.
         let controller = WritableStreamDefaultController::new(
+            cx,
             global,
-            UnderlyingSinkType::new_js(
-                underlying_sink.abort.clone(),
-                underlying_sink.start.clone(),
-                underlying_sink.close.clone(),
-                underlying_sink.write.clone(),
+            UnderlyingSinkTypeRef::new_js(
+                underlying_sink.abort.as_ref(),
+                underlying_sink.start.as_ref(),
+                underlying_sink.close.as_ref(),
+                underlying_sink.write.as_ref(),
             ),
             strategy_hwm,
             strategy_size,
-            CanGc::from_cx(cx),
         );
 
         // Note: this must be done before `setup`,
@@ -976,28 +957,27 @@ impl WritableStream {
 }
 
 /// <https://streams.spec.whatwg.org/#create-writable-stream>
-#[cfg_attr(crown, expect(crown::unrooted_must_root))]
 pub(crate) fn create_writable_stream(
     cx: &mut JSContext,
     global: &GlobalScope,
     writable_high_water_mark: f64,
-    writable_size_algorithm: Rc<QueuingStrategySize>,
-    underlying_sink_type: UnderlyingSinkType,
+    writable_size_algorithm: RootedCallback<QueuingStrategySize>,
+    underlying_sink_type: UnderlyingSinkTypeRef<'_>,
 ) -> Fallible<DomRoot<WritableStream>> {
     // Assert: ! IsNonNegativeNumber(highWaterMark) is true.
     assert!(writable_high_water_mark >= 0.0);
 
     // Let stream be a new WritableStream.
     // Perform ! InitializeWritableStream(stream).
-    let stream = WritableStream::new_with_proto(global, None, CanGc::from_cx(cx));
+    let stream = WritableStream::new_with_proto(cx, global, None);
 
     // Let controller be a new WritableStreamDefaultController.
     let controller = WritableStreamDefaultController::new(
+        cx,
         global,
         underlying_sink_type,
         writable_high_water_mark,
         writable_size_algorithm,
-        CanGc::from_cx(cx),
     );
 
     // Perform ? SetUpWritableStreamDefaultController(stream, controller, startAlgorithm, writeAlgorithm,
@@ -1024,7 +1004,7 @@ impl WritableStreamMethods<crate::DomTypeHolder> for WritableStream {
         // converted to an IDL value of type UnderlyingSink.
         let underlying_sink_dict = if !underlying_sink_obj.is_null() {
             rooted!(&in(cx) let obj_val = ObjectValue(underlying_sink_obj.get()));
-            match UnderlyingSink::new(cx.into(), obj_val.handle(), CanGc::from_cx(cx)) {
+            match UnderlyingSink::new(cx, obj_val.handle()) {
                 Ok(ConversionResult::Success(val)) => val,
                 Ok(ConversionResult::Failure(error)) => {
                     return Err(Error::Type(error.into_owned()));
@@ -1037,16 +1017,16 @@ impl WritableStreamMethods<crate::DomTypeHolder> for WritableStream {
             UnderlyingSink::empty()
         };
 
-        if !underlying_sink_dict.type_.handle().is_undefined() {
+        if !underlying_sink_dict.type_.get().is_undefined() {
             // If underlyingSinkDict["type"] exists, throw a RangeError exception.
             return Err(Error::Range(c"type is set".to_owned()));
         }
 
         // Perform ! InitializeWritableStream(this).
-        let stream = WritableStream::new_with_proto(global, proto, CanGc::from_cx(cx));
+        let stream = WritableStream::new_with_proto(cx, global, proto);
 
         // Let sizeAlgorithm be ! ExtractSizeAlgorithm(strategy).
-        let size_algorithm = extract_size_algorithm(strategy, CanGc::from_cx(cx));
+        let size_algorithm = extract_size_algorithm(cx, strategy);
 
         // Let highWaterMark be ? ExtractHighWaterMark(strategy, 1).
         let high_water_mark = extract_high_water_mark(strategy, 1.0)?;
@@ -1073,17 +1053,14 @@ impl WritableStreamMethods<crate::DomTypeHolder> for WritableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#ws-abort>
-    fn Abort(&self, cx: &mut CurrentRealm, reason: SafeHandleValue) -> Rc<Promise> {
+    fn Abort(&self, cx: &mut CurrentRealm, reason: SafeHandleValue) -> RootedPromise {
         let global = GlobalScope::from_current_realm(cx);
 
         // If ! IsWritableStreamLocked(this) is true,
         if self.is_locked() {
             // return a promise rejected with a TypeError exception.
-            let promise = Promise::new2(cx, &global);
-            promise.reject_error(
-                Error::Type(c"Stream is locked.".to_owned()),
-                CanGc::from_cx(cx),
-            );
+            let promise = Promise::new(cx, &global);
+            promise.reject_error(cx, Error::Type(c"Stream is locked.".to_owned()));
             return promise;
         }
 
@@ -1092,27 +1069,24 @@ impl WritableStreamMethods<crate::DomTypeHolder> for WritableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#ws-close>
-    fn Close(&self, cx: &mut CurrentRealm) -> Rc<Promise> {
+    fn Close(&self, cx: &mut CurrentRealm) -> RootedPromise {
         let global = GlobalScope::from_current_realm(cx);
 
         // If ! IsWritableStreamLocked(this) is true,
         if self.is_locked() {
             // return a promise rejected with a TypeError exception.
-            let promise = Promise::new2(cx, &global);
-            promise.reject_error(
-                Error::Type(c"Stream is locked.".to_owned()),
-                CanGc::from_cx(cx),
-            );
+            let promise = Promise::new(cx, &global);
+            promise.reject_error(cx, Error::Type(c"Stream is locked.".to_owned()));
             return promise;
         }
 
         // If ! WritableStreamCloseQueuedOrInFlight(this) is true
         if self.close_queued_or_in_flight() {
             // return a promise rejected with a TypeError exception.
-            let promise = Promise::new2(cx, &global);
+            let promise = Promise::new(cx, &global);
             promise.reject_error(
+                cx,
                 Error::Type(c"Stream has closed queued or in-flight".to_owned()),
-                CanGc::from_cx(cx),
             );
             return promise;
         }
@@ -1124,14 +1098,12 @@ impl WritableStreamMethods<crate::DomTypeHolder> for WritableStream {
     /// <https://streams.spec.whatwg.org/#ws-get-writer>
     fn GetWriter(
         &self,
-        realm: InRealm,
-        can_gc: CanGc,
+        realm: &mut CurrentRealm,
     ) -> Result<DomRoot<WritableStreamDefaultWriter>, Error> {
-        let cx = GlobalScope::get_cx();
-        let global = GlobalScope::from_safe_context(cx, realm);
+        let global = GlobalScope::from_current_realm(realm);
 
         // Return ? AcquireWritableStreamDefaultWriter(this).
-        self.aquire_default_writer(cx, &global, can_gc)
+        self.aquire_default_writer(realm, &global)
     }
 }
 
@@ -1147,14 +1119,13 @@ pub(crate) struct CrossRealmTransformWritable {
     controller: Dom<WritableStreamDefaultController>,
 
     /// The `backpressurePromise` used in the algorithm.
-    #[ignore_malloc_size_of = "nested Rc"]
-    backpressure_promise: Rc<RefCell<Option<Rc<Promise>>>>,
+    #[conditional_malloc_size_of]
+    backpressure_promise: Rc<RefCell<Option<TracedPromise>>>,
 }
 
 impl CrossRealmTransformWritable {
     /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
     /// Add a handler for port’s message event with the following steps:
-    #[expect(unsafe_code)]
     pub(crate) fn handle_message(
         &self,
         cx: &mut CurrentRealm,
@@ -1162,14 +1133,7 @@ impl CrossRealmTransformWritable {
         message: SafeHandleValue,
     ) {
         rooted!(&in(cx) let mut value = UndefinedValue());
-        let type_string = unsafe {
-            get_type_and_value_from_message(
-                cx.into(),
-                message,
-                value.handle_mut(),
-                CanGc::from_cx(cx),
-            )
-        };
+        let type_string = get_type_and_value_from_message(cx, message, value.handle_mut());
 
         // If type is "pull",
         // Done below as the steps are the same for both types.
@@ -1180,13 +1144,13 @@ impl CrossRealmTransformWritable {
             self.controller.error_if_needed(cx, value.handle(), global);
         }
 
-        let backpressure_promise = self.backpressure_promise.borrow_mut().take();
+        rooted!(&in(cx) let backpressure_promise = self.backpressure_promise.borrow_mut().take());
 
         // Note: the below steps are for both "pull" and "error" types.
         // If backpressurePromise is not undefined,
-        if let Some(promise) = backpressure_promise {
+        if let Some(ref promise) = *backpressure_promise {
             // Resolve backpressurePromise with undefined.
-            promise.resolve_native(&(), CanGc::from_cx(cx));
+            promise.resolve_native(cx, &());
 
             // Set backpressurePromise to undefined.
             // Done above with `take`.
@@ -1202,12 +1166,12 @@ impl CrossRealmTransformWritable {
         port: &MessagePort,
     ) {
         // Let error be a new "DataCloneError" DOMException.
-        let error = DOMException::new(global, DOMErrorName::DataCloneError, CanGc::from_cx(cx));
+        let error = DOMException::new(cx, global, DOMErrorName::DataCloneError);
         rooted!(&in(cx) let mut rooted_error = UndefinedValue());
-        error.safe_to_jsval(cx.into(), rooted_error.handle_mut(), CanGc::from_cx(cx));
+        error.to_jsval(cx, rooted_error.handle_mut());
 
         // Perform ! CrossRealmTransformSendError(port, error).
-        port.cross_realm_transform_send_error(rooted_error.handle(), CanGc::from_cx(cx));
+        port.cross_realm_transform_send_error(cx, rooted_error.handle());
 
         // Perform ! WritableStreamDefaultControllerErrorIfNeeded(controller, error).
         self.controller
@@ -1237,18 +1201,18 @@ impl Transferable for WritableStream {
         let cx = &mut realm;
 
         // Step 2. Let port1 be a new MessagePort in the current Realm.
-        let port_1 = MessagePort::new(&global, CanGc::from_cx(cx));
+        let port_1 = MessagePort::new(cx, &global);
         global.track_message_port(&port_1, None);
 
         // Step 3. Let port2 be a new MessagePort in the current Realm.
-        let port_2 = MessagePort::new(&global, CanGc::from_cx(cx));
+        let port_2 = MessagePort::new(cx, &global);
         global.track_message_port(&port_2, None);
 
         // Step 4. Entangle port1 and port2.
         global.entangle_ports(*port_1.message_port_id(), *port_2.message_port_id());
 
         // Step 5. Let readable be a new ReadableStream in the current Realm.
-        let readable = ReadableStream::new_with_proto(&global, None, CanGc::from_cx(cx));
+        let readable = ReadableStream::new_with_proto(cx, &global, None);
 
         // Step 6. Perform ! SetUpCrossRealmTransformReadable(readable, port1).
         readable.setup_cross_realm_transform_readable(cx, &port_1);
@@ -1257,7 +1221,7 @@ impl Transferable for WritableStream {
         let promise = readable.pipe_to(cx, &global, self, false, false, false, None);
 
         // Step 8. Set promise.[[PromiseIsHandled]] to true.
-        promise.set_promise_is_handled();
+        promise.set_promise_is_handled(cx);
 
         // Step 9. Set dataHolder.[[port]] to ! StructuredSerializeWithTransfer(port2, « port2 »).
         port_2.transfer(cx)
@@ -1272,7 +1236,7 @@ impl Transferable for WritableStream {
     ) -> Result<DomRoot<Self>, ()> {
         // Their transfer-receiving steps, given dataHolder and value, are:
         // Note: dataHolder is used in `structuredclone.rs`, and value is created here.
-        let value = WritableStream::new_with_proto(owner, None, CanGc::from_cx(cx));
+        let value = WritableStream::new_with_proto(cx, owner, None);
 
         // Step 1. Let deserializedRecord be !
         // StructuredDeserializeWithTransfer(dataHolder.[[port]], the current
@@ -1297,3 +1261,8 @@ impl Transferable for WritableStream {
         }
     }
 }
+
+#[derive(JSTraceable)]
+struct RcHolder<T>(Rc<T>);
+
+impl<T: js::rust::Traceable> js::gc::Rootable for RcHolder<T> {}

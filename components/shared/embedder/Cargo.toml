@@ -26,8 +26,8 @@ euclid = { workspace = true }
 http = { workspace = true }
 hyper_serde = { workspace = true }
 image = { workspace = true }
-keyboard-types = { workspace = true }
 inventory = { workspace = true }
+keyboard-types = { workspace = true }
 log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
@@ -44,3 +44,6 @@ url = { workspace = true }
 uuid = { workspace = true }
 webdriver = { workspace = true }
 webrender_api = { workspace = true }
+
+[lints]
+workspace = true

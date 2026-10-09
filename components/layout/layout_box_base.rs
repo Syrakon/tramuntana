@@ -3,14 +3,15 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use app_units::Au;
-use atomic_refcell::AtomicRefCell;
+use atomic_refcell::{AtomicRef, AtomicRefCell};
 use euclid::Point2D;
 use layout_api::LayoutDamage;
 use malloc_size_of_derive::MallocSizeOf;
-use servo_arc::Arc;
+use servo_arc::Arc as ServoArc;
 use style::computed_values::position::T as Position;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
@@ -28,7 +29,8 @@ use crate::fragment_tree::{
 use crate::geom::LogicalSides1D;
 use crate::positioned::{PositioningContext, relative_adjustement};
 use crate::sizing::{ComputeInlineContentSizes, InlineContentSizesResult, SizeConstraint};
-use crate::{ArcRefCell, ConstraintSpace, ContainingBlock, ContainingBlockSize};
+use crate::traversal::ElementDamageSet;
+use crate::{ConstraintSpace, ContainingBlock, ContainingBlockSize};
 
 /// A box tree node that handles containing information about style and the original DOM
 /// node or pseudo-element that it is based on. This also handles caching of layout values
@@ -39,26 +41,55 @@ use crate::{ArcRefCell, ConstraintSpace, ContainingBlock, ContainingBlockSize};
 #[derive(MallocSizeOf)]
 pub(crate) struct LayoutBoxBase {
     pub base_fragment_info: BaseFragmentInfo,
-    pub style: Arc<ComputedValues>,
+    pub style: ServoArc<ComputedValues>,
     pub cached_inline_content_size:
         AtomicRefCell<Option<Box<(SizeConstraint, InlineContentSizesResult)>>>,
     pub outer_inline_content_sizes_depend_on_content: AtomicBool,
-    pub cached_layout_result: AtomicRefCell<Option<LayoutResultAndInputs>>,
+
+    /// The cached layout results for this [`LayoutBoxBase`]. These are either cached
+    /// independent formatting context results or a cached block layout for use within
+    /// a block flow.
+    cached_layout_result: AtomicRefCell<Option<LayoutResultAndInputs>>,
+
+    /// Whether or not the cached layout result for this [`LayoutBoxBase`] is dirty.
+    /// This flag is used to preserve the cache when it can be used to do a faster
+    /// layout, but cannot be reused directly.
+    cached_layout_result_dirty: AtomicBool,
+
+    /// A count of the number of boxes are in this box's subtree (including itself).
+    /// This is used as a heuristic to know when to perform parallel layout.
+    subtree_size: AtomicUsize,
+
     pub fragments: AtomicRefCell<Vec<Fragment>>,
     pub parent_box: Option<WeakLayoutBox>,
 }
 
 impl LayoutBoxBase {
-    pub(crate) fn new(base_fragment_info: BaseFragmentInfo, style: Arc<ComputedValues>) -> Self {
+    pub(crate) fn new(
+        base_fragment_info: BaseFragmentInfo,
+        style: ServoArc<ComputedValues>,
+    ) -> Self {
         Self {
             base_fragment_info,
             style,
             cached_inline_content_size: AtomicRefCell::default(),
             outer_inline_content_sizes_depend_on_content: AtomicBool::new(true),
             cached_layout_result: AtomicRefCell::default(),
+            cached_layout_result_dirty: AtomicBool::default(),
+            subtree_size: AtomicUsize::default(),
             fragments: AtomicRefCell::default(),
             parent_box: None,
         }
+    }
+
+    /// Set the subtree size on this [`LayoutBoxBase`]. This should be done once
+    /// box construction knows how many boxes are in this box's subtree.
+    pub(crate) fn set_subtree_size(&self, size: usize) {
+        self.subtree_size.store(size, Ordering::Relaxed);
+    }
+
+    pub(crate) fn subtree_size(&self) -> usize {
+        self.subtree_size.load(Ordering::Relaxed)
     }
 
     /// Get the inline content sizes of a box tree node that extends this [`LayoutBoxBase`], fetch
@@ -86,8 +117,8 @@ impl LayoutBoxBase {
         result
     }
 
-    pub(crate) fn fragments(&self) -> Vec<Fragment> {
-        self.fragments.borrow().clone()
+    pub(crate) fn fragments(&self) -> AtomicRef<'_, Vec<Fragment>> {
+        self.fragments.borrow()
     }
 
     pub(crate) fn add_fragment(&self, fragment: Fragment) {
@@ -102,17 +133,18 @@ impl LayoutBoxBase {
         self.fragments.borrow_mut().clear();
     }
 
-    pub(crate) fn clear_fragments_and_fragment_cache(&self) {
-        self.fragments.borrow_mut().clear();
-        *self.cached_layout_result.borrow_mut() = None;
+    /// Clear all resulting fragments and dirty and fragment caches. Resulting fragments are
+    /// used for layout queries and fragment caches are used for incremental layout.
+    pub(crate) fn clear_fragments_and_dirty_fragment_cache(&self) {
+        self.clear_fragments();
+        self.cached_layout_result_dirty
+            .store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn repair_style(&mut self, new_style: &Arc<ComputedValues>) {
+    pub(crate) fn repair_style(&mut self, new_style: &ServoArc<ComputedValues>) {
         self.style = new_style.clone();
-        for fragment in self.fragments.borrow_mut().iter_mut() {
-            if let Some(mut base) = fragment.base_mut() {
-                base.repair_style(new_style);
-            }
+        for fragment in self.fragments.borrow().iter() {
+            fragment.repair_style(new_style);
         }
     }
 
@@ -121,20 +153,22 @@ impl LayoutBoxBase {
         self.parent_box.as_ref().and_then(WeakLayoutBox::upgrade)
     }
 
-    pub(crate) fn add_damage(
-        &self,
-        element_damage: LayoutDamage,
-        damage_from_children: LayoutDamage,
-    ) -> LayoutDamage {
-        self.clear_fragments_and_fragment_cache();
-
-        if !element_damage.is_empty() ||
-            damage_from_children.contains(LayoutDamage::RECOMPUTE_INLINE_CONTENT_SIZES)
+    /// Clear fragment layout caches on this base, depending on upward flowing damage, but
+    /// *do not* clear its resulting fragment. The layout cache itself is always cleared,
+    /// but the inline content size cache is cleared conditionally.
+    ///
+    /// Returns true is this [`LayoutBoxBase`] propagates `RecomputeInlineContentSizes`
+    /// and false otherwise.
+    pub(crate) fn invalidate_caches(&self, damage_set: &ElementDamageSet) -> bool {
+        self.cached_layout_result_dirty
+            .store(true, Ordering::Relaxed);
+        if !damage_set.on_element.is_empty() ||
+            damage_set
+                .from_children
+                .contains(LayoutDamage::RecomputeInlineContentSizes)
         {
             *self.cached_inline_content_size.borrow_mut() = None;
         }
-
-        let mut damage_for_parent = element_damage | damage_from_children;
 
         // When a block container has a mix of inline-level and block-level contents, the
         // inline-level ones are wrapped inside an anonymous block associated with the
@@ -146,15 +180,72 @@ impl LayoutBoxBase {
         // clear the cached intrinsic sizes of the parent. But if the contributions are
         // purely extrinsic, then the intrinsic sizes of the ancestors won't be affected,
         // and we can keep the cache.
-        damage_for_parent.set(
-            LayoutDamage::RECOMPUTE_INLINE_CONTENT_SIZES,
-            !element_damage.is_empty() ||
-                (!self.base_fragment_info.is_anonymous() &&
-                    self.outer_inline_content_sizes_depend_on_content
-                        .load(Ordering::Relaxed)),
-        );
+        !self.base_fragment_info.is_anonymous() &&
+            self.outer_inline_content_sizes_depend_on_content
+                .load(Ordering::Relaxed)
+    }
 
-        damage_for_parent
+    /// Clear fragment layout caches on this base, depending on upward flowing damage, and
+    /// also clear its resulting fragment. The layout cache itself is always cleared, but
+    /// the inline content size cache is cleared conditionally.
+    ///
+    /// Returns true is this [`LayoutBoxBase`] propagates `RecomputeInlineContentSizes`
+    /// and false otherwise.
+    pub(crate) fn invalidate_caches_for_fragment_tree_layout(
+        &self,
+        damage_set: &ElementDamageSet,
+    ) -> bool {
+        self.clear_fragments();
+        self.invalidate_caches(damage_set)
+    }
+
+    pub(crate) fn cached_independent_formatting_context_layout_if_applicable(
+        &self,
+        positioning_context: &mut PositioningContext,
+        containing_block_for_children: &ContainingBlock<'_>,
+    ) -> Option<IndependentFormattingContextLayoutResult> {
+        if self.cached_layout_result_dirty.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let cache = self.cached_layout_result.borrow();
+        let Some(LayoutResultAndInputs::IndependentFormattingContext(cache)) = &*cache else {
+            return None;
+        };
+
+        let cache = &**cache;
+        if cache.containing_block_for_children_size.inline !=
+            containing_block_for_children.size.inline
+        {
+            return None;
+        }
+        if cache.containing_block_for_children_size.block !=
+            containing_block_for_children.size.block &&
+            cache.result.depends_on_block_constraints
+        {
+            return None;
+        }
+
+        positioning_context.append(cache.positioning_context.clone());
+        Some(cache.result.clone())
+    }
+
+    pub(crate) fn cache_independent_formatting_context_layout(
+        &self,
+        containing_block_for_children: &ContainingBlock<'_>,
+        child_positioning_context: &PositioningContext,
+        result: &IndependentFormattingContextLayoutResult,
+    ) {
+        self.cached_layout_result_dirty
+            .store(false, Ordering::Relaxed);
+        *self.cached_layout_result.borrow_mut() =
+            Some(LayoutResultAndInputs::IndependentFormattingContext(
+                Box::new(IndependentFormattingContextLayoutResultAndInputs {
+                    result: result.clone(),
+                    positioning_context: child_positioning_context.clone(),
+                    containing_block_for_children_size: containing_block_for_children.size.clone(),
+                }),
+            ));
     }
 
     pub(crate) fn cached_same_formatting_context_block_if_applicable(
@@ -163,7 +254,11 @@ impl LayoutBoxBase {
         collapsible_with_parent_start_margin: Option<CollapsibleWithParentStartMargin>,
         ignore_block_margins_for_stretch: LogicalSides1D<bool>,
         has_inline_parent: bool,
-    ) -> Option<ArcRefCell<BoxFragment>> {
+    ) -> Option<Arc<BoxFragment>> {
+        if self.cached_layout_result_dirty.load(Ordering::Relaxed) {
+            return None;
+        }
+
         let mut cached_layout_result = self.cached_layout_result.borrow_mut();
         let Some(LayoutResultAndInputs::SameFormattingContextBlock(result)) =
             &mut *cached_layout_result
@@ -174,7 +269,7 @@ impl LayoutBoxBase {
         if result.containing_block_size != containing_block.size ||
             result.containing_block_writing_mode != containing_block.style.writing_mode ||
             result.containing_block_justify_items !=
-                containing_block.style.clone_justify_items().computed.0.0 ||
+                containing_block.style.get_justify_items().computed.0.0 ||
             result.collapsible_with_parent_start_margin != collapsible_with_parent_start_margin ||
             result.ignore_block_margins_for_stretch != ignore_block_margins_for_stretch ||
             result.has_inline_parent != has_inline_parent
@@ -184,20 +279,12 @@ impl LayoutBoxBase {
 
         let fragment = result.result.fragment.clone();
         {
-            let mut borrowed_fragment = fragment.borrow_mut();
-
-            // Ideally when the final position doesn't change, this wouldn't be set, but we have
-            // no way currently to track whether the final position wil differ from the one set in
-            // the cached fragment. Final positioning is done in the containing block and depends
-            // on things like margins and the size of siblings.
-            borrowed_fragment.base.status = FragmentStatus::PositionMaybeChanged;
-
-            borrowed_fragment.base.rect.origin = result.result.original_offset;
-            if self.style.clone_position() == Position::Relative {
-                borrowed_fragment.base.rect.origin +=
-                    relative_adjustement(&self.style, containing_block)
-                        .to_physical_vector(containing_block.style.writing_mode)
+            let mut origin = result.result.original_offset;
+            if self.style.get_box().position == Position::Relative {
+                origin += relative_adjustement(&self.style, containing_block)
+                    .to_physical_vector(containing_block.style.writing_mode)
             }
+            fragment.base.set_rect_origin(origin);
         }
 
         Some(fragment)
@@ -209,18 +296,19 @@ impl LayoutBoxBase {
         collapsible_with_parent_start_margin: Option<CollapsibleWithParentStartMargin>,
         ignore_block_margins_for_stretch: LogicalSides1D<bool>,
         has_inline_parent: bool,
-        fragment: ArcRefCell<BoxFragment>,
+        fragment: Arc<BoxFragment>,
     ) {
         let mut original_offset;
         {
-            let borrowed_fragment = fragment.borrow();
-            original_offset = borrowed_fragment.content_rect().origin;
-            if self.style.clone_position() == Position::Relative {
+            original_offset = fragment.content_rect().origin;
+            if self.style.get_box().position == Position::Relative {
                 original_offset -= relative_adjustement(&self.style, containing_block)
                     .to_physical_vector(containing_block.style.writing_mode)
             }
         }
 
+        self.cached_layout_result_dirty
+            .store(false, Ordering::Relaxed);
         *self.cached_layout_result.borrow_mut() =
             Some(LayoutResultAndInputs::SameFormattingContextBlock(Box::new(
                 SameFormattingContextBlockLayoutResultAndInputs {
@@ -232,7 +320,7 @@ impl LayoutBoxBase {
                     containing_block_writing_mode: containing_block.style.writing_mode,
                     containing_block_justify_items: containing_block
                         .style
-                        .clone_justify_items()
+                        .get_justify_items()
                         .computed
                         .0
                         .0,
@@ -241,6 +329,20 @@ impl LayoutBoxBase {
                     has_inline_parent,
                 },
             )));
+    }
+
+    pub(crate) fn clear_scrollable_overflow_all_on_fragments(&self) {
+        for fragment in self.fragments.borrow().iter() {
+            fragment.clear_scrollable_overflow();
+        }
+    }
+
+    pub(crate) fn mark_fragments_as_descendants_changed(&self) {
+        for fragment in self.fragments.borrow().iter() {
+            if let Some(base) = fragment.base() {
+                base.set_status(FragmentStatus::OnlyDescendantsChanged);
+            }
+        }
     }
 }
 
@@ -302,7 +404,8 @@ pub(crate) struct IndependentFormattingContextLayoutResultAndInputs {
 
 #[derive(Clone, MallocSizeOf)]
 pub(crate) struct SameFormattingContextBlockLayoutResult {
-    pub fragment: ArcRefCell<BoxFragment>,
+    #[conditional_malloc_size_of]
+    pub fragment: Arc<BoxFragment>,
     original_offset: Point2D<Au, CSSPixel>,
 }
 

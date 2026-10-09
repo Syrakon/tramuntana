@@ -4,6 +4,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use crossbeam_channel::Sender;
 use devtools_traits::{
     ChromeToDevtoolsControlMsg, DevtoolsControlMsg, HttpRequest as DevtoolsHttpRequest,
@@ -12,16 +13,16 @@ use devtools_traits::{
 use http::{HeaderMap, Method};
 use hyper_serde::Serde;
 use log::error;
+use net_traits::Metadata;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{Destination, Request};
 use net_traits::response::{CacheState, Response};
-use net_traits::{DebugVec, FetchMetadata};
 use servo_base::id::{BrowsingContextId, PipelineId};
 use servo_url::ServoUrl;
 
 use crate::fetch::methods::FetchContext;
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn prepare_devtools_request(
     request_id: String,
     url: ServoUrl,
@@ -40,7 +41,7 @@ pub(crate) fn prepare_devtools_request(
         url,
         method,
         headers,
-        body: body.map(DebugVec::from),
+        body: body.map(Bytes::from),
         pipeline_id,
         started_date_time,
         time_stamp: started_date_time
@@ -77,17 +78,13 @@ pub(crate) fn send_response_to_devtools(
     response: &Response,
     body_data: Option<Vec<u8>>,
 ) {
-    let meta = match response.metadata() {
-        Ok(FetchMetadata::Unfiltered(m)) => m,
-        Ok(FetchMetadata::Filtered { unsafe_, .. }) => unsafe_,
-        Err(_) => {
-            log::warn!("No metadata available, skipping devtools response.");
-            return;
-        },
+    let Ok(metadata): Result<Metadata, _> = response.metadata().map(Into::into) else {
+        log::warn!("No metadata available, skipping devtools response.");
+        return;
     };
     send_response_values_to_devtools(
-        meta.headers.map(Serde::into_inner),
-        meta.status,
+        metadata.headers.map(Serde::into_inner),
+        metadata.status,
         body_data,
         response.cache_state,
         request,
@@ -95,7 +92,6 @@ pub(crate) fn send_response_to_devtools(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_response_values_to_devtools(
     headers: Option<HeaderMap>,
     status: HttpStatus,
@@ -115,7 +111,7 @@ pub(crate) fn send_response_values_to_devtools(
         let devtoolsresponse = DevtoolsHttpResponse {
             headers,
             status,
-            body: body.map(DebugVec::from),
+            body: body.map(Bytes::from),
             from_cache,
             pipeline_id,
             browsing_context_id,
@@ -134,18 +130,14 @@ pub(crate) fn send_security_info_to_devtools(
     context: &FetchContext,
     response: &Response,
 ) {
-    let meta = match response.metadata() {
-        Ok(FetchMetadata::Unfiltered(m)) => m,
-        Ok(FetchMetadata::Filtered { unsafe_, .. }) => unsafe_,
-        Err(_) => {
-            log::warn!("No metadata available, skipping devtools security info.");
-            return;
-        },
+    let Ok(metadata): Result<Metadata, _> = response.metadata().map(Into::into) else {
+        log::warn!("No metadata available, skipping devtools security info.");
+        return;
     };
 
     if let (Some(devtools_chan), Some(security_info), Some(webview_id)) = (
         context.devtools_chan.clone(),
-        meta.tls_security_info,
+        metadata.tls_security_info,
         request.target_webview_id,
     ) {
         let update = NetworkEvent::SecurityInfo(SecurityInfoUpdate {

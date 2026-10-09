@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
@@ -10,19 +11,18 @@ use script_bindings::reflector::reflect_dom_object_with_proto;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
-use crate::dom::bindings::codegen::Bindings::PopStateEventBinding;
-use crate::dom::bindings::codegen::Bindings::PopStateEventBinding::PopStateEventMethods;
+use crate::dom::bindings::codegen::Bindings::PopStateEventBinding::{
+    PopStateEventInit, PopStateEventMethods,
+};
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{AsHandleValue, DomRoot};
 use crate::dom::bindings::str::DOMString;
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::window::Window;
-use crate::script_runtime::{CanGc, JSContext};
 
-// https://html.spec.whatwg.org/multipage/#the-popstateevent-interface
+/// <https://html.spec.whatwg.org/multipage/#the-popstateevent-interface>
 #[dom_struct]
 pub(crate) struct PopStateEvent {
     event: Event,
@@ -39,28 +39,23 @@ impl PopStateEvent {
     }
 
     fn new_uninitialized(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<PopStateEvent> {
-        reflect_dom_object_with_proto(
-            Box::new(PopStateEvent::new_inherited()),
-            window,
-            proto,
-            can_gc,
-        )
+        reflect_dom_object_with_proto(cx, Box::new(PopStateEvent::new_inherited()), window, proto)
     }
 
     fn new(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
         type_: Atom,
         bubbles: bool,
         cancelable: bool,
         state: HandleValue,
-        can_gc: CanGc,
     ) -> DomRoot<PopStateEvent> {
-        let ev = PopStateEvent::new_uninitialized(window, proto, can_gc);
+        let ev = PopStateEvent::new_uninitialized(cx, window, proto);
         ev.state.set(state.get());
         {
             let event = ev.upcast::<Event>();
@@ -70,39 +65,38 @@ impl PopStateEvent {
     }
 
     pub(crate) fn dispatch_jsval(
+        cx: &mut js::context::JSContext,
         target: &EventTarget,
         window: &Window,
         state: HandleValue,
-        can_gc: CanGc,
     ) {
-        let event =
-            PopStateEvent::new(window, None, atom!("popstate"), false, false, state, can_gc);
-        event.upcast::<Event>().fire(target, can_gc);
+        let event = PopStateEvent::new(cx, window, None, atom!("popstate"), false, false, state);
+        event.upcast::<Event>().fire(cx, target);
     }
 }
 
 impl PopStateEventMethods<crate::DomTypeHolder> for PopStateEvent {
     /// <https://html.spec.whatwg.org/multipage/#popstateevent>
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
         type_: DOMString,
-        init: RootedTraceableBox<PopStateEventBinding::PopStateEventInit>,
+        init: &PopStateEventInit,
     ) -> Fallible<DomRoot<PopStateEvent>> {
         Ok(PopStateEvent::new(
+            cx,
             window,
             proto,
             Atom::from(type_),
             init.parent.bubbles,
             init.parent.cancelable,
-            init.state.handle(),
-            can_gc,
+            init.state.as_handle_value(),
         ))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-popstateevent-state>
-    fn State(&self, _cx: JSContext, mut retval: MutableHandleValue) {
+    fn State(&self, mut retval: MutableHandleValue) {
         retval.set(self.state.get())
     }
 

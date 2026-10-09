@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use html5ever::{LocalName, local_name};
+use html5ever::{LocalName, local_name, ns};
 use js::context::JSContext;
 use script_bindings::inheritance::Castable;
 use style::attr::AttrValue;
@@ -45,8 +45,8 @@ impl Element {
                 if let Some(anchor) = self.downcast::<HTMLAnchorElement>() {
                     return anchor
                         .upcast::<Element>()
-                        .get_attribute(&local_name!("href"))
-                        .map(|attr| DOMString::from(&**attr.value()));
+                        .get_attribute_string_value(&local_name!("href"))
+                        .map(|value| value.into());
                 }
 
                 // Step 2.2. Return null.
@@ -56,11 +56,11 @@ impl Element {
             CommandName::Subscript | CommandName::Superscript => {
                 // Step 3.1. If element is a sup, return "superscript".
                 if matches!(*self.local_name(), local_name!("sup")) {
-                    return Some("superscript".into());
+                    return Some(DOMString::from_static("superscript"));
                 }
                 // Step 3.2. If element is a sub, return "subscript".
                 if matches!(*self.local_name(), local_name!("sub")) {
-                    return Some("subscript".into());
+                    return Some(DOMString::from_static("subscript"));
                 }
                 // Step 3.3. Return null.
                 return None;
@@ -70,11 +70,13 @@ impl Element {
                 if let Some(value) = CssPropertyName::TextDecorationLine.value_set_for_style(self) {
                     // Step 4.1. If element's style attribute sets "text-decoration" to a value containing "line-through", return "line-through".
                     // Step 4.2. Return null.
-                    return Some("line-through".into()).filter(|_| value.contains("line-through"));
+                    return value
+                        .contains("line-through")
+                        .then_some(DOMString::from_static("line-through"));
                 }
                 // Step 5. If command is "strikethrough" and element is an s or strike element, return "line-through".
                 if matches!(*self.local_name(), local_name!("s") | local_name!("strike")) {
-                    return Some("line-through".into());
+                    return Some(DOMString::from_static("line-through"));
                 }
             },
             CommandName::Underline => {
@@ -82,11 +84,13 @@ impl Element {
                 if let Some(value) = CssPropertyName::TextDecorationLine.value_set_for_style(self) {
                     // Step 6.1. If element's style attribute sets "text-decoration" to a value containing "underline", return "underline".
                     // Step 6.2. Return null.
-                    return Some("underline".into()).filter(|_| value.contains("underline"));
+                    return value
+                        .contains("underline")
+                        .then_some(DOMString::from_static("underline"));
                 }
                 // Step 7. If command is "underline" and element is a u element, return "underline".
                 if *self.local_name() == local_name!("u") {
-                    return Some("underline".into());
+                    return Some(DOMString::from_static("underline"));
                 }
             },
             _ => {},
@@ -102,10 +106,17 @@ impl Element {
         // Step 11. If element is a font element that has an attribute whose effect is to create a presentational hint for property,
         // return the value that the hint sets property to. (For a size of 7, this will be the non-CSS value "xxx-large".)
         if self.is::<HTMLFontElement>() &&
-            let Some(font_size) = self.get_attribute(&local_name!("size")) &&
-            let AttrValue::UInt(_, value) = *font_size.value()
+            let Some(font_size) = self
+                .with_attribute(&ns!(), &local_name!("size"), |attribute| {
+                    if let AttrValue::UInt(_, value) = *attribute.value() {
+                        Some(value)
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
         {
-            return Some(font_size_to_css_font(&value).into());
+            return Some(font_size_to_css_font(&font_size).into());
         }
 
         // Step 12. If element is in the following list, and property is equal to the CSS property name listed for it,
@@ -115,12 +126,12 @@ impl Element {
             CssPropertyName::FontWeight
                 if element_name == &local_name!("b") || element_name == &local_name!("strong") =>
             {
-                Some("bold".into())
+                Some(DOMString::from_static("bold"))
             },
             CssPropertyName::FontStyle
                 if element_name == &local_name!("i") || element_name == &local_name!("em") =>
             {
-                Some("italic".into())
+                Some(DOMString::from_static("italic"))
             },
             // Step 13. Return null.
             _ => None,
@@ -191,16 +202,62 @@ impl Element {
         false
     }
 
+    // <https://w3c.github.io/editing/docs/execCommand/#indentation-element>
+    pub(crate) fn is_indentation_element(&self) -> bool {
+        // > An indentation element is either a blockquote, or a div
+        if !matches!(
+            *self.local_name(),
+            local_name!("blockquote") | local_name!("div")
+        ) {
+            return false;
+        }
+
+        // > that has a style attribute that sets "margin" or some subproperty of it.
+        let style_attribute = self.style_attribute().borrow();
+        let Some(declarations) = style_attribute.as_ref() else {
+            return false;
+        };
+        let document = self.owner_document();
+        let shared_lock = document.style_shared_author_lock();
+        let read_lock = shared_lock.read();
+        let style = declarations.read_with(&read_lock);
+
+        ShorthandId::Margin
+            .longhands()
+            .any(|longhand| style.contains(PropertyDeclarationId::Longhand(longhand)))
+    }
+
     pub(crate) fn has_empty_style_attribute(&self) -> bool {
         let style_attribute = self.style_attribute().borrow();
         style_attribute.as_ref().is_some_and(|declarations| {
             let document = self.owner_document();
-            let shared_lock = document.style_shared_lock();
+            let shared_lock = document.style_shared_author_lock();
             let read_lock = shared_lock.read();
             let style = declarations.read_with(&read_lock);
 
             style.is_empty()
         })
+    }
+
+    /// <https://w3c.github.io/editing/docs/execCommand/#non-list-single-line-container>
+    pub(crate) fn is_non_list_single_line_container(&self) -> bool {
+        // > A non-list single-line container is an HTML element with local name
+        // > "address", "div", "h1", "h2", "h3", "h4", "h5", "h6", "listing", "p", "pre", or "xmp".
+        matches!(
+            *self.local_name(),
+            local_name!("address") |
+                local_name!("div") |
+                local_name!("h1") |
+                local_name!("h2") |
+                local_name!("h3") |
+                local_name!("h4") |
+                local_name!("h5") |
+                local_name!("h6") |
+                local_name!("listing") |
+                local_name!("p") |
+                local_name!("pre") |
+                local_name!("xmp")
+        )
     }
 
     /// <https://w3c.github.io/editing/docs/execCommand/#simple-modifiable-element>
@@ -283,7 +340,7 @@ impl Element {
             return false;
         };
         let document = self.owner_document();
-        let shared_lock = document.style_shared_lock();
+        let shared_lock = document.style_shared_author_lock();
         let read_lock = shared_lock.read();
         let style = declarations.read_with(&read_lock);
 
@@ -318,9 +375,9 @@ impl Element {
             local_name!("s") | local_name!("strike") | local_name!("u")
         );
         if a_font_or_span || s_strike_or_u {
-            // Note that the shorthand "text-decoration" expands to 3 longhands. Hence we check if the length
-            // is 3 here, instead of 1.
-            if style.len() == 3 &&
+            // Note that the shorthand "text-decoration" expands to N longhands (4 at time of writing).
+            // Hence we check if the length is equal to N here, instead of 1.
+            if style.len() == ShorthandId::TextDecoration.longhands().count() &&
                 style
                     .shorthand_to_css(ShorthandId::TextDecoration, &mut String::new())
                     .is_ok()
@@ -353,16 +410,59 @@ impl Element {
         false
     }
 
+    pub(crate) fn is_simple_indentation_element(&self) -> bool {
+        // > A simple indentation element is an indentation element
+        if !self.is_indentation_element() {
+            return false;
+        }
+
+        // > that has no attributes except possibly
+        let attrs = self.attrs().borrow();
+        let mut attrs = attrs.iter();
+        attrs.all(|attr| {
+            // - a style attribute that sets no properties other than "margin", "border", "padding", or subproperties of those; and/or
+            if matches!(*attr.local_name(), local_name!("style")) {
+                let style_attribute = self.style_attribute().borrow();
+                let Some(declarations) = style_attribute.as_ref() else {
+                    return false;
+                };
+                let document = self.owner_document();
+                let shared_lock = document.style_shared_author_lock();
+                let read_lock = shared_lock.read();
+                let style = declarations.read_with(&read_lock);
+
+                let properties: Vec<_> = ShorthandId::Margin
+                    .longhands()
+                    .chain(ShorthandId::Border.longhands())
+                    .chain(ShorthandId::Padding.longhands())
+                    .collect();
+                return style.declarations().iter().all(|declaration| {
+                    declaration
+                        .id()
+                        .as_longhand()
+                        .is_some_and(|longhand| properties.contains(&longhand))
+                });
+            }
+
+            // - a dir attribute
+            if matches!(*attr.local_name(), local_name!("dir")) {
+                return true;
+            }
+
+            false
+        })
+    }
+
     /// <https://w3c.github.io/editing/docs/execCommand/#set-the-tag-name>
-    pub(crate) fn set_the_tag_name(&self, cx: &mut JSContext, new_name: &str) -> DomRoot<Element> {
+    pub(crate) fn set_the_tag_name(&self, cx: &mut JSContext, new_name: &str) -> DomRoot<Node> {
         // Step 1. If element is an HTML element with local name equal to new name, return element.
         if self.local_name() == &LocalName::from(new_name) {
-            return DomRoot::from_ref(self);
+            return DomRoot::upcast(DomRoot::from_ref(self));
         }
         // Step 2. If element's parent is null, return element.
         let node = self.upcast::<Node>();
         let Some(parent) = node.GetParentNode() else {
-            return DomRoot::from_ref(self);
+            return DomRoot::upcast(DomRoot::from_ref(self));
         };
         // Step 3. Let replacement element be the result of calling createElement(new name) on the ownerDocument of element.
         let document = node.owner_document();
@@ -384,6 +484,6 @@ impl Element {
         // Step 7. Remove element from its parent.
         node.remove_self(cx);
         // Step 8. Return replacement element.
-        replacement
+        DomRoot::upcast(replacement)
     }
 }

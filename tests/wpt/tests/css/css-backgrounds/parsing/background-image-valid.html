@@ -20,6 +20,7 @@ test_valid_value("background-image", 'none, url("http://www.example.com/")', ['n
 
 test_valid_value("background-image", 'light-dark(url("a.png"), url("b.png"))');
 test_valid_value("background-image", 'light-dark(linear-gradient(red), url("b.png"))');
+test_valid_value("background-image", 'light-dark(image(blue), url("b.png"))');
 
 test_valid_value(
     "background-image",

@@ -23,9 +23,10 @@ byteorder = { workspace = true }
 crossbeam-channel = { workspace = true }
 euclid = { workspace = true }
 glow = { workspace = true }
-half = "2"
+half = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
+num-traits = { workspace = true }
 paint_api = { workspace = true }
 parking_lot = { workspace = true }
 pixels = { workspace = true }
@@ -36,3 +37,6 @@ surfman = { workspace = true }
 webrender_api = { workspace = true }
 webxr = { workspace = true, optional = true }
 webxr-api = { workspace = true, optional = true }
+
+[lints]
+workspace = true

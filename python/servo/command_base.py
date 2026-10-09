@@ -422,6 +422,18 @@ class CommandBase(object):
                 print("Hint: Ninja-build is available on github at: https://github.com/ninja-build/ninja/releases")
                 exit(1)
 
+        # jemalloc requires to be compiled with a page size that is at least equal to the one
+        # used by the kernel of machine on which it will run.
+        # Some linux distros for arm64 configure the page size to 16KB (e.g. Raspberry Pi OS 13)
+        # and few others use a 64KB page size. The upstream 'jemalloc` has switched to 64KB pages
+        # as the default, but this is not available in `tikv-jemalloc` yet, so we configure it here.
+        # FIXME: Remove after `tikv-jemalloc` ships the change to default to 64KB page size.
+        # See https://github.com/servo/servo/issues/47114
+        if "aarch64-unknown-linux-gnu" == self.target.triple():
+            # The value of the environment variable represents the number of bits in the address
+            # space, so 2^16 means we use 64KB as the page size.
+            env["AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE"] = "16"
+
         # Increase stylo thread stack size to 8 MiB for all builds
         # to match the recursion depth of Chromium.
         # This only reserves virtual memory space and has almost no overhead.
@@ -602,10 +614,19 @@ class CommandBase(object):
 
                 if binary_selection:
                     if "servo_binary" not in kwargs:
-                        kwargs["servo_binary"] = kwargs.get("bin") or self.get_binary_path(
-                            cast(BuildType, kwargs.get("build_type")),
-                            sanitizer=cast(SanitizerKind, kwargs.get("sanitizer")),
-                        )
+                        # For packaged targets (Android, OpenHarmony) the binary is not important,
+                        # since we can't run it directly. We could return the shared library object,
+                        # but that doesn't seem very useful.
+                        if self.target.needs_packaging():
+                            if kwargs.get("bin") is not None:
+                                print(f"`--bin` cannot be used with the '{self.target.triple()}' target.")
+                                sys.exit(1)
+                            kwargs["servo_binary"] = None
+                        else:
+                            kwargs["servo_binary"] = kwargs.get("bin") or self.get_binary_path(
+                                cast(BuildType, kwargs.get("build_type")),
+                                sanitizer=cast(SanitizerKind, kwargs.get("sanitizer")),
+                            )
                     kwargs.pop("bin")
                     kwargs.pop("nightly")
                     if not build_type:
@@ -624,6 +645,7 @@ class CommandBase(object):
 
     @staticmethod
     def allow_target_configuration(original_function: Callable) -> Callable:
+        @functools.wraps(original_function)
         def target_configuration_decorator(self: CommandBase, *args: Any, **kwargs: Any) -> Callable:
             self.configure_build_target(kwargs, suppress_log=True)
             kwargs.pop("target", False)
@@ -741,6 +763,7 @@ class CommandBase(object):
         use_crown: bool = False,
         capture_output: bool = False,
         target_override: Optional[str] = None,
+        subcommand: str | None = None,
         **_kwargs: Any,
     ) -> CompletedProcess[bytes] | int:
         env = cast(dict[str, str], env or self.build_env())
@@ -812,10 +835,14 @@ class CommandBase(object):
         # but uv venv on Windows only provides a `python`, not `python3`.
         env["PYTHON3"] = "python"
 
-        if capture_output:
-            return subprocess.run(["cargo", command] + args + cargo_args, env=env, capture_output=capture_output)
+        command_args = [command]
+        if subcommand:
+            command_args.append(subcommand)
 
-        return call(["cargo", command] + args + cargo_args, env=env, verbose=verbose)
+        if capture_output:
+            return subprocess.run(["cargo"] + command_args + args + cargo_args, env=env, capture_output=capture_output)
+
+        return call(["cargo"] + command_args + args + cargo_args, env=env, verbose=verbose)
 
     def android_adb_path(self, env: dict[str, Any]) -> str:
         if "ANDROID_SDK_ROOT" in env:

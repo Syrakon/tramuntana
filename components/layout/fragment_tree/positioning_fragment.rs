@@ -2,6 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use app_units::Au;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc as ServoArc;
@@ -9,8 +12,9 @@ use servo_base::print_tree::PrintTree;
 use style::properties::ComputedValues;
 
 use super::{BaseFragment, BaseFragmentInfo, Fragment};
-use crate::cell::ArcRefCell;
-use crate::geom::PhysicalRect;
+use crate::SharedStyle;
+use crate::fragment_tree::ContainingBlockCalculation;
+use crate::geom::{PhysicalRect, SyncPhysicalRectAu};
 
 /// Can contain child fragments with relative coordinates, but does not contribute to painting
 /// itself. [`PositioningFragment`]s may be completely anonymous, or just non-painting Fragments
@@ -18,14 +22,22 @@ use crate::geom::PhysicalRect;
 #[derive(MallocSizeOf)]
 pub(crate) struct PositioningFragment {
     pub base: BaseFragment,
+
+    /// The style for this [`PositioningFragment`].
+    pub style: SharedStyle,
+
     pub children: Vec<Fragment>,
 
     /// The scrollable overflow of this anonymous fragment's children.
-    scrollable_overflow: Option<PhysicalRect<Au>>,
+    scrollable_overflow: SyncPhysicalRectAu,
+    scrollable_overflow_is_up_to_date: AtomicBool,
 
     /// This [`PositioningFragment`]'s containing block rectangle in coordinates relative to
     /// the initial containing block, but not taking into account any transforms.
-    pub cumulative_containing_block_rect: PhysicalRect<Au>,
+    pub cumulative_containing_block_rect: SyncPhysicalRectAu,
+
+    /// Whether or not this [`PositioningFragment`] is a line box.
+    is_line_box: bool,
 }
 
 impl PositioningFragment {
@@ -33,16 +45,23 @@ impl PositioningFragment {
         style: ServoArc<ComputedValues>,
         rect: PhysicalRect<Au>,
         children: Vec<Fragment>,
-    ) -> ArcRefCell<Self> {
-        Self::new_with_base_fragment_info(BaseFragmentInfo::anonymous(), style, rect, children)
+        is_line_box: bool,
+    ) -> Arc<Self> {
+        Self::new_with_base_fragment_info(
+            BaseFragmentInfo::anonymous(),
+            style,
+            rect,
+            children,
+            is_line_box,
+        )
     }
 
     pub fn new_empty(
         base_fragment_info: BaseFragmentInfo,
         rect: PhysicalRect<Au>,
         style: ServoArc<ComputedValues>,
-    ) -> ArcRefCell<Self> {
-        Self::new_with_base_fragment_info(base_fragment_info, style, rect, Vec::new())
+    ) -> Arc<Self> {
+        Self::new_with_base_fragment_info(base_fragment_info, style, rect, Vec::new(), false)
     }
 
     fn new_with_base_fragment_info(
@@ -50,40 +69,73 @@ impl PositioningFragment {
         style: ServoArc<ComputedValues>,
         rect: PhysicalRect<Au>,
         children: Vec<Fragment>,
-    ) -> ArcRefCell<Self> {
-        ArcRefCell::new(PositioningFragment {
-            base: BaseFragment::new(base_fragment_info, style.into(), rect),
+        is_line_box: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            base: BaseFragment::new(base_fragment_info, rect),
+            style: style.into(),
             children,
-            scrollable_overflow: None,
-            cumulative_containing_block_rect: PhysicalRect::zero(),
+            scrollable_overflow: Default::default(),
+            scrollable_overflow_is_up_to_date: AtomicBool::new(false),
+            cumulative_containing_block_rect: Default::default(),
+            is_line_box,
         })
     }
 
-    pub(crate) fn set_containing_block(&mut self, containing_block: &PhysicalRect<Au>) {
-        self.cumulative_containing_block_rect = *containing_block;
+    #[inline]
+    pub(crate) fn set_containing_block(&self, containing_block: &PhysicalRect<Au>) {
+        self.cumulative_containing_block_rect.set(*containing_block);
     }
 
-    pub fn offset_by_containing_block(&self, rect: &PhysicalRect<Au>) -> PhysicalRect<Au> {
-        rect.translate(self.cumulative_containing_block_rect.origin.to_vector())
+    pub fn offset_by_containing_block(
+        &self,
+        rect: &PhysicalRect<Au>,
+        containing_block_computation: ContainingBlockCalculation<'_>,
+    ) -> PhysicalRect<Au> {
+        containing_block_computation.ensure();
+        rect.translate(self.cumulative_containing_block_rect.origin().to_vector())
     }
 
-    pub(crate) fn calculate_scrollable_overflow(&mut self) {
-        self.scrollable_overflow = Some(self.children.iter().fold(
-            PhysicalRect::zero(),
-            |acc, child| {
+    /// Get the scrollable overflow for this [`PositioningFragment`] relative to its
+    /// containing block, recalculating scrollable overflow when necessary, for instance
+    /// after a style change.
+    pub(crate) fn scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
+        if self
+            .scrollable_overflow_is_up_to_date
+            .load(Ordering::Acquire)
+        {
+            self.scrollable_overflow.get()
+        } else {
+            let rect = self.calculate_scrollable_overflow();
+            self.scrollable_overflow.set(rect);
+            self.scrollable_overflow_is_up_to_date
+                .store(true, Ordering::Release);
+            rect
+        }
+    }
+
+    /// Clear the scrollable overflow on this [`PositioningFragment`]. This is called
+    /// during damage propagation when a fragment is preserved, itself or one of its
+    /// descendants has scrollable overflow damage.
+    pub(crate) fn clear_scrollable_overflow(&self) {
+        self.scrollable_overflow_is_up_to_date
+            .store(false, Ordering::Release);
+    }
+
+    fn calculate_scrollable_overflow(&self) -> PhysicalRect<Au> {
+        self.children
+            .iter()
+            .fold(PhysicalRect::zero(), |acc, child| {
                 acc.union(
                     &child
-                        .calculate_scrollable_overflow_for_parent()
-                        .translate(self.base.rect.origin.to_vector()),
+                        .scrollable_overflow_for_parent()
+                        .translate(self.base.rect().origin.to_vector()),
                 )
-            },
-        ));
+            })
     }
 
-    pub(crate) fn scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
-        self.scrollable_overflow.expect(
-            "Should only call `scrollable_overflow_for_parent()` after calculating overflow",
-        )
+    pub(crate) fn is_line_box(&self) -> bool {
+        self.is_line_box
     }
 
     pub fn print(&self, tree: &mut PrintTree) {
@@ -92,7 +144,9 @@ impl PositioningFragment {
                 \nbase={:?}\
                 \nrect={:?}\
                 \nscrollable_overflow={:?}",
-            self.base, self.base.rect, self.scrollable_overflow
+            self.base,
+            self.base.rect(),
+            self.scrollable_overflow
         ));
 
         for child in &self.children {

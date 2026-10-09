@@ -16,17 +16,20 @@ extern crate log;
 extern crate malloc_size_of_derive;
 
 pub mod assert;
+pub mod buffer_source;
 pub mod callback;
 pub mod cell;
 mod constant;
 mod constructor;
 pub mod conversions;
+pub mod dom;
 pub mod domstring;
 pub mod error;
 mod finalize;
 mod guard;
 mod import;
 pub mod inheritance;
+mod init;
 pub mod interface;
 pub mod interfaces;
 pub mod iterable;
@@ -35,19 +38,26 @@ mod lock;
 mod mem;
 mod namespace;
 pub mod num;
+pub mod permanent_root;
 pub mod principals;
 pub mod proxyhandler;
 pub mod realms;
 pub mod record;
+pub mod refcounted;
 pub mod reflector;
 pub mod root;
+pub mod routed_promise;
 pub mod script_runtime;
+pub mod serializable;
 pub mod settings_stack;
 pub mod str;
 pub mod structuredclone;
+pub mod tasks;
 pub mod trace;
+pub mod traits;
 pub mod utils;
 pub mod weakref;
+pub mod wrap;
 
 #[allow(non_snake_case, unsafe_op_in_unsafe_fn)]
 pub mod codegen {

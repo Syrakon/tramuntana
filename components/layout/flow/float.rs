@@ -760,10 +760,7 @@ impl FloatBandNode {
 impl FloatBandLink {
     /// Returns the first band whose top is less than or equal to the given `block_position`.
     fn find(&self, block_position: Au) -> Option<FloatBand> {
-        let this = match self.0 {
-            None => return None,
-            Some(ref node) => node,
-        };
+        let this = self.0.as_ref()?;
 
         if block_position < this.band.top {
             return this.left.find(block_position);
@@ -780,10 +777,7 @@ impl FloatBandLink {
 
     /// Returns the first band whose top is strictly greater than the given `block_position`.
     fn find_next(&self, block_position: Au) -> Option<FloatBand> {
-        let this = match self.0 {
-            None => return None,
-            Some(ref node) => node,
-        };
+        let this = self.0.as_ref()?;
 
         if block_position >= this.band.top {
             return this.right.find_next(block_position);
@@ -1080,7 +1074,7 @@ impl SequentialLayoutState {
     /// This function places a Fragment that has been created for a FloatBox.
     pub(crate) fn place_float_fragment(
         &mut self,
-        box_fragment: &mut BoxFragment,
+        box_fragment: &BoxFragment,
         containing_block: &ContainingBlock,
         margins_collapsing_with_parent_containing_block: CollapsedMargin,
         block_offset_from_containing_block_top: Au,
@@ -1114,7 +1108,7 @@ impl SequentialLayoutState {
 
         // Re-calculate relative adjustment so that it is not lost when the BoxFragment's
         // `content_rect` is overwritten below.
-        let relative_offset = match style.clone_position() {
+        let relative_offset = match style.get_box().position {
             Position::Relative => relative_adjustement(&style, containing_block),
             _ => LogicalVec2::zero(),
         };
@@ -1130,13 +1124,15 @@ impl SequentialLayoutState {
             block: new_position_in_bfc.block - block_start_of_containing_block_in_bfc,
         };
 
-        box_fragment.base.rect = LogicalRect {
-            start_corner: new_position_in_containing_block,
-            size: box_fragment
-                .content_rect()
-                .size
-                .to_logical(container_writing_mode),
-        }
-        .as_physical(Some(containing_block));
+        box_fragment.base.set_rect(
+            LogicalRect {
+                start_corner: new_position_in_containing_block,
+                size: box_fragment
+                    .content_rect()
+                    .size
+                    .to_logical(container_writing_mode),
+            }
+            .as_physical(Some(containing_block)),
+        );
     }
 }

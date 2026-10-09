@@ -16,7 +16,7 @@ use gstreamer;
 use gstreamer_app;
 use gstreamer_play;
 use gstreamer_play::prelude::*;
-use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
+use servo_base::generic_channel::{self, GenericCallback, GenericReceiver};
 use servo_media::MediaInstanceError;
 use servo_media_player::audio::AudioRenderer;
 use servo_media_player::context::PlayerGLContext;
@@ -128,10 +128,11 @@ enum PlayerSource {
 
 struct PlayerInner {
     player: gstreamer_play::Play,
-    _signal_adapter: gstreamer_play::PlaySignalAdapter,
+    signal_adapter: gstreamer_play::PlaySignalAdapter,
     source: Option<PlayerSource>,
     video_sink: gstreamer_app::AppSink,
     input_size: u64,
+    seekable: bool,
     play_state: gstreamer_play::PlayState,
     paused: Cell<bool>,
     can_resume: Cell<bool>,
@@ -160,6 +161,14 @@ impl PlayerInner {
             } else {
                 -1 // live source
             });
+        }
+        Ok(())
+    }
+
+    pub fn set_seekable(&mut self, seekable: bool) -> Result<(), PlayerError> {
+        self.seekable = seekable;
+        if let Some(PlayerSource::Seekable(ref mut source)) = self.source {
+            source.set_seekable(seekable);
         }
         Ok(())
     }
@@ -529,12 +538,13 @@ macro_rules! notify(
 
 struct SeekChannel {
     sender: SeekLock,
-    recv: IpcReceiver<SeekLockMsg>,
+    recv: GenericReceiver<SeekLockMsg>,
 }
 
 impl SeekChannel {
     fn new() -> Self {
-        let (sender, recv) = channel::<SeekLockMsg>().expect("Couldn't create IPC channel");
+        let (sender, recv) =
+            generic_channel::channel::<SeekLockMsg>().expect("Couldn't create IPC channel");
         Self {
             sender: SeekLock {
                 lock_channel: sender,
@@ -560,7 +570,7 @@ pub struct GStreamerPlayer {
     /// Channel to communicate with the owner GStreamerBackend instance.
     backend_chan: Arc<Mutex<Sender<BackendMsg>>>,
     inner: RefCell<Option<Arc<Mutex<PlayerInner>>>>,
-    observer: Arc<Mutex<IpcSender<PlayerEvent>>>,
+    observer: Arc<Mutex<GenericCallback<PlayerEvent>>>,
     audio_renderer: Option<Arc<Mutex<dyn AudioRenderer>>>,
     video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
     /// Indicates whether the setup was succesfully performed and
@@ -570,6 +580,9 @@ pub struct GStreamerPlayer {
     stream_type: StreamType,
     /// Decorator used to setup the video sink and process the produced frames.
     render: Arc<Mutex<GStreamerRender>>,
+    /// Whether to enable download buffering. This is only enabled heuristically for some media,
+    /// because it causes issues in certain situations. See <https://github.com/servo/servo/issues/23241>.
+    download_buffering_enabled: AtomicBool,
 }
 
 impl GStreamerPlayer {
@@ -579,7 +592,7 @@ impl GStreamerPlayer {
         context_id: &ClientContextId,
         backend_chan: Arc<Mutex<Sender<BackendMsg>>>,
         stream_type: StreamType,
-        observer: IpcSender<PlayerEvent>,
+        observer: GenericCallback<PlayerEvent>,
         video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
         audio_renderer: Option<Arc<Mutex<dyn AudioRenderer>>>,
         gl_context: Box<dyn PlayerGLContext>,
@@ -601,6 +614,7 @@ impl GStreamerPlayer {
             is_ready: Arc::new(Once::new()),
             stream_type,
             render: Arc::new(Mutex::new(GStreamerRender::new(gl_context))),
+            download_buffering_enabled: AtomicBool::new(false),
         }
     }
 
@@ -624,10 +638,37 @@ impl GStreamerPlayer {
         let signal_adapter = gstreamer_play::PlaySignalAdapter::new_sync_emit(&player);
         let pipeline = player.pipeline();
 
-        // The progressive downloading of playbin is not used: its download buffer cannot give
-        // the end of the media resource, which is looked at to find its type, before it has
-        // all of it, so nothing could be played or even known about the media before the
-        // download was over. The data is fetched again if it is ever needed again.
+        // FIXME(#282): The progressive downloading breaks playback on Windows and Android.
+        if !cfg!(any(target_os = "windows", target_os = "android")) &&
+            self.download_buffering_enabled.load(Ordering::Relaxed)
+        {
+            // Set player to perform progressive downloading. This will make the
+            // player store the downloaded media in a local temporary file for
+            // faster playback of already-downloaded chunks.
+            let flags = pipeline.property_value("flags");
+            let flags_class = match glib::FlagsClass::with_type(flags.type_()) {
+                Some(flags) => flags,
+                None => {
+                    return Err(PlayerError::Backend(
+                        "FlagsClass creation failed".to_owned(),
+                    ));
+                },
+            };
+            let flags_class = match flags_class.builder_with_value(flags) {
+                Some(class) => class,
+                None => {
+                    return Err(PlayerError::Backend(
+                        "FlagsClass creation failed".to_owned(),
+                    ));
+                },
+            };
+            let Some(flags) = flags_class.set_by_nick("download").build() else {
+                return Err(PlayerError::Backend(
+                    "FlagsClass creation failed".to_owned(),
+                ));
+            };
+            pipeline.set_property_from_value("flags", &flags);
+        }
 
         // Set max size for the player buffer.
         pipeline.set_property("buffer-size", MAX_BUFFER_SIZE);
@@ -738,10 +779,11 @@ impl GStreamerPlayer {
 
         *self.inner.borrow_mut() = Some(Arc::new(Mutex::new(PlayerInner {
             player,
-            _signal_adapter: signal_adapter.clone(),
+            signal_adapter: signal_adapter.clone(),
             source: None,
             video_sink,
             input_size: 0,
+            seekable: true,
             play_state: gstreamer_play::PlayState::Stopped,
             paused: Cell::new(DEFAULT_PAUSED),
             can_resume: Cell::new(DEFAULT_CAN_RESUME),
@@ -824,13 +866,14 @@ impl GStreamerPlayer {
             // <https://github.com/servo/servo/issues/40740>
             let mut send_pause_event = false;
 
-            if inner.last_metadata.is_none() && metadata.is_seekable {
-                if inner.playback_rate.get() != DEFAULT_PLAYBACK_RATE {
+            if inner.last_metadata.is_none() {
+                if metadata.is_seekable && inner.playback_rate.get() != DEFAULT_PLAYBACK_RATE {
                     // The `paused` state change event will be fired after the
                     // seek initiated by the playback rate change has
                     // completed.
                     inner.player.set_rate(inner.playback_rate.get());
                 } else if inner.play_state == gstreamer_play::PlayState::Paused {
+                    // We need to send the paused event for non seekable push streams.
                     send_pause_event = true;
                 }
             }
@@ -950,6 +993,7 @@ impl GStreamerPlayer {
                         if inner.input_size > 0 {
                             servosrc.set_size(inner.input_size as i64);
                         }
+                        servosrc.set_seekable(inner.seekable);
 
                         let sender_clone = sender.clone();
                         let is_ready = is_ready_clone.clone();
@@ -1068,8 +1112,10 @@ impl GStreamerPlayer {
         };
 
         let result = receiver.recv().unwrap();
-        // The handler was connected on the signal adapter, not on the player.
-        signal_adapter.disconnect(error_handler_id);
+        glib::signal::signal_handler_disconnect(
+            &inner.lock().unwrap().signal_adapter,
+            error_handler_id,
+        );
         result
     }
 }
@@ -1143,6 +1189,7 @@ impl Player for GStreamerPlayer {
     inner_player_proxy!(stop, ());
     inner_player_proxy!(end_of_stream, ());
     inner_player_proxy!(set_input_size, size, u64);
+    inner_player_proxy!(set_seekable, seekable, bool);
     inner_player_proxy!(set_mute, muted, bool);
     inner_player_proxy_getter!(muted, bool, DEFAULT_MUTED);
     inner_player_proxy!(set_playback_rate, playback_rate, f64);
@@ -1202,6 +1249,17 @@ impl Player for GStreamerPlayer {
         range: Range<f64>,
     ) -> Result<SourceBufferState, PlayerError> {
         self.with_inner(|inner| inner.remove_source_buffer_range(id, range))
+    }
+
+    fn set_download_buffering_enabled(&self, enable: bool) -> Result<(), PlayerError> {
+        // We can't use the default implementation because we need to set the
+        // download_buffering_enabled flag before calling setup, which is where
+        // the "download" flag is set on the pipeline. That has to happen before
+        // the URI is set.
+        self.download_buffering_enabled
+            .store(enable, Ordering::Relaxed);
+        self.setup()?;
+        Ok(())
     }
 
     fn render_use_gl(&self) -> bool {

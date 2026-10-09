@@ -3,7 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use js::context::JSContext;
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::BluetoothCharacteristicPropertiesBinding::BluetoothCharacteristicPropertiesMethods;
 use crate::dom::bindings::root::DomRoot;
@@ -54,7 +55,7 @@ impl BluetoothCharacteristicProperties {
 
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
-        cx: &mut js::context::JSContext,
+        cx: &mut JSContext,
         global: &GlobalScope,
         broadcast: bool,
         read: bool,
@@ -66,7 +67,8 @@ impl BluetoothCharacteristicProperties {
         reliableWrite: bool,
         writableAuxiliaries: bool,
     ) -> DomRoot<BluetoothCharacteristicProperties> {
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(BluetoothCharacteristicProperties::new_inherited(
                 broadcast,
                 read,
@@ -79,7 +81,6 @@ impl BluetoothCharacteristicProperties {
                 writableAuxiliaries,
             )),
             global,
-            cx,
         )
     }
 }

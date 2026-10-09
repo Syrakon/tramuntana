@@ -87,14 +87,6 @@ impl<'dom> DangerousStyleElement<'dom> for ServoDangerousStyleElement<'dom> {
     }
 }
 
-impl<'dom> style::dom::AttributeProvider for ServoDangerousStyleElement<'dom> {
-    fn get_attr(&self, attr: &style::LocalName, namespace: &style::Namespace) -> Option<String> {
-        self.element
-            .get_attr_val_for_layout(namespace, attr)
-            .map(Into::into)
-    }
-}
-
 impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
     type ConcreteNode = ServoDangerousStyleNode<'dom>;
     type TraversalChildrenIterator = DOMDescendantIterator<'dom>;
@@ -184,7 +176,7 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
         context.animations.get_animation_declarations(
             &AnimationSetKey::new_for_non_pseudo(node.opaque()),
             context.current_time_for_animations,
-            document.style_shared_lock(),
+            &document.shared_style_locks().author,
         )
     }
 
@@ -197,7 +189,7 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
         context.animations.get_transition_declarations(
             &AnimationSetKey::new_for_non_pseudo(node.opaque()),
             context.current_time_for_animations,
-            document.style_shared_lock(),
+            &document.shared_style_locks().author,
         )
     }
 
@@ -418,7 +410,7 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
         let element_lang = match override_lang {
             Some(Some(lang)) => lang,
             Some(None) => AtomString::default(),
-            None => AtomString::from(&*self.element.get_lang_for_layout()),
+            None => self.element.get_lang_for_layout(),
         };
         extended_filtering(&element_lang, value)
     }
@@ -488,7 +480,7 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
         // As long as this "unopaqued" element does not escape this function, we're not leaking
         // potentially-mutable elements from opaque elements.
         let host = unsafe {
-            let ptr = opaque_host.as_const_ptr::<JSObject>();
+            let ptr = opaque_host.to_ptr().as_ptr() as *const JSObject;
             let untrusted_address = UntrustedNodeAddress::from_id(ptr as usize);
             let node = Node::from_untrusted_node_address(untrusted_address);
             let trusted_address = node.to_trusted_node_address();
@@ -619,9 +611,7 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
         };
 
         let text_shaping_needs_recollect = || {
-            if old.clone_direction() != new.clone_direction() ||
-                old.clone_unicode_bidi() != new.clone_unicode_bidi()
-            {
+            if !old.direction_equals(new) || !old.unicode_bidi_equals(new) {
                 return true;
             }
 
@@ -642,15 +632,27 @@ impl<'dom> style::dom::TElement for ServoDangerousStyleElement<'dom> {
         };
 
         if box_tree_needs_rebuild() {
-            RestyleDamage::from_bits_retain(LayoutDamage::BOX_DAMAGE.bits())
+            RestyleDamage::from_bits_retain(LayoutDamage::BoxDamage.bits())
         } else if text_shaping_needs_recollect() {
-            RestyleDamage::from_bits_retain(LayoutDamage::DESCENDANT_HAS_BOX_DAMAGE.bits())
+            RestyleDamage::from_bits_retain(LayoutDamage::DescendantHasBoxDamage.bits())
         } else {
             // This element needs to be laid out again, but does not have any damage to
             // its box. In the future, we will distinguish between types of damage to the
             // fragment as well.
             RestyleDamage::RELAYOUT
         }
+    }
+
+    fn get_attr(&self, attr: &style::LocalName, namespace: &style::Namespace) -> Option<String> {
+        // All attribute names on HTML elements in HTML docs match ASCII-case-insensitively.
+        // See note in https://html.spec.whatwg.org/multipage/#custom-data-attribute
+        if self.is_html_element_in_html_document() {
+            let attr = &style::LocalName::new(attr.to_ascii_lowercase());
+            self.element.get_attr_val_for_layout(namespace, attr)
+        } else {
+            self.element.get_attr_val_for_layout(namespace, attr)
+        }
+        .map(Into::into)
     }
 }
 

@@ -46,7 +46,9 @@ pub enum TerminationReason {
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum ResponseBody {
     Empty, // XXXManishearth is this necessary, or is Done(vec![]) enough?
+    #[serde(with = "serde_bytes")]
     Receiving(Vec<u8>),
+    #[serde(with = "serde_bytes")]
     Done(Vec<u8>),
 }
 
@@ -75,14 +77,6 @@ pub enum CacheState {
     Local,
     Validated,
     Partial,
-}
-
-/// [Https state](https://fetch.spec.whatwg.org/#concept-response-https-state)
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
-pub enum HttpsState {
-    None,
-    Deprecated,
-    Modern,
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -114,7 +108,6 @@ pub struct Response {
     #[conditional_malloc_size_of]
     pub body: Arc<Mutex<ResponseBody>>,
     pub cache_state: CacheState,
-    pub https_state: HttpsState,
     pub tls_security_info: Option<TlsSecurityInfo>,
     pub referrer: Option<ServoUrl>,
     /// <https://fetch.spec.whatwg.org/#response-redirect-taint>
@@ -154,7 +147,6 @@ impl Response {
             headers: HeaderMap::new(),
             body: Arc::new(Mutex::new(ResponseBody::Empty)),
             cache_state: CacheState::None,
-            https_state: HttpsState::None,
             tls_security_info: None,
             referrer: None,
             referrer_policy: ReferrerPolicy::EmptyString,
@@ -189,7 +181,6 @@ impl Response {
             headers: HeaderMap::new(),
             body: Arc::new(Mutex::new(ResponseBody::Empty)),
             cache_state: CacheState::None,
-            https_state: HttpsState::None,
             tls_security_info: None,
             referrer: None,
             referrer_policy: ReferrerPolicy::EmptyString,
@@ -256,13 +247,11 @@ impl Response {
 
     /// Convert to a filtered response, of type `filter_type`.
     /// Do not use with type Error or Default
-    #[rustfmt::skip]
     pub fn to_filtered(self, filter_type: ResponseType) -> Response {
-        match filter_type {
-            ResponseType::Default |
-            ResponseType::Error(..) => panic!(),
-            _ => (),
-        }
+        assert!(!matches!(
+            filter_type,
+            ResponseType::Default | ResponseType::Error(..)
+        ));
 
         let old_response = self.to_actual();
 
@@ -277,27 +266,47 @@ impl Response {
         response.response_type = filter_type;
 
         match response.response_type {
-            ResponseType::Default |
-            ResponseType::Error(..) => unreachable!(),
+            ResponseType::Default | ResponseType::Error(..) => unreachable!(),
 
             ResponseType::Basic => {
-                let headers = old_headers.iter().filter(|(name, _)| {
-                    !matches!(&*name.as_str().to_ascii_lowercase(), "set-cookie" | "set-cookie2")
-                }).map(|(n, v)| (n.clone(), v.clone())).collect();
+                let headers = old_headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        let name = name.as_str();
+                        !name.eq_ignore_ascii_case("set-cookie") &&
+                            !name.eq_ignore_ascii_case("set-cookie2")
+                    })
+                    .map(|(n, v)| (n.clone(), v.clone()))
+                    .collect();
                 response.headers = headers;
             },
 
             ResponseType::Cors => {
-                let headers = old_headers.iter().filter(|(name, _)| {
-                    match &*name.as_str().to_ascii_lowercase() {
-                        "cache-control" | "content-language" | "content-length" | "content-type" |
-                        "expires" | "last-modified" | "pragma" => true,
-                        "set-cookie" | "set-cookie2" => false,
-                        header => {
-                            exposed_headers.iter().any(|h| *header == h.as_str().to_ascii_lowercase())
+                let headers = old_headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        let name = name.as_str();
+                        if name.eq_ignore_ascii_case("cache-control") ||
+                            name.eq_ignore_ascii_case("content-language") ||
+                            name.eq_ignore_ascii_case("content-length") ||
+                            name.eq_ignore_ascii_case("content-type") ||
+                            name.eq_ignore_ascii_case("expires") ||
+                            name.eq_ignore_ascii_case("last-modified") ||
+                            name.eq_ignore_ascii_case("pragma")
+                        {
+                            true
+                        } else if name.eq_ignore_ascii_case("set-cookie") ||
+                            name.eq_ignore_ascii_case("set-cookie2")
+                        {
+                            false
+                        } else {
+                            exposed_headers
+                                .iter()
+                                .any(|h| h.as_str().eq_ignore_ascii_case(name))
                         }
-                    }
-                }).map(|(n, v)| (n.clone(), v.clone())).collect();
+                    })
+                    .map(|(n, v)| (n.clone(), v.clone()))
+                    .collect();
                 response.headers = headers;
             },
 
@@ -328,7 +337,6 @@ impl Response {
             metadata.location_url.clone_from(&response.location_url);
             metadata.headers = Some(Serde(response.headers.clone()));
             metadata.status.clone_from(&response.status);
-            metadata.https_state = response.https_state;
             metadata.referrer.clone_from(&response.referrer);
             metadata.referrer_policy = response.referrer_policy;
             metadata.redirected = response.actual_response().url_list.len() > 1;

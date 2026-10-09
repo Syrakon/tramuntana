@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![cfg_attr(crown, expect(crown::unrooted_must_root))]
+#![cfg_attr(crown, allow(crown::jscontext_first_arg))]
 
 use std::borrow::Cow;
 use std::cell::{Cell, Ref, RefCell, RefMut};
@@ -38,12 +39,11 @@ use crate::dom::html::htmlformelement::{FormControlElementHelpers, HTMLFormEleme
 use crate::dom::html::htmlscriptelement::HTMLScriptElement;
 use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::node::Node;
+use crate::dom::node::virtualmethods::vtable_for;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::servoparser::{
     ElementAttribute, ParsingAlgorithm, attach_declarative_shadow_inner, create_element_for_token,
 };
-use crate::dom::virtualmethods::vtable_for;
-use crate::script_runtime::CanGc;
 
 type ParseNodeId = usize;
 
@@ -491,6 +491,7 @@ impl Tokenizer {
                     .map(|attr| ElementAttribute::new(attr.name, DOMString::from(attr.value)))
                     .collect();
                 let element = create_element_for_token(
+                    cx,
                     name,
                     attrs,
                     &self.document,
@@ -498,7 +499,6 @@ impl Tokenizer {
                     ParsingAlgorithm::Normal,
                     &self.custom_element_reaction_stack,
                     had_duplicate_attributes,
-                    cx,
                 );
                 self.insert_node(node, Dom::from_ref(element.upcast()));
             },
@@ -547,12 +547,7 @@ impl Tokenizer {
                     .downcast::<Element>()
                     .expect("tried to set attrs on non-Element in HTML parsing");
                 for attr in attrs {
-                    elem.set_attribute_from_parser(
-                        cx,
-                        attr.name,
-                        DOMString::from(attr.value),
-                        None,
-                    );
+                    elem.set_attribute_from_parser(cx, attr.name, DOMString::from(attr.value));
                 }
             },
             ParseOperation::RemoveFromParent { target } => {
@@ -600,7 +595,7 @@ impl Tokenizer {
                 let control = elem.and_then(|e| e.as_maybe_form_control());
 
                 if let Some(control) = control {
-                    control.set_form_owner_from_parser(&form, CanGc::from_cx(cx));
+                    control.set_form_owner_from_parser(cx, &form);
                 }
             },
             ParseOperation::Pop { node } => {

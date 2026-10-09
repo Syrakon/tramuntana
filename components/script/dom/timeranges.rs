@@ -5,6 +5,7 @@
 use std::fmt;
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::TimeRangesBinding::TimeRangesMethods;
@@ -12,7 +13,6 @@ use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 struct TimeRange {
@@ -141,11 +141,11 @@ impl TimeRanges {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         ranges: TimeRangesContainer,
-        can_gc: CanGc,
     ) -> DomRoot<TimeRanges> {
-        reflect_dom_object(Box::new(TimeRanges::new_inherited(ranges)), window, can_gc)
+        reflect_dom_object(cx, Box::new(TimeRanges::new_inherited(ranges)), window)
     }
 }
 

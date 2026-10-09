@@ -5,13 +5,10 @@
 use aws_lc_rs::digest;
 
 use crate::dom::bindings::error::Error;
-use crate::dom::subtlecrypto::{CryptoAlgorithm, SubtleAlgorithm};
+use crate::dom::subtlecrypto::{Algorithm, CryptoAlgorithm};
 
 /// <https://w3c.github.io/webcrypto/#sha-operations-digest>
-pub(crate) fn digest(
-    nomrmalized_algorithm: &SubtleAlgorithm,
-    message: &[u8],
-) -> Result<Vec<u8>, Error> {
+pub(crate) fn digest(nomrmalized_algorithm: &Algorithm, message: &[u8]) -> Result<Vec<u8>, Error> {
     // Step 1.
     // If the name member of normalizedAlgorithm is a cases-sensitive string match for "SHA-1":
     //     Let result be the result of performing the SHA-1 hash function defined in Section 6.1 of
@@ -34,7 +31,7 @@ pub(crate) fn digest(
         CryptoAlgorithm::Sha384 => digest::digest(&digest::SHA384, message).as_ref().to_vec(),
         CryptoAlgorithm::Sha512 => digest::digest(&digest::SHA512, message).as_ref().to_vec(),
         _ => {
-            return Err(Error::NotSupported(None));
+            return Err(Error::NotSupported(Some("Algorithm not supported".into())));
         },
     };
 

@@ -4,6 +4,7 @@
 
 use html5ever::local_name;
 use js::context::JSContext;
+use script_bindings::codegen::GenericBindings::RangeBinding::RangeMethods;
 use script_bindings::inheritance::Castable;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::properties::{LonghandId, PropertyDeclarationId, ShorthandId};
@@ -20,9 +21,9 @@ use crate::dom::execcommand::contenteditable::node::move_preserving_ranges;
 use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlfontelement::HTMLFontElement;
-use crate::dom::node::node::{Node, NodeTraits, ShadowIncluding};
+use crate::dom::iterators::ShadowIncluding;
+use crate::dom::node::node::{Node, NodeTraits};
 use crate::dom::text::Text;
-use crate::script_runtime::CanGc;
 
 impl HTMLElement {
     pub(crate) fn local_name(&self) -> &str {
@@ -41,7 +42,7 @@ impl HTMLElement {
                 return;
             };
             let document = element.owner_document();
-            let shared_lock = document.style_shared_lock();
+            let shared_lock = document.style_shared_author_lock();
             let read_lock = shared_lock.read();
             let style = declarations.read_with(&read_lock);
 
@@ -183,14 +184,14 @@ impl HTMLElement {
         };
         let range = self
             .upcast::<Element>()
-            .ensure_contenteditable_selection_range(&document, CanGc::from_cx(cx));
+            .ensure_contenteditable_selection_range(cx, &document);
         // If the current range is already associated with this contenteditable
         // element, then we shouldn't do anything. This is important when focus
         // is lost and regained, but selection was changed beforehand. In that
         // case, we should maintain the selection as it were, by not creating
         // a new range.
         if selection
-            .active_range()
+            .active_range(cx)
             .is_some_and(|active| active == range)
         {
             return;
@@ -261,8 +262,8 @@ impl HTMLElement {
             }
             previous_node = child;
         }
-        range.set_start(&selected_node, selected_offset);
-        range.set_end(&selected_node, selected_offset);
-        selection.AddRange(&range);
+        let _ = range.SetStart(cx.no_gc(), &selected_node, selected_offset);
+        let _ = range.SetEnd(cx.no_gc(), &selected_node, selected_offset);
+        selection.AddRange(cx.no_gc(), &range);
     }
 }

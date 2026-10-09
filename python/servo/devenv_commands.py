@@ -134,10 +134,26 @@ class MachCommands(CommandBase):
         env = self.build_env()
         env["RUSTC"] = "rustc"
 
-        # arguments to be passed through to clippy (as opposed to the cargo clippy wrapper)
-        # These should mainly be `--allow`, `--warn`, `--deny`, `--forbid`
-        # Note that some lints can additionally be configured by `.clippy.toml` at the repository root.
+        # Arguments to be passed through to clippy (as opposed to the cargo clippy wrapper)
+        # Prefer to specify these in the `lints.clippy` section in `/Cargo.toml`. Note that
+        # to enable linter warnings in a specific package, the `[lints]` section must inherit
+        # from the workspace. Example `components/X/Cargo.toml`:
+        #
+        # ```
+        # [lints]
+        # workspace = true
+        # ```
+        #
+        # TODO(47512): Move these to `workspace.lints.clippy` once all `Cargo.toml` specify lints
         clippy_args = ["--deny=clippy::disallowed_types", "--warn=clippy::redundant-clone"]
+
+        if self.target.is_cross_build():
+            if "--target" not in params:
+                params.append("--target")
+                params.append(self.target.triple())
+                # Suppress false positives for thread_local_statics when cross-compiling.
+                # Upstream issue: https://github.com/rust-lang/rust-clippy/issues/13422#issuecomment-3282764205
+            clippy_args.append("--allow=clippy::missing_const_for_thread_local")
 
         if "--" not in params:
             params.append("--")

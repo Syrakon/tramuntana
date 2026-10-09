@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use embedder_traits::{
-    AnimationState, InputEvent, InputEventAndId, InputEventId, InputEventResult, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PaintHitTestResult, Scroll, TouchEvent,
-    TouchEventType, ViewportDetails, WebViewPoint, WheelEvent,
+    AnimationState, InputEvent, InputEventAndId, InputEventId, InputEventResult,
+    PaintHitTestResult, Scroll, TouchEvent, TouchEventType, ViewportDetails, WebViewPoint,
+    WheelEvent,
 };
-use euclid::{Scale, Vector2D};
+use euclid::{Scale, Size2D, Vector2D};
 use log::{debug, warn};
 use malloc_size_of::MallocSizeOf;
 use paint_api::display_list::{ScrollType, SpatialTreeNodeInfo};
@@ -39,7 +39,8 @@ use crate::pinch_zoom::PinchZoom;
 use crate::pipeline_details::PipelineDetails;
 use crate::refresh_driver::{BaseRefreshDriver, RefreshDriverObserver};
 use crate::touch::{
-    PendingTouchInputEvent, TouchHandler, TouchIdMoveTracking, TouchMoveAllowed, TouchSequenceState,
+    PanPolicyInput, PendingTouchInputEvent, TouchHandler, TouchIdMoveTracking, TouchMoveAllowed,
+    TouchSequenceState,
 };
 
 #[derive(Clone, Copy)]
@@ -48,6 +49,9 @@ pub(crate) struct ScrollEvent {
     pub scroll: Scroll,
     /// Scroll the scroll node that is found at this point.
     pub point: DevicePoint,
+    /// The kind of input that originated this scroll. `Touch` respects `touch-action`
+    /// restrictions; `InputEvents` (mouse wheel, keyboard) does not.
+    pub scroll_type: ScrollType,
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +129,9 @@ pub(crate) struct WebViewRenderer {
     /// and initial values for zoom derived from the `viewport` meta tag in web content.
     viewport_description: ViewportDescription,
 
+    /// The dimensions of the screen on which this WebView is rendering.
+    screen_size: Size2D<f32, DevicePixel>,
+
     //
     // Data that is shared with the parent renderer.
     //
@@ -166,6 +173,7 @@ impl WebViewRenderer {
             hidden: false,
             animating: false,
             viewport_description: Default::default(),
+            screen_size: viewport_details.device_size,
             embedder_to_constellation_sender,
             refresh_driver,
             webrender_document,
@@ -186,8 +194,10 @@ impl WebViewRenderer {
             .any(PipelineDetails::animation_callbacks_running)
     }
 
+    /// Whether this [`WebViewRenderer`] is animating. Note that hidden `WebView`s
+    /// are never considered to be animating.
     pub(crate) fn animating(&self) -> bool {
-        self.animating
+        self.animating && !self.hidden()
     }
 
     pub(crate) fn hidden(&self) -> bool {
@@ -198,7 +208,15 @@ impl WebViewRenderer {
     /// value changed or `false` otherwise.
     pub(crate) fn set_hidden(&mut self, new_value: bool) -> bool {
         let old_value = std::mem::replace(&mut self.hidden, new_value);
-        new_value != old_value
+        if new_value == old_value {
+            return false;
+        }
+
+        let _ = self.embedder_to_constellation_sender.send(
+            EmbedderToConstellationMessage::SetWebViewHidden(self.id, new_value),
+        );
+        self.update_animation_state();
+        true
     }
 
     /// Returns the [`PipelineDetails`] for the given [`PipelineId`], creating it if needed.
@@ -211,10 +229,17 @@ impl WebViewRenderer {
             .or_insert_with(PipelineDetails::new)
     }
 
-    pub(crate) fn pipeline_exited(&mut self, pipeline_id: PipelineId, source: PipelineExitSource) {
+    /// Record that `source` has reported `pipeline_id` as exited. Returns `true`
+    /// once every source has done so and the pipeline details have been discarded,
+    /// so that the caller can also drop the pipeline's scene state in WebRender.
+    pub(crate) fn pipeline_exited(
+        &mut self,
+        pipeline_id: PipelineId,
+        source: PipelineExitSource,
+    ) -> bool {
         let pipeline = self.pipelines.entry(pipeline_id);
         let Entry::Occupied(mut pipeline) = pipeline else {
-            return;
+            return false;
         };
 
         pipeline.get_mut().exited.insert(source);
@@ -223,10 +248,14 @@ impl WebViewRenderer {
         // finished processing the pipeline shutdown. This prevents any followup messges
         // from re-adding the pipeline details and creating a zombie.
         if !pipeline.get().exited.is_all() {
-            return;
+            return false;
         }
 
+        // Flush the LCP candidates when exiting pipeline.
+        pipeline.get_mut().lcp_candidates.clear();
+
         pipeline.remove_entry();
+        true
     }
 
     pub(crate) fn set_frame_tree(&mut self, frame_tree: &SendableFrameTree) {
@@ -312,7 +341,7 @@ impl WebViewRenderer {
             AnimationState::NoAnimationsPresent => {
                 pipeline_details.animations_running = false;
             },
-            AnimationState::NoAnimationCallbacksPresent => {
+            AnimationState::AnimationCallbacksAbsent => {
                 pipeline_details.animation_callbacks_running = false;
             },
         }
@@ -381,6 +410,9 @@ impl WebViewRenderer {
         self.on_scroll_window_event(
             Scroll::Delta((-fling_action.delta).into()),
             fling_action.cursor,
+            // Fling is a continuation of a touch pan, so it must respect
+            // `touch-action` like the originating touch gesture.
+            ScrollType::Touch,
         );
         true
     }
@@ -466,6 +498,13 @@ impl WebViewRenderer {
             .event
             .point()
             .map(|point| point.as_device_point(self.device_pixels_per_page_pixel()));
+        let is_touch_down = matches!(
+            &event.event,
+            InputEvent::Touch(TouchEvent {
+                event_type: TouchEventType::Down,
+                ..
+            })
+        );
         let hit_test_result = match event_point {
             Some(point) => {
                 let hit_test_result = match event.event {
@@ -481,6 +520,30 @@ impl WebViewRenderer {
             },
             None => None,
         };
+
+        // For touch-down, capture the hit node's `touch-action` and scrollable
+        // axes from the scroll tree so the pan axis-lock policy can be decided
+        // at pan-start.
+        if is_touch_down && let Some(hit) = &hit_test_result {
+            let policy_input = self
+                .pipelines
+                .get(&hit.pipeline_id)
+                .and_then(|pipeline_details| {
+                    pipeline_details
+                        .scroll_tree
+                        .touch_action_and_scrollable_axes_for(hit.external_scroll_id)
+                })
+                .map(
+                    |(touch_action, scrollable_x, scrollable_y)| PanPolicyInput {
+                        touch_action,
+                        scrollable_x,
+                        scrollable_y,
+                    },
+                );
+            if let Some(input) = policy_input {
+                self.touch_handler.set_pan_policy_input(input);
+            }
+        }
 
         if let Err(error) = self.embedder_to_constellation_sender.send(
             EmbedderToConstellationMessage::ForwardInputEvent(self.id, event, hit_test_result),
@@ -619,11 +682,19 @@ impl WebViewRenderer {
         reached_constellation
     }
 
-    fn on_touch_up(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) -> bool {
+    fn on_touch_up(
+        &mut self,
+        render_api: &RenderApi,
+        mut event: TouchEvent,
+        id: InputEventId,
+    ) -> bool {
         let point = event
             .point
             .as_device_point(self.device_pixels_per_page_pixel());
-        self.touch_handler.on_touch_up(event.touch_id, point);
+        // Tag taps so script can generate the compatibility mouse events.
+        if self.touch_handler.on_touch_up(event.touch_id, point) {
+            event.can_synthesize_mouse_events = true;
+        }
         self.send_touch_event(render_api, event, id)
     }
 
@@ -642,7 +713,6 @@ impl WebViewRenderer {
 
     fn on_touch_event_processed(
         &mut self,
-        render_api: &RenderApi,
         pending_touch_input_event: PendingTouchInputEvent,
         result: InputEventResult,
     ) {
@@ -652,9 +722,11 @@ impl WebViewRenderer {
             touch_id,
         } = pending_touch_input_event;
 
-        if result.contains(InputEventResult::DefaultPrevented) {
+        // A touch is left to the compositor only if neither script nor a user agent widget
+        // process it.
+        if result.intersects(InputEventResult::DefaultPrevented | InputEventResult::Consumed) {
             debug!(
-                "Touch event {:?} in sequence {:?} prevented!",
+                "Touch event {:?} in sequence {:?} prevented or consumed",
                 event_type, sequence_id
             );
             match event_type {
@@ -694,7 +766,7 @@ impl WebViewRenderer {
                         return;
                     };
                     match info.state {
-                        TouchSequenceState::PendingClick(_) => {
+                        TouchSequenceState::PendingClick => {
                             info.state = TouchSequenceState::Finished;
                             self.touch_handler.remove_touch_sequence(sequence_id);
                         },
@@ -756,13 +828,8 @@ impl WebViewRenderer {
                         return;
                     };
                     match info.state {
-                        TouchSequenceState::PendingClick(point) => {
+                        TouchSequenceState::PendingClick => {
                             info.state = TouchSequenceState::Finished;
-                            // PreventDefault from touch_down may have been processed after
-                            // touch_up already occurred.
-                            if !info.prevent_click {
-                                self.simulate_mouse_click(render_api, point);
-                            }
                             self.touch_handler.remove_touch_sequence(sequence_id);
                         },
                         TouchSequenceState::Flinging { .. } => {
@@ -793,43 +860,22 @@ impl WebViewRenderer {
         }
     }
 
-    /// <http://w3c.github.io/touch-events/#mouse-events>
-    fn simulate_mouse_click(&mut self, render_api: &RenderApi, point: DevicePoint) {
-        let button = MouseButton::Left;
-        self.dispatch_input_event_with_hit_testing(
-            render_api,
-            InputEvent::MouseMove(MouseMoveEvent::new_compatibility_for_touch(point.into())).into(),
-        );
-        self.dispatch_input_event_with_hit_testing(
-            render_api,
-            InputEvent::MouseButton(MouseButtonEvent::new(
-                MouseButtonAction::Down,
-                button,
-                point.into(),
-            ))
-            .into(),
-        );
-        self.dispatch_input_event_with_hit_testing(
-            render_api,
-            InputEvent::MouseButton(MouseButtonEvent::new(
-                MouseButtonAction::Up,
-                button,
-                point.into(),
-            ))
-            .into(),
-        );
-    }
-
     pub(crate) fn notify_scroll_event(&mut self, scroll: Scroll, point: WebViewPoint) {
         let point = point.as_device_point(self.device_pixels_per_page_pixel());
-        self.on_scroll_window_event(scroll, point);
+        self.on_scroll_window_event(scroll, point, ScrollType::InputEvents);
     }
 
-    fn on_scroll_window_event(&mut self, scroll: Scroll, cursor: DevicePoint) {
+    fn on_scroll_window_event(
+        &mut self,
+        scroll: Scroll,
+        cursor: DevicePoint,
+        scroll_type: ScrollType,
+    ) {
         self.pending_scroll_zoom_events
             .push(ScrollZoomEvent::Scroll(ScrollEvent {
                 scroll,
                 point: cursor,
+                scroll_type,
             }));
     }
 
@@ -908,6 +954,7 @@ impl WebViewRenderer {
                 render_api,
                 combined_event.point.to_f32(),
                 combined_event.scroll,
+                combined_event.scroll_type,
             )
         });
         if let Some(ref scroll_result) = scroll_result {
@@ -925,6 +972,10 @@ impl WebViewRenderer {
         let pinch_zoom_result = self.set_pinch_zoom(new_pinch_zoom);
         if pinch_zoom_result == PinchZoomResult::DidPinchZoom {
             self.send_pinch_zoom_infos_to_script();
+            // Pinch zoom changes the viewport transform without touching the pipeline, so no reflow
+            // will occur. Notify the embedding layer so it can refresh the accessibility root node,
+            // whose transform scales by the pinch zoom.
+            self.webview.notify_viewport_updated();
         }
 
         (pinch_zoom_result, scroll_result)
@@ -939,6 +990,7 @@ impl WebViewRenderer {
         render_api: &RenderApi,
         cursor: DevicePoint,
         scroll: Scroll,
+        scroll_type: ScrollType,
     ) -> Option<ScrollResult> {
         let scroll_location = match scroll {
             Scroll::Delta(delta) => {
@@ -969,7 +1021,7 @@ impl WebViewRenderer {
                 let scroll_result = pipeline_details.scroll_tree.scroll_node_or_ancestor(
                     hit_test_result.external_scroll_id,
                     scroll_location,
-                    ScrollType::InputEvents,
+                    scroll_type,
                 );
                 if let Some((external_scroll_id, offset)) = scroll_result {
                     // We would like to cache the hit test for the node that that actually scrolls
@@ -1106,15 +1158,18 @@ impl WebViewRenderer {
         PinchZoomResult::DidPinchZoom
     }
 
+    /// Set the page zoom for this renderer, returning `true` if the value actually changed.
     pub(crate) fn set_page_zoom(
         &mut self,
         new_page_zoom: Scale<f32, CSSPixel, DeviceIndependentPixel>,
-    ) {
+    ) -> bool {
         let new_page_zoom = new_page_zoom.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM);
         let old_zoom = std::mem::replace(&mut self.page_zoom, new_page_zoom);
-        if old_zoom != self.page_zoom {
-            self.send_window_size_message();
+        if old_zoom == self.page_zoom {
+            return false;
         }
+        self.send_window_size_message();
+        true
     }
 
     /// The scale to use when displaying this [`WebViewRenderer`] in WebRender
@@ -1165,6 +1220,7 @@ impl WebViewRenderer {
                 ViewportDetails {
                     hidpi_scale_factor: device_pixel_ratio,
                     size: layout_viewport,
+                    device_size: self.screen_size,
                 },
                 WindowSizeType::Resize,
             ),
@@ -1180,6 +1236,17 @@ impl WebViewRenderer {
         if self.hidpi_scale_factor == old_scale_factor {
             return false;
         }
+
+        self.send_window_size_message();
+        true
+    }
+
+    /// Set the `screen_size` for this renderer, returning `true` if the value actually changed.
+    pub(crate) fn set_screen_size(&mut self, new_size: Size2D<f32, DevicePixel>) -> bool {
+        if self.screen_size == new_size {
+            return false;
+        }
+        self.screen_size = new_size;
 
         self.send_window_size_message();
         true
@@ -1217,7 +1284,6 @@ impl WebViewRenderer {
 
     pub(crate) fn notify_input_event_handled(
         &mut self,
-        render_api: &RenderApi,
         repaint_reason: &Cell<RepaintReason>,
         id: InputEventId,
         result: InputEventResult,
@@ -1225,7 +1291,7 @@ impl WebViewRenderer {
         if let Some(pending_touch_input_event) =
             self.touch_handler.take_pending_touch_input_event(id)
         {
-            self.on_touch_event_processed(render_api, pending_touch_input_event, result);
+            self.on_touch_event_processed(pending_touch_input_event, result);
             self.touch_handler
                 .add_touch_move_refresh_observer_if_necessary(
                     self.refresh_driver.clone(),

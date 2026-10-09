@@ -3,10 +3,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
+use script_bindings::callback::{OwnerWindow, RootedCallback, TracedCallback};
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::callback::ExceptionHandling::Rethrow;
@@ -16,8 +16,8 @@ use crate::dom::bindings::codegen::Bindings::NodeIteratorBinding::NodeIteratorMe
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::root::{Dom, DomRoot, MutDom};
 use crate::dom::document::Document;
+use crate::dom::iterators::ShadowIncluding;
 use crate::dom::node::Node;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct NodeIterator {
@@ -32,44 +32,51 @@ pub(crate) struct NodeIterator {
 }
 
 impl NodeIterator {
-    fn new_inherited(root_node: &Node, what_to_show: u32, filter: Filter) -> NodeIterator {
+    fn new_inherited(
+        root_node: &Node,
+        what_to_show: u32,
+        node_filter: Option<RootedCallback<NodeFilter>>,
+    ) -> NodeIterator {
         NodeIterator {
             reflector_: Reflector::new(),
             root_node: Dom::from_ref(root_node),
             reference_node: MutDom::new(root_node),
             pointer_before_reference_node: Cell::new(true),
             what_to_show,
-            filter,
+            filter: match node_filter {
+                None => Filter::None,
+                Some(callback) => Filter::Callback(callback.to_traced()),
+            },
             active: Cell::new(false),
         }
     }
 
     pub(crate) fn new_with_filter(
+        cx: &mut JSContext,
         document: &Document,
         root_node: &Node,
         what_to_show: u32,
-        filter: Filter,
-        can_gc: CanGc,
+        node_filter: Option<RootedCallback<NodeFilter>>,
     ) -> DomRoot<NodeIterator> {
         reflect_dom_object(
-            Box::new(NodeIterator::new_inherited(root_node, what_to_show, filter)),
+            cx,
+            Box::new(NodeIterator::new_inherited(
+                root_node,
+                what_to_show,
+                node_filter,
+            )),
             document.window(),
-            can_gc,
         )
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         document: &Document,
         root_node: &Node,
         what_to_show: u32,
-        node_filter: Option<Rc<NodeFilter>>,
-        can_gc: CanGc,
+        node_filter: Option<RootedCallback<NodeFilter>>,
     ) -> DomRoot<NodeIterator> {
-        let filter = match node_filter {
-            None => Filter::None,
-            Some(jsfilter) => Filter::Callback(jsfilter),
-        };
-        NodeIterator::new_with_filter(document, root_node, what_to_show, filter, can_gc)
+        NodeIterator::new_with_filter(cx, document, root_node, what_to_show, node_filter)
     }
 }
 
@@ -85,10 +92,10 @@ impl NodeIteratorMethods<crate::DomTypeHolder> for NodeIterator {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-nodeiterator-filter>
-    fn GetFilter(&self) -> Option<Rc<NodeFilter>> {
+    fn GetFilter(&self, cx: &JSContext) -> Option<RootedCallback<NodeFilter>> {
         match self.filter {
             Filter::None => None,
-            Filter::Callback(ref nf) => Some((*nf).clone()),
+            Filter::Callback(ref nf) => Some(nf.root(cx)),
         }
     }
 
@@ -129,7 +136,7 @@ impl NodeIteratorMethods<crate::DomTypeHolder> for NodeIterator {
         }
 
         // Step 3-1.
-        for following_node in node.following_nodes(&self.root_node) {
+        for following_node in node.following_nodes(&self.root_node, ShadowIncluding::No) {
             // Step 3-2.
             let result = self.accept_node(cx, &following_node)?;
 
@@ -201,7 +208,9 @@ impl NodeIterator {
     fn accept_node(&self, cx: &mut JSContext, node: &Node) -> Fallible<u16> {
         // Step 1.
         if self.active.get() {
-            return Err(Error::InvalidState(None));
+            return Err(Error::InvalidState(Some(
+                "Node iterator cannot be active".into(),
+            )));
         }
         // Step 2.
         let n = node.NodeType() - 1;
@@ -228,7 +237,10 @@ impl NodeIterator {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) enum Filter {
     None,
-    Callback(#[ignore_malloc_size_of = "callbacks are hard"] Rc<NodeFilter>),
+    Callback(TracedCallback<NodeFilter>),
 }
+
+impl OwnerWindow<crate::DomTypeHolder> for NodeIterator {}

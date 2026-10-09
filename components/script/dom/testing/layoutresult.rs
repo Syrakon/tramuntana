@@ -2,16 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use js::gc::MutableHandleValue;
 use script_bindings::domstring::DOMString;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 
 use crate::dom::bindings::codegen::Bindings::ServoTestUtilsBinding::LayoutResultMethods;
-use crate::dom::bindings::import::base::SafeJSContext;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub(crate) struct LayoutResult {
@@ -19,7 +18,7 @@ pub(crate) struct LayoutResult {
     phases: Vec<DOMString>,
     rebuilt_fragment_count: u32,
     restyle_fragment_count: u32,
-    possibly_moved_fragment_count: u32,
+    only_descendants_changed_count: u32,
 }
 
 impl LayoutResult {
@@ -27,41 +26,41 @@ impl LayoutResult {
         phases: Vec<DOMString>,
         rebuilt_fragment_count: u32,
         restyle_fragment_count: u32,
-        possibly_moved_fragment_count: u32,
+        only_descendants_changed_count: u32,
     ) -> Self {
         Self {
             reflector_: Reflector::new(),
             phases,
             rebuilt_fragment_count,
             restyle_fragment_count,
-            possibly_moved_fragment_count,
+            only_descendants_changed_count,
         }
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         phases: Vec<DOMString>,
         rebuilt_fragment_count: u32,
         restyle_fragment_count: u32,
-        possibly_moved_fragment_count: u32,
-        can_gc: CanGc,
+        only_descendants_changed_count: u32,
     ) -> DomRoot<Self> {
         reflect_dom_object(
+            cx,
             Box::new(Self::new_inherited(
                 phases,
                 rebuilt_fragment_count,
                 restyle_fragment_count,
-                possibly_moved_fragment_count,
+                only_descendants_changed_count,
             )),
             global,
-            can_gc,
         )
     }
 }
 
 impl LayoutResultMethods<crate::DomTypeHolder> for LayoutResult {
-    fn Phases(&self, cx: SafeJSContext, can_gc: CanGc, return_value: MutableHandleValue) {
-        to_frozen_array(&self.phases, cx, return_value, can_gc);
+    fn Phases(&self, cx: &mut JSContext, return_value: MutableHandleValue) {
+        to_frozen_array(cx, &self.phases, return_value);
     }
 
     fn RebuiltFragmentCount(&self) -> u32 {
@@ -72,7 +71,7 @@ impl LayoutResultMethods<crate::DomTypeHolder> for LayoutResult {
         self.restyle_fragment_count
     }
 
-    fn PossiblyMovedFragmentCount(&self) -> u32 {
-        self.possibly_moved_fragment_count
+    fn OnlyDescendantsChangedCount(&self) -> u32 {
+        self.only_descendants_changed_count
     }
 }

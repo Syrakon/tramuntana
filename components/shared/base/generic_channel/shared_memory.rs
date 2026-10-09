@@ -10,7 +10,8 @@ use ipc_channel::ipc::IpcSharedMemory;
 use malloc_size_of::MallocSizeOf;
 use serde::de::VariantAccess;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use servo_config::opts;
+
+use crate::generic_channel::use_ipc;
 
 #[derive(Clone)]
 pub struct GenericSharedMemory(GenericSharedMemoryVariant);
@@ -19,6 +20,12 @@ pub struct GenericSharedMemory(GenericSharedMemoryVariant);
 enum GenericSharedMemoryVariant {
     Ipc(IpcSharedMemory),
     InProcess(Arc<Vec<u8>>),
+}
+
+impl AsRef<[u8]> for GenericSharedMemory {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
 }
 
 impl Deref for GenericSharedMemory {
@@ -44,7 +51,7 @@ impl MallocSizeOf for GenericSharedMemory {
 
 impl GenericSharedMemory {
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        if servo_config::opts::get().multiprocess || servo_config::opts::get().force_ipc {
+        if use_ipc() {
             GenericSharedMemory(GenericSharedMemoryVariant::Ipc(
                 IpcSharedMemory::from_bytes(bytes),
             ))
@@ -56,7 +63,7 @@ impl GenericSharedMemory {
     }
 
     pub fn from_byte(data: u8, length: usize) -> Self {
-        if servo_config::opts::get().multiprocess || servo_config::opts::get().force_ipc {
+        if use_ipc() {
             GenericSharedMemory(GenericSharedMemoryVariant::Ipc(IpcSharedMemory::from_byte(
                 data, length,
             )))
@@ -68,6 +75,34 @@ impl GenericSharedMemory {
         }
     }
 
+    /// Build a `GenericSharedMemory` from a `Vec<u8>`.
+    ///
+    /// In single-process mode this allows reusing the Vec and the only cost is
+    /// allocating a new Arc. Prefer over `Self::from_bytes` if ownership is
+    /// transferred.
+    pub fn from_vec(bytes: Vec<u8>) -> Self {
+        if use_ipc() {
+            GenericSharedMemory(GenericSharedMemoryVariant::Ipc(
+                IpcSharedMemory::from_bytes(&bytes),
+            ))
+        } else {
+            GenericSharedMemory(GenericSharedMemoryVariant::InProcess(Arc::new(bytes)))
+        }
+    }
+
+    /// Build a `GenericSharedMemory` from an `Arc<Vec<u8>>`.
+    ///
+    /// In single-process mode this allows creating shared memory without copying.
+    pub fn from_arc_vec(arc: Arc<Vec<u8>>) -> Self {
+        if use_ipc() {
+            GenericSharedMemory(GenericSharedMemoryVariant::Ipc(
+                IpcSharedMemory::from_bytes(&arc),
+            ))
+        } else {
+            GenericSharedMemory(GenericSharedMemoryVariant::InProcess(arc))
+        }
+    }
+
     /// Free operation in single process mode.
     /// If multiple `GenericSharedmemory` point to the same value this is safe to use and only effects the value currently hold.
     pub fn into_arc_vec(self) -> Arc<Vec<u8>> {
@@ -76,6 +111,44 @@ impl GenericSharedMemory {
                 Arc::new(ipc_shared_memory.to_vec())
             },
             GenericSharedMemoryVariant::InProcess(arc) => arc,
+        }
+    }
+
+    pub fn from_bytes_with_mutator(bytes: &[u8], mutator: impl FnOnce(&mut [u8])) -> Self {
+        let mut shared_memory = Self::from_bytes(bytes);
+        match &mut shared_memory.0 {
+            GenericSharedMemoryVariant::Ipc(ipc_shared_memory) => {
+                #[expect(unsafe_code)]
+                unsafe {
+                    mutator(ipc_shared_memory.deref_mut())
+                }
+            },
+            GenericSharedMemoryVariant::InProcess(arc) => mutator(
+                Arc::get_mut(arc)
+                    .expect("Arc just created from bytes")
+                    .as_mut_slice(),
+            ),
+        }
+        shared_memory
+    }
+
+    #[expect(unsafe_code)]
+    /// Returns a mutable reference to the deref of this IpcSharedMemory.
+    ///
+    /// # Safety
+    ///
+    /// This is safe if there is only one reader/writer on the data. In single process mode breaking invariant causes panics.
+    pub unsafe fn deref_mut(&mut self) -> &mut [u8] {
+        match &mut self.0 {
+            GenericSharedMemoryVariant::Ipc(ipc_shared_memory) => {
+                #[expect(unsafe_code)]
+                unsafe {
+                    ipc_shared_memory.deref_mut()
+                }
+            },
+            GenericSharedMemoryVariant::InProcess(arc) => Arc::get_mut(arc)
+                .expect("Arc just created from bytes")
+                .as_mut_slice(),
         }
     }
 }
@@ -93,7 +166,7 @@ impl Serialize for GenericSharedMemory {
                 s.serialize_newtype_variant("GenericSharedMemory", 0, "Ipc", memory)
             },
             GenericSharedMemoryVariant::InProcess(arc) => {
-                if opts::get().multiprocess || opts::get().force_ipc {
+                if use_ipc() {
                     return Err(serde::ser::Error::custom(
                         "Arc<Vec<u8>> found in multiprocess mode!",
                     ));
@@ -132,7 +205,7 @@ impl<'de> serde::de::Visitor<'de> for GenericSharedMemoryVisitor {
                 .newtype_variant::<IpcSharedMemory>()
                 .map(|receiver| GenericSharedMemory(GenericSharedMemoryVariant::Ipc(receiver))),
             GenericSharedMemoryVariantNames::InProcess => {
-                if opts::get().multiprocess || servo_config::opts::get().force_ipc {
+                if use_ipc() {
                     return Err(serde::de::Error::custom(
                         "Arc data found in multiprocess mode!",
                     ));

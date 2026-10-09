@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::ops::Deref;
-use std::rc::Rc;
 use std::str::FromStr;
 
 use data_url::mime::Mime;
@@ -13,14 +12,14 @@ use js::realm::CurrentRealm;
 use js::rust::{HandleObject, HandleValue as SafeHandleValue, MutableHandleValue};
 use script_bindings::cell::DomRefCell;
 use script_bindings::record::Record;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto_and_cx};
+use script_bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use servo_constellation_traits::BlobImpl;
 
 use crate::dom::bindings::codegen::Bindings::ClipboardBinding::{
     ClipboardItemMethods, ClipboardItemOptions, PresentationStyle,
 };
 use crate::dom::bindings::conversions::{
-    ConversionResult, SafeFromJSValConvertible, StringificationBehavior,
+    ConversionResult, FromJSValConvertible, StringificationBehavior,
 };
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::frozenarray::CachedFrozenArray;
@@ -28,53 +27,49 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::blob::Blob;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise, TracedPromise};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 /// The fulfillment handler for the reacting to representationDataPromise part of
 /// <https://w3c.github.io/clipboard-apis/#dom-clipboarditem-gettype>.
 #[derive(Clone, JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct RepresentationDataPromiseFulfillmentHandler {
-    #[conditional_malloc_size_of]
-    promise: Rc<Promise>,
+    promise: TracedPromise,
     type_: String,
 }
+
+impl js::gc::Rootable for RepresentationDataPromiseFulfillmentHandler {}
 
 impl Callback for RepresentationDataPromiseFulfillmentHandler {
     /// Substeps of 8.1.2.1 If representationDataPromise was fulfilled with value v, then:
     fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
-        let can_gc = CanGc::from_cx(cx);
         // 1. If v is a DOMString, then follow the below steps:
         if v.get().is_string() {
             // 1.1 Let dataAsBytes be the result of UTF-8 encoding v.
-            let data_as_bytes = match DOMString::safe_from_jsval(
-                cx.into(),
-                v,
-                StringificationBehavior::Default,
-                can_gc,
-            ) {
-                Ok(ConversionResult::Success(s)) => s.as_bytes().to_owned(),
+            let data_as_bytes = match DOMString::from_jsval(cx, v, StringificationBehavior::Default)
+            {
+                Ok(ConversionResult::Success(s)) => s.as_bytes(cx.no_gc()).to_owned(),
                 _ => return,
             };
 
             // 1.2 Let blobData be a Blob created using dataAsBytes with its type set to mimeType, serialized.
             let blob_data = Blob::new(
+                cx,
                 &self.promise.global(),
                 BlobImpl::new_from_bytes(data_as_bytes, self.type_.clone()),
-                can_gc,
             );
 
             // 1.3 Resolve p with blobData.
-            self.promise.resolve_native(&blob_data, can_gc);
+            self.promise.resolve_native(cx, &blob_data);
         }
         // 2. If v is a Blob, then follow the below steps:
-        else if DomRoot::<Blob>::safe_from_jsval(cx.into(), v, (), can_gc)
+        else if DomRoot::<Blob>::from_jsval(cx, v, ())
             .is_ok_and(|result| result.get_success_value().is_some())
         {
             // 2.1 Resolve p with v.
-            self.promise.resolve(cx.into(), v, can_gc);
+            self.promise.resolve(cx, v);
         }
     }
 }
@@ -82,17 +77,18 @@ impl Callback for RepresentationDataPromiseFulfillmentHandler {
 /// The rejection handler for the reacting to representationDataPromise part of
 /// <https://w3c.github.io/clipboard-apis/#dom-clipboarditem-gettype>.
 #[derive(Clone, JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct RepresentationDataPromiseRejectionHandler {
-    #[conditional_malloc_size_of]
-    promise: Rc<Promise>,
+    promise: TracedPromise,
 }
+
+impl js::gc::Rootable for RepresentationDataPromiseRejectionHandler {}
 
 impl Callback for RepresentationDataPromiseRejectionHandler {
     /// Substeps of 8.1.2.2 If representationDataPromise was rejected, then:
     fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
         // 1. Reject p with "NotFoundError" DOMException in realm.
-        self.promise
-            .reject_error(Error::NotFound(None), CanGc::from_cx(cx));
+        self.promise.reject_error(cx, Error::NotFound(None));
     }
 }
 
@@ -101,14 +97,16 @@ const CUSTOM_FORMAT_PREFIX: &str = "web ";
 
 /// <https://w3c.github.io/clipboard-apis/#representation>
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(super) struct Representation {
     #[no_trace]
     #[ignore_malloc_size_of = "Extern type"]
     pub mime_type: Mime,
     pub is_custom: bool,
-    #[conditional_malloc_size_of]
-    pub data: Rc<Promise>,
+    pub data: TracedPromise,
 }
+
+impl js::gc::Rootable for Representation {}
 
 #[dom_struct]
 pub(crate) struct ClipboardItem {
@@ -134,12 +132,7 @@ impl ClipboardItem {
         window: &Window,
         proto: Option<HandleObject>,
     ) -> DomRoot<ClipboardItem> {
-        reflect_dom_object_with_proto_and_cx(
-            Box::new(ClipboardItem::new_inherited()),
-            window,
-            proto,
-            cx,
-        )
+        reflect_dom_object_with_proto(cx, Box::new(ClipboardItem::new_inherited()), window, proto)
     }
 }
 
@@ -149,7 +142,7 @@ impl ClipboardItemMethods<crate::DomTypeHolder> for ClipboardItem {
         cx: &mut JSContext,
         global: &Window,
         proto: Option<HandleObject>,
-        items: Record<DOMString, Rc<Promise>>,
+        items: Record<DOMString, RootedPromise>,
         options: &ClipboardItemOptions,
     ) -> Fallible<DomRoot<ClipboardItem>> {
         // Step 1 If items is empty, then throw a TypeError.
@@ -164,7 +157,9 @@ impl ClipboardItemMethods<crate::DomTypeHolder> for ClipboardItem {
         let clipboard_item = ClipboardItem::new(cx, global, proto);
 
         // Step 4 Set this's clipboard item's presentation style to options["presentationStyle"].
-        *clipboard_item.presentation_style.borrow_mut() = options.presentationStyle;
+        *clipboard_item
+            .presentation_style
+            .safe_borrow_mut(cx.no_gc()) = options.presentationStyle;
 
         // Step 6 For each (key, value) in items:
         for (key, value) in items.deref() {
@@ -201,17 +196,17 @@ impl ClipboardItemMethods<crate::DomTypeHolder> for ClipboardItem {
             // Step 6.4 Set representation’s isCustom flag to isCustom.
             // Step 6.8 Set representation’s MIME type to mimeType.
             // Step 6.9 Set representation’s data to value.
-            let representation = Representation {
+            rooted!(&in(cx) let mut representation = Some(Representation {
                 mime_type,
                 is_custom,
-                data: value.clone(),
-            };
+                data: value.to_traced(),
+            }));
 
             // Step 6.10 Append representation to this's clipboard item's list of representations.
             clipboard_item
                 .representations
-                .borrow_mut()
-                .push(representation);
+                .safe_borrow_mut(cx.no_gc())
+                .push(representation.take().unwrap());
         }
 
         // NOTE: The steps for creating a frozen array from the list of mimeType are done in the Types() method
@@ -227,6 +222,7 @@ impl ClipboardItemMethods<crate::DomTypeHolder> for ClipboardItem {
     /// <https://w3c.github.io/clipboard-apis/#dom-clipboarditem-types>
     fn Types(&self, cx: &mut JSContext, retval: MutableHandleValue) {
         self.frozen_types.get_or_init(
+            cx,
             || {
                 // Step 5 Let types be a list of DOMString.
                 let mut types = Vec::new();
@@ -250,14 +246,12 @@ impl ClipboardItemMethods<crate::DomTypeHolder> for ClipboardItem {
                     });
                 types
             },
-            cx.into(),
             retval,
-            CanGc::from_cx(cx),
         );
     }
 
     /// <https://w3c.github.io/clipboard-apis/#dom-clipboarditem-gettype>
-    fn GetType(&self, realm: &mut CurrentRealm, type_: DOMString) -> Fallible<Rc<Promise>> {
+    fn GetType(&self, realm: &mut CurrentRealm, type_: DOMString) -> Fallible<RootedPromise> {
         // Step 1 Let realm be this’s relevant realm.
         let global = self.global();
 
@@ -288,21 +282,26 @@ impl ClipboardItemMethods<crate::DomTypeHolder> for ClipboardItem {
             // Step 8.1 If representation’s MIME type is mimeType and representation’s isCustom is isCustom, then:
             if representation.mime_type == mime_type && representation.is_custom == is_custom {
                 // Step 8.1.1 Let representationDataPromise be the representation’s data.
-                let representation_data_promise = &representation.data;
+                let representation_data_promise = representation.data.root(realm);
 
                 // Step 8.1.2 React to representationDataPromise:
-                let fulfillment_handler = Box::new(RepresentationDataPromiseFulfillmentHandler {
-                    promise: p.clone(),
+                rooted!(&in(realm) let mut fulfillment_handler = Some(RepresentationDataPromiseFulfillmentHandler {
+                    promise: p.to_traced(),
                     type_: representation.mime_type.to_string(),
-                });
-                let rejection_handler =
-                    Box::new(RepresentationDataPromiseRejectionHandler { promise: p.clone() });
+                }));
+                rooted!(&in(realm) let mut rejection_handler = Some(RepresentationDataPromiseRejectionHandler {
+                    promise: p.to_traced(),
+                }));
 
                 let handler = PromiseNativeHandler::new(
+                    realm,
                     &global,
-                    Some(fulfillment_handler),
-                    Some(rejection_handler),
-                    CanGc::from_cx(realm),
+                    fulfillment_handler
+                        .take()
+                        .map(|handler| Box::new(handler) as Box<dyn Callback>),
+                    rejection_handler
+                        .take()
+                        .map(|handler| Box::new(handler) as Box<dyn Callback>),
                 );
                 representation_data_promise.append_native_handler(realm, &handler);
 
@@ -312,7 +311,7 @@ impl ClipboardItemMethods<crate::DomTypeHolder> for ClipboardItem {
         }
 
         // Step 9 Reject p with "NotFoundError" DOMException in realm.
-        p.reject_error(Error::NotFound(None), CanGc::from_cx(realm));
+        p.reject_error(realm, Error::NotFound(None));
 
         // Step 10 Return p.
         Ok(p)

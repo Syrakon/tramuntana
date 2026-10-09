@@ -64,6 +64,7 @@ pub enum WebViewPoint {
 }
 
 impl WebViewPoint {
+    #[doc(hidden)]
     pub fn as_device_point(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DevicePoint {
         match self {
             Self::Device(point) => *point,
@@ -100,6 +101,7 @@ pub enum WebViewRect {
 }
 
 impl WebViewRect {
+    #[doc(hidden)]
     pub fn as_device_rect(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DeviceRect {
         match self {
             Self::Device(rect) => *rect,
@@ -129,6 +131,9 @@ impl From<Box2D<f32, CSSPixel>> for WebViewRect {
     }
 }
 
+/// A 2D vector in a `WebView`, either expressed in device pixels or page pixels.
+/// Page pixels are CSS pixels, which take into account device pixel scale,
+/// page zoom, and pinch zoom.
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum WebViewVector {
     Device(DeviceVector2D),
@@ -136,6 +141,7 @@ pub enum WebViewVector {
 }
 
 impl WebViewVector {
+    #[doc(hidden)]
     pub fn as_device_vector(&self, scale: Scale<f32, CSSPixel, DevicePixel>) -> DeviceVector2D {
         match self {
             Self::Device(vector) => *vector,
@@ -162,10 +168,15 @@ impl From<Vector2D<f32, CSSPixel>> for WebViewVector {
     }
 }
 
+/// Represents the destination of a scroll operation.
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum Scroll {
+    /// An offset to scroll by, with positive offsets revealing more content on the bottom
+    /// and right of the scrollable area.
     Delta(WebViewVector),
+    /// Scroll to the start of the scrollable area.
     Start,
+    /// Scroll to the end of the scrollable area.
     End,
 }
 
@@ -283,11 +294,12 @@ pub trait RefreshDriver {
     fn observe_next_frame(&self, start_frame_callback: Box<dyn Fn() + Send + 'static>);
 }
 
+/// Credentials to use in an HTTP authentication challenge.
 #[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AuthenticationResponse {
-    /// Username for http request authentication
+    /// Username for HTTP request authentication
     pub username: String,
-    /// Password for http request authentication
+    /// Password for HTTP request authentication
     pub password: String,
 }
 
@@ -368,13 +380,16 @@ pub enum RegisterOrUnregister {
     Unregister,
 }
 
+/// A request from Servo to embedder to register or unregister a custom
+/// protocol handler for a scheme, typically triggered by web content.
+/// See <https://html.spec.whatwg.org/multipage/#custom-handlers>
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtocolHandlerUpdateRegistration {
-    /// The scheme for the protocol handler
+    /// The scheme for the protocol handler.
     pub scheme: String,
-    /// The URL to navigate to when handling requests for scheme
+    /// The URL to navigate to when handling requests for scheme.
     pub url: ServoUrl,
-    /// Whether this update is to register or unregister the protocol handler
+    /// Whether this update is to register or unregister the protocol handler.
     pub register_or_unregister: RegisterOrUnregister,
 }
 
@@ -388,6 +403,9 @@ pub struct ViewportDetails {
     /// The scale factor to use to account for HiDPI scaling. This does not take into account
     /// any page or pinch zoom applied by `Paint` to the contents.
     pub hidpi_scale_factor: Scale<f32, CSSPixel, DevicePixel>,
+
+    /// The device dimensions that this viewport is displayed within.
+    pub device_size: Size2D<f32, DevicePixel>,
 }
 
 impl ViewportDetails {
@@ -407,16 +425,17 @@ pub struct ScreenMetrics {
 }
 
 /// An opaque identifier for a single history traversal operation.
-#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct TraversalId(String);
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct TraversalId(Uuid);
 
 impl TraversalId {
     #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
+        Self(Uuid::new_v4())
     }
 }
 
+/// The pixel format of the buffer representing a raster image.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, MallocSizeOf)]
 pub enum PixelFormat {
     /// Luminance channel only
@@ -444,6 +463,12 @@ pub struct Image {
 }
 
 impl Image {
+    /// Creates a new [`Image`] with the given `width` and `height`.
+    ///
+    /// `data` is a shared memory block containing the pixel data of one or more image frames, in
+    /// the given `format`.
+    ///
+    /// `range` is the byte offset within `data` that is the start of the first frame.
     pub fn new(
         width: u32,
         height: u32,
@@ -466,6 +491,7 @@ impl Image {
     }
 }
 
+/// The severity level of a message logged by page content.
 #[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
 #[serde(rename_all = "lowercase")]
 pub enum ConsoleLogLevel {
@@ -475,6 +501,7 @@ pub enum ConsoleLogLevel {
     Warn,
     Error,
     Trace,
+    Dir,
 }
 
 impl From<ConsoleLogLevel> for log::Level {
@@ -486,13 +513,17 @@ impl From<ConsoleLogLevel> for log::Level {
             ConsoleLogLevel::Warn => log::Level::Warn,
             ConsoleLogLevel::Error => log::Level::Error,
             ConsoleLogLevel::Trace => log::Level::Trace,
+            ConsoleLogLevel::Dir => log::Level::Info,
         }
     }
 }
 
+/// Information about a single Bluetooth device.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct BluetoothDeviceDescription {
+    /// The unique address of this device.
     pub address: String,
+    /// A human-readable name for this device.
     pub name: String,
 }
 
@@ -548,7 +579,7 @@ pub enum EmbedderMsg {
     /// Async permission request for screen wake lock. The callback is invoked
     /// with the user's decision, which resolves or rejects the pending promise
     /// without blocking the script thread.
-    RequestWakeLockPermission(WebViewId, GenericCallback<AllowOrDeny>),
+    RequestWakeLockPermission(WebViewId, GenericCallback<AllowOrDeny>, WakeLockType),
     /// A page asks for a passkey to be made or used. The string is the origin of
     /// the asking document, which is the top-level one of its webview. The
     /// callback settles the pending promise without blocking the script thread.
@@ -597,7 +628,7 @@ impl Debug for EmbedderMsg {
 }
 
 /// <https://w3c.github.io/mediasession/#mediametadata>
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
 pub struct MediaMetadata {
     /// Title
     pub title: String,
@@ -611,8 +642,8 @@ impl MediaMetadata {
     pub fn new(title: String) -> Self {
         Self {
             title,
-            artist: "".to_owned(),
-            album: "".to_owned(),
+            artist: String::new(),
+            album: String::new(),
         }
     }
 }
@@ -672,7 +703,8 @@ pub enum PermissionFeature {
     BackgroundSync,
     Bluetooth,
     PersistentStorage,
-    ScreenWakeLock,
+    ScreenWakeLock(WakeLockType),
+    Gamepad,
 }
 
 /// Used to specify the kind of input method editor appropriate to edit a field.
@@ -724,9 +756,9 @@ pub struct WebResourceRequest {
         serialize_with = "::hyper_serde::serialize"
     )]
     pub headers: HeaderMap,
-    pub url: Url,
+    pub url: ServoUrl,
     pub destination: Destination,
-    pub referrer_url: Option<Url>,
+    pub referrer_url: Option<ServoUrl>,
     pub is_for_main_frame: bool,
     pub is_redirect: bool,
 }
@@ -839,6 +871,7 @@ pub enum MediaSessionActionType {
 }
 
 /// The status of the load in this `WebView`.
+#[repr(i32)]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum LoadStatus {
     /// The load has started, but the headers have not yet been parsed.
@@ -991,7 +1024,7 @@ pub enum AnimationState {
     /// No animations are active and no callbacks are queued
     NoAnimationsPresent,
     /// No animations are active but callbacks are queued
-    NoAnimationCallbacksPresent,
+    AnimationCallbacksAbsent,
 }
 
 /// A sequence number generated by a script thread for its pipelines. The
@@ -1072,6 +1105,7 @@ impl Display for FocusSequenceNumber {
 #[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct JavaScriptEvaluationId(pub usize);
 
+/// A JavaScript value produced by evaluation of a script.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum JSValue {
     Undefined,
@@ -1087,6 +1121,7 @@ pub enum JSValue {
     Object(HashMap<String, JSValue>),
 }
 
+/// Information about a JavaScript error that occured during the evaluation of a script.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct JavaScriptErrorInfo {
     pub message: String,
@@ -1135,6 +1170,7 @@ pub enum JavaScriptEvaluationError {
     SerializationError(JavaScriptEvaluationResultSerializationError),
 }
 
+#[repr(i32)]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ScreenshotCaptureError {
     /// The screenshot request failed to read the screenshot image from the `WebView`'s

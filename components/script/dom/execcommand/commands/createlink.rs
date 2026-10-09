@@ -6,13 +6,13 @@ use html5ever::local_name;
 use js::context::JSContext;
 use script_bindings::inheritance::Castable;
 
-use crate::dom::ShadowIncluding;
 use crate::dom::bindings::codegen::Bindings::HTMLAnchorElementBinding::HTMLAnchorElementMethods;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::Element;
 use crate::dom::execcommand::basecommand::CommandName;
 use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
+use crate::dom::iterators::ShadowIncluding;
 use crate::dom::selection::Selection;
 
 /// <https://w3c.github.io/editing/docs/execCommand/#the-createlink-command>
@@ -30,9 +30,9 @@ pub(crate) fn execute_createlink_command(
     // is an ancestor of some node effectively contained in the active range,
     // set that a element's href attribute to value.
     let active_range = selection
-        .active_range()
+        .active_range(cx)
         .expect("Must always have an active range");
-    active_range.for_each_effectively_contained_child(|node| {
+    active_range.for_each_effectively_contained_child(cx, |cx, node| {
         for ancestor in node.inclusive_ancestors(ShadowIncluding::No) {
             if !ancestor.is_editable() {
                 return;

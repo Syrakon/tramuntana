@@ -49,21 +49,15 @@ jobs:
           tool-cache: true
           android: false
           swap-storage: false
-      - uses: actions/checkout@v5
-        if: github.event_name != 'pull_request_target'
-        with:
-          fetch-depth: 2
-      # This is necessary to checkout the pull request if this run was triggered via a
-      # `pull_request_target` event.
-      - uses: actions/checkout@v5
-        if: github.event_name == 'pull_request_target'
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 2
+      - uses: servo/ci-runners/actions/checkout@b42c96524cdd72126255602c69c4ad649c750ebf
       - name: Install crown
         run: cargo install --path support/crown
       - name: Change Mirror Priorities
         uses: ./.github/actions/apt-mirrors
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20.1"
       - name: Setup Python
         uses: ./.github/actions/setup-python
       - name: Bootstrap dependencies
@@ -75,14 +69,17 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
-          packages: 'tools platform-tools platforms;android-33'
+          packages: 'platform-tools platforms;android-34'
       - name: Install Android NDK
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
-          ndk-version: r28b
+          # When updating this version, be sure to update the README instructions as well
+          # as the corresponding page in the book:
+          # https://book.servo.org/building/android.html.
+          ndk-version: r29
       - name: Setup Gradle caches
         uses: gradle/actions/setup-gradle@v4
       - name: Trigger initial download of Gradle with retries
@@ -108,10 +105,23 @@ jobs:
         run: |
           ./mach build --use-crown --locked --target ${{ matrix.target }} --profile ${{ inputs.profile }}
           mv target/cargo-timings target/cargo-timings-android-${{ matrix.target }}
-      # TODO: This is disabled since APK crashes during startup.
-      # See https://github.com/servo/servo/issues/31134
-      # - name: Script tests
-      #   run: ./mach test-android-startup
+      # See https://github.com/ReactiveCircus/android-emulator-runner#running-hardware-accelerated-emulators-on-linux-runners
+      - name: Enable KVM group permissions
+        if: ${{ matrix.target == 'x86_64-linux-android' }}
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Android startup smoketest
+        if: ${{ matrix.target == 'x86_64-linux-android' }}
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          # This should be kept in sync with the `android-sdk-min` version in `libs.versions.toml`.
+          # DO NOT INCREASE THIS without prior discussion on zulip!
+          api-level: 29
+          arch: x86_64
+          target: default
+          script: ./mach smoketest --target ${{ matrix.target }} --profile ${{ inputs.profile }}
       - name: Archive build timing
         uses: actions/upload-artifact@v7
         with:
@@ -124,14 +134,14 @@ jobs:
         id: upload-apk
         with:
           name: ${{ inputs.profile }}-binary-android-${{ matrix.target }}
-          path: target/android/${{ matrix.target }}/${{ inputs.profile }}/servoapp.apk
+          path: target/${{ matrix.target }}/${{ inputs.profile }}/servoapp.apk
           if-no-files-found: error
       - name: Upload AAR artifact
         uses: actions/upload-artifact@v7
         id: upload-aar
         with:
           name: ${{ inputs.profile }}-library-android-${{ matrix.target }}
-          path: target/android/${{ matrix.target }}/${{ inputs.profile }}/servoview.aar
+          path: target/${{ matrix.target }}/${{ inputs.profile }}/servoview.aar
           if-no-files-found: error
       - name: Collect artifact IDs needed by the release workflow
         if: matrix.target == 'aarch64-linux-android'

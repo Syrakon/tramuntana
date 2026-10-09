@@ -12,6 +12,7 @@ use js::jsval::NullValue;
 use script_bindings::cell::DomRefCell;
 use script_bindings::cformat;
 use script_bindings::codegen::GenericBindings::PerformanceBinding::PerformanceMarkOptions;
+use script_bindings::codegen::GenericBindings::PerformanceMarkBinding::PerformanceMarkMethods;
 use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
 use script_bindings::codegen::GenericUnionTypes::StringOrPerformanceMeasureOptions;
 use script_bindings::reflector::reflect_dom_object;
@@ -22,10 +23,10 @@ use super::performanceentry::{EntryType, PerformanceEntry};
 use super::performancemark::PerformanceMark;
 use super::performancemeasure::PerformanceMeasure;
 use super::performancenavigation::PerformanceNavigation;
-use super::performancenavigationtiming::PerformanceNavigationTiming;
 use super::performanceobserver::PerformanceObserver as DOMPerformanceObserver;
+use crate::dom::PERFORMANCE_TIMING_ATTRIBUTES;
 use crate::dom::bindings::codegen::Bindings::PerformanceBinding::{
-    DOMHighResTimeStamp, PerformanceEntryList as DOMPerformanceEntryList, PerformanceMethods,
+    DOMHighResTimeStamp, PerformanceMethods,
 };
 use crate::dom::bindings::codegen::UnionTypes::StringOrDouble;
 use crate::dom::bindings::error::{Error, Fallible};
@@ -33,50 +34,28 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{AsHandleValue, Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::structuredclone;
-use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::performance::performancetiming::PerformanceTiming;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
-
-pub(crate) const INVALID_ENTRY_NAMES: &[&str] = &[
-    "navigationStart",
-    "unloadEventStart",
-    "unloadEventEnd",
-    "redirectStart",
-    "redirectEnd",
-    "fetchStart",
-    "domainLookupStart",
-    "domainLookupEnd",
-    "connectStart",
-    "connectEnd",
-    "secureConnectionStart",
-    "requestStart",
-    "responseStart",
-    "responseEnd",
-    "domLoading",
-    "domInteractive",
-    "domContentLoadedEventStart",
-    "domContentLoadedEventEnd",
-    "domComplete",
-    "loadEventStart",
-    "loadEventEnd",
-];
 
 /// Implementation of a list of PerformanceEntry items shared by the
 /// Performance and PerformanceObserverEntryList interfaces implementations.
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct PerformanceEntryList {
     /// <https://w3c.github.io/performance-timeline/#dfn-performance-entry-buffer>
-    entries: DOMPerformanceEntryList,
+    entries: Vec<Dom<PerformanceEntry>>,
 }
 
 impl PerformanceEntryList {
-    pub(crate) fn new(entries: DOMPerformanceEntryList) -> Self {
-        PerformanceEntryList { entries }
+    pub(crate) fn new(entries: Vec<DomRoot<PerformanceEntry>>) -> Self {
+        PerformanceEntryList {
+            entries: entries.into_iter().map(|entry| entry.as_traced()).collect(),
+        }
     }
 
     /// <https://www.w3.org/TR/performance-timeline/#dfn-filter-buffer-map-by-name-and-type>
@@ -94,7 +73,7 @@ impl PerformanceEntryList {
                         .as_ref()
                         .is_none_or(|type_| e.entry_type() == *type_)
             })
-            .cloned()
+            .map(|entry| entry.as_rooted())
             .collect::<Vec<DomRoot<PerformanceEntry>>>();
 
         // Step 6. Sort results's entries in chronological order with respect to startTime
@@ -131,18 +110,10 @@ impl PerformanceEntryList {
     }
 }
 
-impl IntoIterator for PerformanceEntryList {
-    type Item = DomRoot<PerformanceEntry>;
-    type IntoIter = ::std::vec::IntoIter<DomRoot<PerformanceEntry>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.entries.into_iter()
-    }
-}
-
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct PerformanceObserver {
-    observer: DomRoot<DOMPerformanceObserver>,
+    observer: Dom<DOMPerformanceObserver>,
     entry_types: Vec<EntryType>,
 }
 
@@ -165,11 +136,17 @@ pub(crate) struct Performance {
     /// <https://w3c.github.io/resource-timing/#performance-resource-timing-buffer-full-event-pending-flag>
     resource_timing_buffer_pending_full_event: Cell<bool>,
     /// <https://w3c.github.io/resource-timing/#performance-resource-timing-secondary-buffer>
-    resource_timing_secondary_entries: DomRefCell<VecDeque<DomRoot<PerformanceEntry>>>,
+    resource_timing_secondary_entries: DomRefCell<VecDeque<Dom<PerformanceEntry>>>,
+    timing: Dom<PerformanceTiming>,
+    navigation: Dom<PerformanceNavigation>,
 }
 
 impl Performance {
-    fn new_inherited(time_origin: CrossProcessInstant) -> Performance {
+    fn new_inherited(
+        time_origin: CrossProcessInstant,
+        timing: &PerformanceTiming,
+        navigation: &PerformanceNavigation,
+    ) -> Performance {
         Performance {
             eventtarget: EventTarget::new_inherited(),
             buffer: DomRefCell::new(PerformanceEntryList::new(Vec::new())),
@@ -180,18 +157,26 @@ impl Performance {
             resource_timing_buffer_current_size: Cell::new(0),
             resource_timing_buffer_pending_full_event: Cell::new(false),
             resource_timing_secondary_entries: DomRefCell::new(VecDeque::new()),
+            timing: Dom::from_ref(timing),
+            navigation: Dom::from_ref(navigation),
         }
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         navigation_start: CrossProcessInstant,
-        can_gc: CanGc,
     ) -> DomRoot<Performance> {
+        let timing = PerformanceTiming::new(cx, global);
+        let navigation = PerformanceNavigation::new(cx, global);
         reflect_dom_object(
-            Box::new(Performance::new_inherited(navigation_start)),
+            cx,
+            Box::new(Performance::new_inherited(
+                navigation_start,
+                &timing,
+                &navigation,
+            )),
             global,
-            can_gc,
         )
     }
 
@@ -237,7 +222,7 @@ impl Performance {
             Some(p) => observers[p].entry_types = entry_types,
             // Otherwise, we create and insert the new PerformanceObserver.
             None => observers.push(PerformanceObserver {
-                observer: DomRoot::from_ref(observer),
+                observer: Dom::from_ref(observer),
                 entry_types,
             }),
         };
@@ -251,17 +236,15 @@ impl Performance {
     ) {
         if buffered {
             let buffer = self.buffer.borrow();
-            let mut new_entries = buffer.get_entries_by_name_and_type(None, Some(entry_type));
+            let new_entries = buffer.get_entries_by_name_and_type(None, Some(entry_type));
             if !new_entries.is_empty() {
-                let mut obs_entries = observer.entries();
-                obs_entries.append(&mut new_entries);
-                observer.set_entries(obs_entries);
+                let new_entries = new_entries.into_iter().map(|entry| entry.as_traced());
+                observer.entries_mut().extend(new_entries);
             }
 
             if !self.pending_notification_observers_task.get() {
                 self.pending_notification_observers_task.set(true);
-                let global = &self.global();
-                let owner = Trusted::new(&*global.performance());
+                let owner = Trusted::new(self);
                 self.global()
                     .task_manager()
                     .performance_timeline_task_source()
@@ -282,7 +265,7 @@ impl Performance {
             },
             // Otherwise, we create and insert the new PerformanceObserver.
             None => observers.push(PerformanceObserver {
-                observer: DomRoot::from_ref(observer),
+                observer: Dom::from_ref(observer),
                 entry_types: vec![entry_type],
             }),
         };
@@ -328,10 +311,7 @@ impl Performance {
 
         // Step 4.
         // add the new entry to the buffer.
-        self.buffer
-            .borrow_mut()
-            .entries
-            .push(DomRoot::from_ref(entry));
+        self.buffer.borrow_mut().entries.push(Dom::from_ref(entry));
 
         let entry_last_index = self.buffer.borrow_mut().entries.len() - 1;
 
@@ -345,8 +325,7 @@ impl Performance {
         // Queue a new notification task.
         self.pending_notification_observers_task.set(true);
 
-        let global = &self.global();
-        let owner = Trusted::new(&*global.performance());
+        let owner = Trusted::new(self);
         self.global()
             .task_manager()
             .performance_timeline_task_source()
@@ -396,16 +375,13 @@ impl Performance {
         // Step 1. While resource timing secondary buffer is not empty and can add resource timing entry returns true, run the following substeps:
         while self.can_add_resource_timing_entry() {
             // Step 1.1. Let entry be the oldest PerformanceResourceTiming in resource timing secondary buffer.
-            let entry = self
+            if let Some(ref entry) = self
                 .resource_timing_secondary_entries
                 .borrow_mut()
-                .pop_front();
-            if let Some(ref entry) = entry {
+                .pop_front()
+            {
                 // Step 1.2. Add entry to the end of performance entry buffer.
-                self.buffer
-                    .borrow_mut()
-                    .entries
-                    .push(DomRoot::from_ref(entry));
+                self.buffer.borrow_mut().entries.push(Dom::from_ref(entry));
                 // Step 1.3. Increment resource timing buffer current size by 1.
                 self.resource_timing_buffer_current_size
                     .set(self.resource_timing_buffer_current_size.get() + 1);
@@ -466,7 +442,7 @@ impl Performance {
         // Step 3. Add new entry to the resource timing secondary buffer.
         self.resource_timing_secondary_entries
             .borrow_mut()
-            .push_back(DomRoot::from_ref(entry));
+            .push_back(Dom::from_ref(entry));
 
         // Step 4. Increase resource timing secondary buffer current size by 1.
         //   This is tracked automatically via `.len()`.
@@ -475,7 +451,7 @@ impl Performance {
 
     pub(crate) fn update_entry(&self, index: usize, entry: &PerformanceEntry) {
         if let Some(e) = self.buffer.borrow_mut().entries.get_mut(index) {
-            *e = DomRoot::from_ref(entry);
+            *e = Dom::from_ref(entry);
         }
     }
 
@@ -497,27 +473,10 @@ impl Performance {
         // FIXME: We don't implement this value yet, so we assume it's zero (and then we don't need it at all)
 
         // Step 4. Let endTime be the value of name in the PerformanceTiming interface.
+        //
         // NOTE: We store all performance values on the document
-        let document = window.Document();
-        let end_time = match name {
-            "unloadEventStart" => document.get_unload_event_start(),
-            "unloadEventEnd" => document.get_unload_event_end(),
-            "domInteractive" => document.get_dom_interactive(),
-            "domContentLoadedEventStart" => document.get_dom_content_loaded_event_start(),
-            "domContentLoadedEventEnd" => document.get_dom_content_loaded_event_end(),
-            "domComplete" => document.get_dom_complete(),
-            "loadEventStart" => document.get_load_event_start(),
-            "loadEventEnd" => document.get_load_event_end(),
-            "redirectStart" => document.get_redirect_start(),
-            "redirectEnd" => document.get_redirect_end(),
-            "secureConnectionStart" => document.get_secure_connection_start(),
-            other => {
-                if cfg!(debug_assertions) {
-                    unreachable!("{other:?} is not the name of a timestamp");
-                }
-                return Err(Error::Operation(None));
-            },
-        };
+        let end_time = window.Document().performance_timing_attribute(name)?;
+
         // Step 5. If endTime is 0, throw an InvalidAccessError.
         let Some(end_time) = end_time else {
             return Err(Error::InvalidAccess(Some(format!(
@@ -539,22 +498,7 @@ impl Performance {
                 // Step 1. If mark is a DOMString and it has the same name as a read only attribute in the
                 // PerformanceTiming interface, let end time be the value returned by running the convert
                 // a name to a timestamp algorithm with name set to the value of mark.
-                // TODO: These aren't all fields because servo doesn't support some of them yet
-                if matches!(
-                    &*name.str(),
-                    "navigationStart" |
-                        "unloadEventStart" |
-                        "unloadEventEnd" |
-                        "domInteractive" |
-                        "domContentLoadedEventStart" |
-                        "domContentLoadedEventEnd" |
-                        "domComplete" |
-                        "loadEventStart" |
-                        "loadEventEnd" |
-                        "redirectStart" |
-                        "redirectEnd" |
-                        "secureConnectionStart"
-                ) {
+                if PERFORMANCE_TIMING_ATTRIBUTES.contains(&&*name.str()) {
                     self.convert_a_name_to_a_timestamp(&name.str())
                 }
                 // Step 2. Otherwise, if mark is a DOMString, let end time be the value of the startTime
@@ -589,21 +533,13 @@ impl Performance {
 
 impl PerformanceMethods<crate::DomTypeHolder> for Performance {
     /// <https://w3c.github.io/navigation-timing/#dom-performance-timing>
-    fn Timing(&self) -> DomRoot<PerformanceNavigationTiming> {
-        let entries = self.GetEntriesByType(DOMString::from("navigation"));
-        if !entries.is_empty() {
-            return DomRoot::from_ref(
-                entries[0]
-                    .downcast::<PerformanceNavigationTiming>()
-                    .unwrap(),
-            );
-        }
-        unreachable!("Are we trying to expose Performance.timing in workers?");
+    fn Timing(&self) -> DomRoot<PerformanceTiming> {
+        DomRoot::from_ref(&*self.timing)
     }
 
     /// <https://w3c.github.io/navigation-timing/#dom-performance-navigation>
     fn Navigation(&self) -> DomRoot<PerformanceNavigation> {
-        PerformanceNavigation::new(&self.global(), CanGc::deprecated_note())
+        DomRoot::from_ref(&*self.navigation)
     }
 
     /// <https://w3c.github.io/hr-time/#dom-performance-now>
@@ -660,11 +596,11 @@ impl PerformanceMethods<crate::DomTypeHolder> for Performance {
         &self,
         cx: &mut JSContext,
         mark_name: DOMString,
-        mark_options: RootedTraceableBox<PerformanceMarkOptions>,
+        mark_options: &PerformanceMarkOptions,
     ) -> Fallible<DomRoot<PerformanceMark>> {
         // Step 1. Run the PerformanceMark constructor and let entry be the newly created object.
         let entry =
-            PerformanceMark::new_with_proto(cx, &self.global(), None, mark_name, mark_options)?;
+            PerformanceMark::Constructor(cx, &self.global(), None, mark_name, mark_options)?;
 
         // Step 2. Queue a PerformanceEntry entry.
         // Step 3. Add entry to the performance entry buffer. (This is done in queue_entry itself)
@@ -810,11 +746,11 @@ impl PerformanceMethods<crate::DomTypeHolder> for Performance {
         // The resulting duration value MAY be negative.
 
         let entry = PerformanceMeasure::new(
+            cx,
             &self.global(),
             measure_name,
             start_time,
             end_time - start_time,
-            Default::default(),
         );
 
         // Step 9. Set entry’s detail attribute as follows:
@@ -825,15 +761,10 @@ impl PerformanceMethods<crate::DomTypeHolder> for Performance {
             !options.detail.get().is_null_or_undefined()
         {
             // Step 9.1.1. Let record be the result of calling the StructuredSerialize algorithm on startOrMeasureOptions’s detail.
-            let record = structuredclone::write(cx.into(), options.detail.handle(), None)?;
+            let record = structuredclone::write(cx, options.detail.as_handle_value(), None)?;
 
             // Step 9.1.2. Set entry’s detail to the result of calling the StructuredDeserialize algorithm on record and the current realm.
-            structuredclone::read(
-                &self.global(),
-                record,
-                detail.handle_mut(),
-                CanGc::from_cx(cx),
-            )?;
+            structuredclone::read(cx, &self.global(), record, detail.handle_mut())?;
         }
         // Step 9.2. Otherwise, set it to null.
         //
