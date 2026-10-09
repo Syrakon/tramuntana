@@ -730,6 +730,20 @@ impl DocumentEventHandler {
         self.update_current_hover_target_and_status(Some(new_target));
     }
 
+    /// A hovered element left the tree. If it was the hover target, the nearest
+    /// element still in the tree takes over, so that the next mouse move clears
+    /// the hover state of the ancestors left behind and sends them their
+    /// `mouseleave`. Walking up from a detached target would never reach them.
+    pub(crate) fn hovered_element_removed(&self, element: &Element, parent: &Node) {
+        if self.current_hover_target.get().as_deref() != Some(element) {
+            return;
+        }
+        let remaining = parent
+            .inclusive_ancestors(ShadowIncluding::Yes)
+            .find_map(DomRoot::downcast::<Element>);
+        self.current_hover_target.set(remaining.as_deref());
+    }
+
     fn update_current_hover_target_and_status(&self, new_hover_target: Option<DomRoot<Element>>) {
         let current_hover_target = self.current_hover_target.get();
         if current_hover_target == new_hover_target {

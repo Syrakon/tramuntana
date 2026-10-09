@@ -4563,6 +4563,12 @@ impl VirtualMethods for Element {
 
         let doc = self.owner_document();
 
+        if self.state.get().contains(ElementState::HOVER) {
+            self.set_hover_state(false);
+            doc.event_handler()
+                .hovered_element_removed(self, context.parent);
+        }
+
         let fullscreen = doc.fullscreen_element();
         if fullscreen.as_deref() == Some(self) {
             doc.exit_fullscreen(CanGc::from_cx(cx));
