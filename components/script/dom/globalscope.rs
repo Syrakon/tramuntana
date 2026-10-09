@@ -3172,7 +3172,17 @@ impl GlobalScope {
         // `inherited_secure_context` implements more-or-less the exact same logic, in a
         // different manner. Workers inherit whether or not their in a secure context and
         // worklets do as well (they can only be created in secure contexts).
-        if Some(false) == self.inherited_secure_context {
+        //
+        // What is inherited is the creator's: the parent of a frame, the owner of a
+        // worker. A top-level document has neither, and what `inherited_secure_context`
+        // holds for it is the page a link to it was followed from. That page says
+        // nothing about this one, which is judged by its own top-level creation URL
+        // alone, as the specification has it: otherwise an HTTPS page reached from an
+        // HTTP one, or from a page of the embedder, is not a secure context.
+        let top_level_window = self
+            .downcast::<Window>()
+            .is_some_and(|window| window.is_top_level());
+        if Some(false) == self.inherited_secure_context && !top_level_window {
             return false;
         }
         // Step 1. If environment is an environment settings object, then:
