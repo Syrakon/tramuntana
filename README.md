@@ -1,18 +1,59 @@
-# The Servo Parallel Browser Engine Project
+# tramuntana
 
-Servo is a prototype web browser engine written in the
-[Rust](https://github.com/rust-lang/rust) language. It is currently developed on
-64-bit macOS, 64-bit Linux, 64-bit Windows, 64-bit OpenHarmony, and Android.
+tramuntana is a fork of [Servo](https://github.com/servo/servo), the web
+browser engine written in [Rust](https://github.com/rust-lang/rust). It is the
+engine of rumb, a browser whose interface is drawn with
+[gpui](https://github.com/zed-industries/zed).
+
+The `main` branch is always Servo upstream with the fork's patches on top.
+[SYNCING.md](SYNCING.md) describes how upstream is merged in, by hand and by
+the weekly CI job.
+
+## What the fork adds
+
+The patches exist because rumb needs them.
+
+- **Embedding in gpui.** Servo renders offscreen and hands each frame to gpui
+  as a dma-buf, with a fence, so the page is composited without a copy. A
+  subset of gpui is vendored in `third_party/gpui`, with a scene primitive and
+  a wgpu pipeline for these external textures.
+- **Embedder API.** A request filter consulted before every fetch, user
+  stylesheets that can be swapped per WebView, user scripts per page, and
+  `registered_domain_name` re-exported. rumb builds its content blocker on
+  these.
+- **Accessibility.** gpui elements can carry accessibility metadata, exposed
+  over AT-SPI through AccessKit on Linux.
+- **Media.** Media Source Extensions, with source buffers played by the
+  GStreamer backend.
+- **Web platform.** `document.all`, the `SVGAElement` interface, and
+  `/favicon.ico` fetched when a page declares no icon.
+- **Fixes** in layout, SVG, WebGL, paint, devtools and the network stack, among
+  them cookies saved while running and not only at a clean exit.
+
+The history of `main` after the last upstream merge lists every patch.
+
+## Building
+
+tramuntana depends on a fork of Stylo, expected as a sibling directory:
+
+```sh
+git clone https://gitlab.com/syrakon/stylo.git
+git clone https://gitlab.com/syrakon/tramuntana.git
+```
+
+After that it builds like Servo; the instructions below are upstream's. The
+bridge to gpui hands frames over as dma-bufs, so that part is Linux only.
+
+## Servo
 
 Servo welcomes contribution from everyone. Check out:
 
 - The [Servo Book](https://book.servo.org) for documentation
 - [servo.org](https://servo.org/) for news and guides
 
-Coordination of Servo development happens:
-- Here in the Github Issues
-- On the [Servo Zulip](https://servo.zulipchat.com/)
-- In video calls advertised in the [Servo Project](https://github.com/servo/project/issues) repo.
+Problems that also happen in upstream Servo belong in the
+[Servo issue tracker](https://github.com/servo/servo/issues). Problems with
+the patches listed above belong in this repository.
 
 ## Getting started
 
