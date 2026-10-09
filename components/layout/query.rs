@@ -774,6 +774,9 @@ fn containing_block_for_node<'a>(node: ServoLayoutNode<'a>) -> Option<ServoLayou
     #[expect(unsafe_code)]
     while let Some(ancestor) = unsafe { current_ancestor.dangerous_flat_tree_parent() } {
         let Some((ancestor_style, ancestor_flags)) = style_and_flags_for_node(&ancestor) else {
+            // An ancestor without a box cannot be the containing block. Step past
+            // it: asking for the parent of the same node again never ends.
+            current_ancestor = ancestor;
             continue;
         };
 
