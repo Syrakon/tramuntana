@@ -1400,6 +1400,14 @@ async fn http_network_or_cache_fetch(
             .typed_insert::<UserAgent>(context.user_agent.parse().unwrap());
     }
 
+    // A reload that bypasses the cache fetches everything the page asks for
+    // again, as if each request had been made with cache mode "reload".
+    if http_request.cache_mode == CacheMode::Default &&
+        context.state.http_cache.is_bypassing(http_request)
+    {
+        http_request.cache_mode = CacheMode::Reload;
+    }
+
     // Steps 8.16 to 8.18
     append_cache_data_to_headers(http_request);
 
@@ -2196,6 +2204,7 @@ async fn http_network_fetch(
     let status = response.status.clone();
     let headers = response.headers.clone();
     let devtools_chan = context.devtools_chan.clone();
+    let aborted = response.aborted.clone();
 
     spawn_task(
         res.into_body()
@@ -2237,6 +2246,9 @@ async fn http_network_fetch(
                 future::ready(Ok(()))
             })
             .map_err(move |error| {
+                // The body ends here but is not whole. The HTTP cache shares this
+                // flag and must not hand out, or keep on disk, what was received.
+                aborted.store(true, std::sync::atomic::Ordering::Release);
                 if let std::io::ErrorKind::InvalidData = error.kind() {
                     debug!("Content decompression error for {:?}", url2);
                     let _ = done_sender3.send(Data::Error(NetworkError::DecompressionError));

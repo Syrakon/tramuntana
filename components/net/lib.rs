@@ -15,6 +15,7 @@ pub mod filemanager_thread;
 mod hosts;
 pub mod hsts;
 pub mod http_cache;
+pub mod http_disk_cache;
 pub mod http_loader;
 pub mod image_cache;
 pub mod local_directory_listing;

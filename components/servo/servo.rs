@@ -931,6 +931,7 @@ impl Servo {
                 mem_profiler_chan.clone(),
                 net_embedder_proxy,
                 opts.config_dir.clone(),
+                opts.cache_dir.clone(),
                 opts.certificate_path.clone(),
                 opts.ignore_certificate_errors,
                 protocols.clone(),

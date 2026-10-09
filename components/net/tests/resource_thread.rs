@@ -30,6 +30,7 @@ fn test_exit() {
         MemProfilerChan(mtx),
         create_generic_embedder_proxy(),
         None,
+        None,
         CACertificates::Default,
         false, /* ignore_certificate_errors */
         std::sync::Arc::new(ProtocolRegistry::default()),

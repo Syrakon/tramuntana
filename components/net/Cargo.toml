@@ -98,6 +98,7 @@ hyper-util = { workspace = true, features = ["server-graceful"] }
 # crates.io version of ourselves - we want to enable a feature of ourselves.
 net = { package = "servo-net", path = ".", features = ["test-util"] }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
+tempfile = "3"
 
 [[test]]
 name = "main"

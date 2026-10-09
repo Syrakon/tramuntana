@@ -17,6 +17,7 @@ mod file_loader;
 mod filemanager_thread;
 mod hsts;
 mod http_cache;
+mod http_disk_cache;
 mod http_loader;
 mod image_cache;
 mod resource_thread;

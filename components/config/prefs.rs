@@ -313,9 +313,14 @@ pub struct Preferences {
     /// The exact behavior is given by
     /// <https://docs.rs/hyper-util/latest/hyper_util/client/proxy/matcher/struct.Builder.html#method.no>
     pub network_http_no_proxy: String,
-    /// The weight of the http memory cache
-    /// Notice that this is not equal to the number of different urls in the cache.
+    /// The number of urls that the http memory cache is expected to hold.
+    /// This sizes the cache, it does not bound it: `network_http_cache_memory_size` does.
     pub network_http_cache_size: u64,
+    /// The bytes of response bodies that the http memory cache may hold.
+    pub network_http_cache_memory_size: u64,
+    /// The bytes that the http cache may take on disk, for embedders that
+    /// give it a directory. Zero keeps the cache in memory only.
+    pub network_http_cache_disk_size: u64,
     pub network_local_directory_listing_enabled: bool,
     /// Force the use of `rust-webpki` verification for CA roots. If this is false (the
     /// default), then `rustls-platform-verifier` will be used, except on Android where
@@ -500,6 +505,8 @@ impl Preferences {
             network_https_proxy_uri: String::new(),
             network_http_no_proxy: String::new(),
             network_http_cache_size: 5000,
+            network_http_cache_memory_size: 32 * 1024 * 1024,
+            network_http_cache_disk_size: 512 * 1024 * 1024,
             network_local_directory_listing_enabled: true,
             network_use_webpki_roots: false,
             session_history_max_length: 20,

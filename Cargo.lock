@@ -8482,6 +8482,7 @@ dependencies = [
  "servo-url",
  "servo_arc",
  "sha2",
+ "tempfile",
  "time",
  "tokio",
  "tokio-rustls",

@@ -64,6 +64,10 @@ pub struct Opts {
     /// Directory for a default config directory
     pub config_dir: Option<PathBuf>,
 
+    /// Directory for data that can be fetched again, such as the HTTP cache.
+    /// Without one, nothing of that kind is kept across restarts.
+    pub cache_dir: Option<PathBuf>,
+
     /// Use temporary storage (data on disk will not persist across restarts).
     pub temporary_storage: bool,
 
@@ -243,6 +247,7 @@ impl Default for Opts {
             sandbox: false,
             debug: Default::default(),
             config_dir: None,
+            cache_dir: None,
             temporary_storage: false,
             shaders_path: None,
             certificate_path: None,

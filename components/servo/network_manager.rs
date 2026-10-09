@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use net_traits::ResourceThreads;
+use servo_base::id::WebViewId;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheEntry {
@@ -70,10 +71,22 @@ impl NetworkManager {
     /// This removes all cached network responses maintained by the networking
     /// layer for both public and private browsing contexts.
     ///
-    /// Note: The networking layer currently only implements an in-memory HTTP
-    /// cache. Support for an on-disk cache is under development.
+    /// This includes what the cache keeps on disk under `Opts::cache_dir`.
     pub fn clear_cache(&self) {
         self.public_resource_threads.clear_cache();
         self.private_resource_threads.clear_cache();
+    }
+
+    /// Make the requests of `webview_id` stop (`true`) or start again (`false`)
+    /// using the responses in the HTTP cache. Responses fetched meanwhile are
+    /// stored and replace the ones in the cache.
+    ///
+    /// To reload a page bypassing the cache, turn this on, reload the webview
+    /// and turn it off once the load completes.
+    pub fn set_cache_bypass(&self, webview_id: WebViewId, bypassing: bool) {
+        self.public_resource_threads
+            .set_cache_bypass(webview_id, bypassing);
+        self.private_resource_threads
+            .set_cache_bypass(webview_id, bypassing);
     }
 }

@@ -30,7 +30,7 @@ use servo_base::generic_channel::{
     self, CallbackSetter, GenericCallback, GenericOneshotSender, GenericSend, GenericSender,
     SendResult,
 };
-use servo_base::id::{CookieStoreId, HistoryStateId, PipelineId};
+use servo_base::id::{CookieStoreId, HistoryStateId, PipelineId, WebViewId};
 use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
 
@@ -526,6 +526,18 @@ impl ResourceThreads {
         let _ = receiver.recv();
     }
 
+    /// Make the requests of `webview_id` stop, or start again, using the
+    /// responses stored in the HTTP cache. What they fetch meanwhile replaces
+    /// what the cache holds, which is how a reload bypasses the cache.
+    pub fn set_cache_bypass(&self, webview_id: WebViewId, bypassing: bool) {
+        if let Err(error) = self
+            .core_thread
+            .send(CoreResourceMsg::SetCacheBypass(webview_id, bypassing))
+        {
+            log::warn!("Could not set the cache bypass of {webview_id:?}: {error:?}");
+        }
+    }
+
     pub fn cookies(&self) -> Vec<SiteDescriptor> {
         let (sender, receiver) = generic_channel::channel().unwrap();
         let _ = self.core_thread.send(CoreResourceMsg::ListCookies(sender));
@@ -746,6 +758,9 @@ pub enum CoreResourceMsg {
     GetCacheEntries(GenericSender<Vec<CacheEntryDescriptor>>),
     /// Clear the network cache.
     ClearCache(Option<GenericSender<()>>),
+    /// Make the requests of a webview stop (`true`) or start again (`false`)
+    /// using the responses stored in the network cache.
+    SetCacheBypass(WebViewId, bool),
     /// Send the service worker network mediator for an origin to CoreResourceThread
     NetworkMediator(IpcSender<CustomResponseMediator>, ImmutableOrigin),
     /// Message forwarded to file manager's handler

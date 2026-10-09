@@ -94,6 +94,7 @@ pub fn new_resource_threads(
     mem_profiler_chan: MemProfilerChan,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
     config_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
     certificate_path: Option<String>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
@@ -116,6 +117,7 @@ pub fn new_resource_threads(
         mem_profiler_chan,
         embedder_proxy,
         config_dir,
+        cache_dir,
         ca_certificates,
         ignore_certificate_errors,
         protocols,
@@ -136,6 +138,7 @@ pub fn new_core_resource_thread(
     mem_profiler_chan: MemProfilerChan,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
     config_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
@@ -167,6 +170,7 @@ pub fn new_core_resource_thread(
             let mut channel_manager = ResourceChannelManager {
                 resource_manager,
                 config_dir,
+                cache_dir,
                 ca_certificates,
                 ignore_certificate_errors,
                 cancellation_listeners: Default::default(),
@@ -197,6 +201,8 @@ pub fn new_core_resource_thread(
 struct ResourceChannelManager {
     resource_manager: CoreResourceManager,
     config_dir: Option<PathBuf>,
+    /// Where the HTTP cache of the public session keeps responses on disk.
+    cache_dir: Option<PathBuf>,
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     cancellation_listeners: FxHashMap<RequestId, Weak<CancellationListener>>,
@@ -206,6 +212,7 @@ struct ResourceChannelManager {
 /// This returns a tuple HttpState and a private HttpState.
 fn create_http_states(
     config_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
@@ -229,7 +236,12 @@ fn create_http_states(
         cookie_jar: RwLock::new(cookie_jar),
         auth_cache: RwLock::new(auth_cache),
         history_states: RwLock::new(FxHashMap::default()),
-        http_cache: HttpCache::default(),
+        http_cache: HttpCache::new(cache_dir.map(|cache_dir| {
+            (
+                cache_dir.join("http"),
+                servo_config::pref!(network_http_cache_disk_size),
+            )
+        })),
         client: create_http_client(create_tls_config(
             ca_certificates.clone(),
             ignore_certificate_errors,
@@ -344,9 +356,10 @@ impl ResourceChannelManager {
     ) {
         let (public_http_state, private_http_state) = create_http_states(
             self.config_dir.as_deref(),
+            self.cache_dir.as_deref(),
             self.ca_certificates.clone(),
             self.ignore_certificate_errors,
-            embedder_proxy,
+            embedder_proxy.clone(),
         );
 
         let mut rx_set = GenericReceiverSet::new();
@@ -713,6 +726,9 @@ impl ResourceChannelManager {
                 if let Some(sender) = sender {
                     let _ = sender.send(());
                 }
+            },
+            CoreResourceMsg::SetCacheBypass(webview_id, bypassing) => {
+                http_state.http_cache.set_bypassing(webview_id, bypassing);
             },
             CoreResourceMsg::ToFileManager(msg) => self.resource_manager.filemanager.handle(msg),
             CoreResourceMsg::StorePreloadedResponse(preload_id, response) => self
