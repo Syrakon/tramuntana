@@ -927,4 +927,30 @@ mod generic_receiversets_tests {
             GenericSelectionResult::ChannelClosed(recv2_select_index)
         );
     }
+
+    #[test]
+    fn test_crossbeam_closed_receiver_is_reported_once() {
+        let (snd1, recv1) = new_generic_channel_crossbeam::<i32>();
+        let (snd2, recv2) = new_generic_channel_crossbeam();
+
+        let mut set = create_crossbeam_receiver_set();
+        let recv1_select_index = set.add(recv1);
+        let recv2_select_index = set.add(recv2);
+
+        drop(snd1);
+        assert_eq!(
+            set.select(),
+            vec![GenericSelectionResult::ChannelClosed(recv1_select_index)]
+        );
+
+        // The closed receiver must not hide the ones that are still open.
+        snd2.send(20).unwrap();
+        assert_eq!(
+            set.select(),
+            vec![GenericSelectionResult::MessageReceived(
+                recv2_select_index,
+                20
+            )]
+        );
+    }
 }

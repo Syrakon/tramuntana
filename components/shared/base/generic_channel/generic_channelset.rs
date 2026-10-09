@@ -134,18 +134,26 @@ impl<T: Serialize + for<'de> Deserialize<'de>> GenericReceiverSet<T> {
                 })
                 .unwrap_or_else(|e| vec![GenericSelectionResult::Error(e.to_string())]),
             GenericReceiverSetVariants::Crossbeam(receivers) => {
-                let mut sel = crossbeam_channel::Select::new();
-                // we need to add all the receivers to the set
-                let _selected_receivers = receivers
-                    .iter()
-                    .map(|receiver| sel.recv(receiver))
-                    .collect::<Vec<usize>>();
-                let selector = sel.select();
-                let index = selector.index();
-                let Some(receiver) = receivers.get(index) else {
-                    return vec![GenericSelectionResult::ChannelClosed(index as u64)];
+                let (index, received) = {
+                    let mut sel = crossbeam_channel::Select::new();
+                    // we need to add all the receivers to the set
+                    let _selected_receivers = receivers
+                        .iter()
+                        .map(|receiver| sel.recv(receiver))
+                        .collect::<Vec<usize>>();
+                    let selector = sel.select();
+                    let index = selector.index();
+                    let Some(receiver) = receivers.get(index) else {
+                        return vec![GenericSelectionResult::ChannelClosed(index as u64)];
+                    };
+                    (index, selector.recv(receiver))
                 };
-                let Ok(result) = selector.recv(receiver) else {
+                let Ok(result) = received else {
+                    // A disconnected receiver is always ready, so leaving it in the
+                    // set would make every later `select` return at once with this
+                    // same result. A receiver that is never ready takes its place,
+                    // which keeps the ids of the other receivers unchanged.
+                    receivers[index] = crossbeam_channel::never();
                     return vec![GenericSelectionResult::ChannelClosed(index as u64)];
                 };
 
