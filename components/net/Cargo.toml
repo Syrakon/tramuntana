@@ -78,6 +78,7 @@ servo-default-resources = { workspace = true, optional = true }
 servo-tracing = { workspace = true }
 servo-url = { workspace = true }
 servo_arc = { workspace = true }
+sha2 = { workspace = true }
 sea-query = { workspace = true }
 sea-query-rusqlite = { workspace = true }
 smallvec = { workspace = true }

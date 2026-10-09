@@ -10,7 +10,7 @@ members = [
     "tests/unit/*",
 ]
 default-members = ["ports/servoshell"]
-exclude = [".cargo", "support/crown", "third_party/gpui"]
+exclude = [".cargo", "support/crown", "third_party/gpui", "third_party/zed-font-kit"]
 
 [workspace.package]
 version = "0.7.0"
