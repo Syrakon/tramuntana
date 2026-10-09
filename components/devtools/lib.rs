@@ -399,6 +399,12 @@ impl DevtoolsInstance {
                     for connection in self.connections.lock().unwrap().values() {
                         connections.push(connection.clone());
                     }
+                    // A network event is kept for as long as the server runs, with
+                    // the body of the response inside. With no client to show it to,
+                    // that is every page ever loaded held in memory for nothing.
+                    if connections.is_empty() {
+                        continue;
+                    }
                     self.handle_network_event(connections, request_id, network_event);
                 },
                 DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::ServerExitMsg) => break,
@@ -698,9 +704,14 @@ impl DevtoolsInstance {
         pipeline_id: PipelineId,
         source_info: SourceInfo,
     ) {
-        let source_content = source_info
-            .content
-            .or_else(|| self.registry.inline_source_content(pipeline_id));
+        // The text of a source lives as long as the server does, and every inline
+        // script holds its own copy of the whole document. Without a client the
+        // actor is still made, so that the source is listed, but it holds no text.
+        let source_content = self.has_client().then_some(()).and_then(|_| {
+            source_info
+                .content
+                .or_else(|| self.registry.inline_source_content(pipeline_id))
+        });
         let source_actor = SourceActor::register(
             &self.registry,
             pipeline_id,
@@ -775,7 +786,15 @@ impl DevtoolsInstance {
         }
     }
 
+    /// Whether a client is connected. What the server records is only of use to one.
+    fn has_client(&self) -> bool {
+        !self.connections.lock().unwrap().is_empty()
+    }
+
     fn handle_update_source_content(&mut self, pipeline_id: PipelineId, source_content: String) {
+        if !self.has_client() {
+            return;
+        }
         for source_name in self.registry.source_actor_names_for_pipeline(pipeline_id) {
             let source_actor = self.registry.find::<SourceActor>(&source_name);
             let mut content = source_actor.content.borrow_mut();
