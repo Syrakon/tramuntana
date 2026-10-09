@@ -10,7 +10,8 @@ use embedder_traits::{
     ConfirmResponse, ConsoleLogLevel, ContextMenuAction, ContextMenuElementInformation,
     ContextMenuItem, Cursor, EmbedderControlId, EmbedderControlResponse, FilePickerRequest,
     FilterPattern, InputEventId, InputEventResult, InputMethodType, LoadStatus, MediaSessionEvent,
-    NewWebViewDetails, Notification, PermissionFeature, PromptResponse, RgbColor, ScreenGeometry,
+    NewWebViewDetails, Notification, PasskeyOperation, PasskeyResponse, PermissionFeature,
+    PromptResponse, RgbColor, ScreenGeometry,
     SelectElementOptionOrOptgroup, SelectElementRequest, SimpleDialogRequest, TraversalId,
     WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
 };
@@ -127,6 +128,52 @@ impl AllowOrDenyRequest {
     pub fn deny(mut self) {
         if let Err(error) = self.0.send(AllowOrDeny::Deny) {
             self.1.raise_response_send_error(error);
+        }
+    }
+}
+
+/// A page of a [`WebView`] asks for a passkey to be made or used. The embedder is
+/// the authenticator: it decides whether the page may speak for the relying party
+/// it names, asks the user, and answers with [`PasskeyRequest::respond`]. A request
+/// dropped without an answer is refused.
+pub struct PasskeyRequest {
+    origin: String,
+    operation: PasskeyOperation,
+    responder: IpcResponder<PasskeyResponse>,
+    error_sender: ServoErrorSender,
+}
+
+impl PasskeyRequest {
+    pub(crate) fn new(
+        origin: String,
+        operation: PasskeyOperation,
+        callback: GenericCallback<PasskeyResponse>,
+        error_sender: ServoErrorSender,
+    ) -> Self {
+        Self {
+            origin,
+            operation,
+            responder: IpcResponder::new_same_process(
+                Box::new(callback),
+                PasskeyResponse::Refused,
+            ),
+            error_sender,
+        }
+    }
+
+    /// The origin of the asking document, as Servo knows it: the page has no say
+    /// in this. It is always the top-level document of the [`WebView`].
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    pub fn operation(&self) -> &PasskeyOperation {
+        &self.operation
+    }
+
+    pub fn respond(mut self, response: PasskeyResponse) {
+        if let Err(error) = self.responder.send(response) {
+            self.error_sender.raise_response_send_error(error);
         }
     }
 }
@@ -988,6 +1035,10 @@ pub trait WebViewDelegate {
     /// permission from the user. The embedder should allow or deny the request, either by
     /// reading a cached value or querying the user for permission via the user interface.
     fn request_permission(&self, _webview: WebView, _request: PermissionRequest) {}
+
+    /// Content in a [`WebView`] asks for a passkey to be made or used. An embedder
+    /// with no authenticator leaves this alone, which refuses the request.
+    fn request_passkey(&self, _webview: WebView, _request: PasskeyRequest) {}
 
     fn request_authentication(
         &self,

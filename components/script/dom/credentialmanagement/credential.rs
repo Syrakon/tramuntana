@@ -62,8 +62,12 @@ impl CredentialMethods<DomTypeHolder> for Credential {
     /// <https://www.w3.org/TR/credential-management-1/#dom-credential-isconditionalmediationavailable>
     fn IsConditionalMediationAvailable(cx: &mut JSContext, _global: &Window) -> Rc<Promise> {
         let in_realm_proof = AlreadyInRealm::assert::<DomTypeHolder>();
-        // FIXME:(arihant2math) return false
-        Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), CanGc::from_cx(cx))
+        let promise =
+            Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), CanGc::from_cx(cx));
+        // No credential here is offered through autofill. A promise left
+        // pending would hang the pages that wait for this answer.
+        promise.resolve_native(&false, CanGc::from_cx(cx));
+        promise
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#dom-credential-willrequestconditionalcreation>

@@ -27,6 +27,8 @@ dictionary CredentialRequestOptions {
    // FIXME: This should be part of a partial dictionary, but that is not implemented yet
    // From PasswordCredential.webidl
    boolean password = false;
+   // From PublicKeyCredential.webidl
+   PublicKeyCredentialRequestOptions publicKey;
 };
 
 // https://www.w3.org/TR/credential-management-1/#dictdef-credentialcreationoptions
@@ -36,6 +38,8 @@ dictionary CredentialCreationOptions {
   // FIXME: This should be part of a partial dictionary, but that is not implemented yet
   // From PasswordCredential.webidl
   PasswordCredentialInit password;
+  // From PublicKeyCredential.webidl
+  PublicKeyCredentialCreationOptions publicKey;
 };
 
 // https://www.w3.org/TR/credential-management-1/#dictdef-credentialdata

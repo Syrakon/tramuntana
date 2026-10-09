@@ -4,21 +4,67 @@
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
+use embedder_traits::{EmbedderMsg, PasskeyOperation, PasskeyResponse};
+use js::context::JSContext;
 use js::realm::CurrentRealm;
 use script_bindings::codegen::GenericBindings::CredentialsContainerBinding::{
-    CredentialCreationOptions, CredentialRequestOptions,
+    CredentialCreationOptions, CredentialMediationRequirement, CredentialRequestOptions,
 };
+use script_bindings::codegen::GenericBindings::PublicKeyCredentialBinding::PublicKeyCredentialDescriptor;
 use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
 use script_bindings::error::{Error, Fallible};
 use script_bindings::reflector::{Reflector, reflect_dom_object};
+use script_bindings::trace::RootedTraceableBox;
 
 use crate::dom::bindings::codegen::Bindings::CredentialsContainerBinding::CredentialsContainerMethods;
 use crate::dom::bindings::codegen::DomTypeHolder::DomTypeHolder;
+use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
+use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
+use crate::dom::credentialmanagement::authenticatorassertionresponse::{
+    Assertion, AuthenticatorAssertionResponse,
+};
+use crate::dom::credentialmanagement::authenticatorattestationresponse::{
+    Attestation, AuthenticatorAttestationResponse,
+};
+use crate::dom::credentialmanagement::authenticatorresponse::AuthenticatorResponse;
 use crate::dom::credentialmanagement::credential::Credential;
+use crate::dom::credentialmanagement::publickeycredential::PublicKeyCredential;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
+use crate::routed_promise::{RoutedPromiseListener, callback_promise};
 use crate::script_runtime::CanGc;
+
+/// The bytes of a `BufferSource`, copied out.
+fn bytes_of(source: &ArrayBufferViewOrArrayBuffer) -> Vec<u8> {
+    match source {
+        ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
+        ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
+    }
+}
+
+/// The ids of the descriptors that name a public key credential.
+/// <https://www.w3.org/TR/webauthn-2/#dictionary-credential-descriptor>
+fn credential_ids(
+    descriptors: Option<&Vec<RootedTraceableBox<PublicKeyCredentialDescriptor>>>,
+) -> Vec<Vec<u8>> {
+    descriptors
+        .into_iter()
+        .flatten()
+        .filter(|descriptor| &*descriptor.type_.str() == "public-key")
+        .map(|descriptor| bytes_of(&descriptor.id))
+        .collect()
+}
+
+/// Whether `mediation` has the user asked nothing, which no passkey is made
+/// or used under: the embedder's authenticator always asks.
+fn without_asking(mediation: CredentialMediationRequirement) -> bool {
+    matches!(
+        mediation,
+        CredentialMediationRequirement::Silent | CredentialMediationRequirement::Conditional
+    )
+}
 
 #[dom_struct]
 pub(crate) struct CredentialsContainer {
@@ -60,7 +106,54 @@ impl CredentialsContainer {
         if options.signal.as_ref().is_some_and(|s| s.aborted()) {
             return Err(Error::Abort(None));
         }
-        Err(Error::NotSupported(None))
+        // <https://www.w3.org/TR/webauthn-2/#sctn-discover-from-external-source>
+        let Some(public_key) = options.publicKey.as_ref() else {
+            return Err(Error::NotSupported(None));
+        };
+        if without_asking(options.mediation) {
+            return Err(Error::NotAllowed(None));
+        }
+        Ok(self.ask_for_passkey(
+            cx,
+            &global,
+            PasskeyOperation::Get {
+                rp_id: public_key.rpId.as_ref().map(|id| id.to_string()),
+                challenge: bytes_of(&public_key.challenge),
+                allow: credential_ids(public_key.allowCredentials.as_ref()),
+            },
+        ))
+    }
+
+    /// Hand `operation` to the embedder's authenticator and return the promise
+    /// its answer settles.
+    ///
+    /// Only the top-level document of a webview may ask, so that the origin
+    /// sent along is the one of the page the user sees, and it is the origin
+    /// this document has, which script cannot change.
+    fn ask_for_passkey(
+        &self,
+        cx: &mut CurrentRealm,
+        global: &GlobalScope,
+        operation: PasskeyOperation,
+    ) -> Rc<Promise> {
+        let promise = Promise::new_in_realm(cx);
+        let origin = global.origin().immutable();
+        let webview_id = match global.webview_id() {
+            Some(id) if global.as_window().is_top_level() && origin.is_tuple() => id,
+            _ => {
+                promise.reject_error(Error::NotAllowed(None), CanGc::from_cx(cx));
+                return promise;
+            },
+        };
+        let task_source = global.task_manager().dom_manipulation_task_source();
+        let callback = callback_promise(&promise, self, task_source);
+        global.send_to_embedder(EmbedderMsg::RequestPasskey(
+            webview_id,
+            origin.ascii_serialization(),
+            operation,
+            callback,
+        ));
+        promise
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#abstract-opdef-store-a-credential>
@@ -84,7 +177,7 @@ impl CredentialsContainer {
     fn create_credential(
         &self,
         cx: &mut CurrentRealm,
-        _options: &CredentialCreationOptions<DomTypeHolder>,
+        options: &CredentialCreationOptions<DomTypeHolder>,
     ) -> Fallible<Rc<Promise>> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
@@ -97,7 +190,106 @@ impl CredentialsContainer {
         if !document.is_fully_active() {
             return Err(Error::InvalidState(None));
         }
-        Err(Error::NotSupported(None))
+        // <https://www.w3.org/TR/webauthn-2/#sctn-createCredential>
+        let Some(public_key) = options.publicKey.as_ref() else {
+            return Err(Error::NotSupported(None));
+        };
+        if without_asking(options.mediation) {
+            return Err(Error::NotAllowed(None));
+        }
+        let algorithms = public_key
+            .pubKeyCredParams
+            .iter()
+            .filter(|parameters| &*parameters.type_.str() == "public-key")
+            .map(|parameters| parameters.alg)
+            .collect();
+        Ok(self.ask_for_passkey(
+            cx,
+            &global,
+            PasskeyOperation::Create {
+                rp_id: public_key.rp.id.as_ref().map(|id| id.to_string()),
+                rp_name: public_key.rp.name.to_string(),
+                challenge: bytes_of(&public_key.challenge),
+                user_handle: bytes_of(&public_key.user.id),
+                user_name: public_key.user.name.to_string(),
+                display_name: public_key.user.displayName.to_string(),
+                algorithms,
+                exclude: credential_ids(public_key.excludeCredentials.as_ref()),
+            },
+        ))
+    }
+}
+
+impl RoutedPromiseListener<PasskeyResponse> for CredentialsContainer {
+    /// The embedder's authenticator answered: settle the promise of
+    /// [`CredentialsContainer::ask_for_passkey`].
+    fn handle_response(&self, cx: &mut JSContext, response: PasskeyResponse, promise: &Rc<Promise>) {
+        let can_gc = CanGc::from_cx(cx);
+        let global = self.global();
+        match response {
+            PasskeyResponse::Created {
+                credential_id,
+                client_data_json,
+                authenticator_data,
+                attestation_object,
+                public_key,
+                algorithm,
+            } => {
+                let response = AuthenticatorAttestationResponse::new(
+                    &global,
+                    Attestation {
+                        client_data_json,
+                        attestation_object,
+                        authenticator_data,
+                        public_key,
+                        algorithm,
+                    },
+                    can_gc,
+                );
+                let credential = PublicKeyCredential::new(
+                    &global,
+                    credential_id,
+                    response.upcast::<AuthenticatorResponse>(),
+                    can_gc,
+                );
+                promise.resolve_native(&credential, can_gc);
+            },
+            PasskeyResponse::Asserted {
+                credential_id,
+                client_data_json,
+                authenticator_data,
+                signature,
+                user_handle,
+            } => {
+                let response = AuthenticatorAssertionResponse::new(
+                    &global,
+                    Assertion {
+                        client_data_json,
+                        authenticator_data,
+                        signature,
+                        user_handle,
+                    },
+                    can_gc,
+                );
+                let credential = PublicKeyCredential::new(
+                    &global,
+                    credential_id,
+                    response.upcast::<AuthenticatorResponse>(),
+                    can_gc,
+                );
+                promise.resolve_native(&credential, can_gc);
+            },
+            PasskeyResponse::Refused => promise.reject_error(Error::NotAllowed(None), can_gc),
+            PasskeyResponse::WrongRelyingParty => {
+                promise.reject_error(Error::Security(None), can_gc)
+            },
+            PasskeyResponse::AlreadyRegistered => {
+                promise.reject_error(Error::InvalidState(None), can_gc)
+            },
+            PasskeyResponse::Unsupported => {
+                promise.reject_error(Error::NotSupported(None), can_gc)
+            },
+        }
     }
 }
 
@@ -106,9 +298,9 @@ impl CredentialsContainerMethods<DomTypeHolder> for CredentialsContainer {
     fn Get(
         &self,
         cx: &mut CurrentRealm,
-        options: &CredentialRequestOptions<DomTypeHolder>,
+        options: RootedTraceableBox<CredentialRequestOptions<DomTypeHolder>>,
     ) -> Fallible<Rc<Promise>> {
-        self.request_credential(cx, options)
+        self.request_credential(cx, &options)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#dom-credentialscontainer-store>
@@ -120,13 +312,17 @@ impl CredentialsContainerMethods<DomTypeHolder> for CredentialsContainer {
     fn Create(
         &self,
         cx: &mut CurrentRealm,
-        options: &CredentialCreationOptions<DomTypeHolder>,
+        options: RootedTraceableBox<CredentialCreationOptions<DomTypeHolder>>,
     ) -> Fallible<Rc<Promise>> {
-        self.create_credential(cx, options)
+        self.create_credential(cx, &options)
     }
 
     /// <https://www.w3.org/TR/credential-management-1/#dom-credentialscontainer-preventsilentaccess>
-    fn PreventSilentAccess(&self) -> Fallible<Rc<Promise>> {
-        Err(Error::NotSupported(None))
+    fn PreventSilentAccess(&self, cx: &mut CurrentRealm) -> Fallible<Rc<Promise>> {
+        // No credential here is ever given without asking the user, so there
+        // is no silent access to prevent. Pages call this when signing out.
+        let promise = Promise::new_in_realm(cx);
+        promise.resolve_native(&(), CanGc::from_cx(cx));
+        Ok(promise)
     }
 }

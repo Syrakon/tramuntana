@@ -298,6 +298,69 @@ pub enum AllowOrDeny {
     Deny,
 }
 
+/// What a page asks of the embedder's passkey authenticator, through
+/// `navigator.credentials.create()` or `navigator.credentials.get()` with a
+/// `publicKey` member.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum PasskeyOperation {
+    /// Make a passkey for an account of the relying party.
+    Create {
+        /// The relying party id the page asked for, if it named one.
+        rp_id: Option<String>,
+        rp_name: String,
+        challenge: Vec<u8>,
+        user_handle: Vec<u8>,
+        user_name: String,
+        display_name: String,
+        /// The COSE algorithms the page takes, most wanted first.
+        algorithms: Vec<i32>,
+        /// Credential ids the relying party already has for this user.
+        exclude: Vec<Vec<u8>>,
+    },
+    /// Sign a challenge with a passkey of the relying party.
+    Get {
+        /// The relying party id the page asked for, if it named one.
+        rp_id: Option<String>,
+        challenge: Vec<u8>,
+        /// The credential ids the page takes; empty means any.
+        allow: Vec<Vec<u8>>,
+    },
+}
+
+/// The embedder's answer to a [`PasskeyOperation`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum PasskeyResponse {
+    /// A passkey was made.
+    Created {
+        credential_id: Vec<u8>,
+        client_data_json: Vec<u8>,
+        authenticator_data: Vec<u8>,
+        attestation_object: Vec<u8>,
+        /// The public key as SubjectPublicKeyInfo.
+        public_key: Vec<u8>,
+        /// The COSE algorithm of the public key.
+        algorithm: i32,
+    },
+    /// A passkey signed the challenge.
+    Asserted {
+        credential_id: Vec<u8>,
+        client_data_json: Vec<u8>,
+        authenticator_data: Vec<u8>,
+        signature: Vec<u8>,
+        user_handle: Vec<u8>,
+    },
+    /// The user said no, or there is nothing to offer: a `NotAllowedError`.
+    Refused,
+    /// The page may not speak for the relying party it named: a `SecurityError`.
+    WrongRelyingParty,
+    /// The authenticator already holds one of the excluded credentials: an
+    /// `InvalidStateError`.
+    AlreadyRegistered,
+    /// The authenticator has none of the algorithms the page takes: a
+    /// `NotSupportedError`.
+    Unsupported,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 /// Whether a protocol handler is requested to be registered or unregistered.
 pub enum RegisterOrUnregister {
@@ -486,6 +549,15 @@ pub enum EmbedderMsg {
     /// with the user's decision, which resolves or rejects the pending promise
     /// without blocking the script thread.
     RequestWakeLockPermission(WebViewId, GenericCallback<AllowOrDeny>),
+    /// A page asks for a passkey to be made or used. The string is the origin of
+    /// the asking document, which is the top-level one of its webview. The
+    /// callback settles the pending promise without blocking the script thread.
+    RequestPasskey(
+        WebViewId,
+        String,
+        PasskeyOperation,
+        GenericCallback<PasskeyResponse>,
+    ),
     /// Report the status of Devtools Server with a token that can be used to bypass the permission prompt.
     OnDevtoolsStarted(Result<u16, ()>, String),
     /// Ask the user to allow a devtools client to connect.
