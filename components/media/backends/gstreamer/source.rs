@@ -11,7 +11,7 @@ use gstreamer::prelude::*;
 use gstreamer::subclass::prelude::*;
 use url::Url;
 
-const MAX_SRC_QUEUE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB.
+const MAX_SRC_QUEUE_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB.
 
 // Implementation sub-module of the GObject
 mod imp {
@@ -302,6 +302,9 @@ mod imp {
 
             self.appsrc.set_caps(None::<&gstreamer::Caps>);
             self.appsrc.set_max_bytes(MAX_SRC_QUEUE_SIZE);
+            // Ask for more data when half of the queue is left, which leaves the time to fetch
+            // it before the queue runs out.
+            self.appsrc.set_min_percent(50);
             self.appsrc.set_block(false);
             self.appsrc.set_format(gstreamer::Format::Bytes);
             self.appsrc

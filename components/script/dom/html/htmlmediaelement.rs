@@ -583,6 +583,9 @@ pub(crate) struct HTMLMediaElement {
     event_handler: RefCell<Option<Arc<Mutex<HTMLMediaElementEventHandler>>>>,
     /// <https://html.spec.whatwg.org/multipage/#show-poster-flag>
     show_poster: Cell<bool>,
+    /// Whether the resource fetch algorithm stopped before fetching anything, because of
+    /// `preload="none"`. See `load_can_wait_for_playback`.
+    load_deferred: Cell<bool>,
     /// <https://html.spec.whatwg.org/multipage/#dom-media-duration>
     duration: Cell<f64>,
     /// <https://html.spec.whatwg.org/multipage/#current-playback-position>
@@ -700,6 +703,7 @@ impl HTMLMediaElement {
             audio_renderer: Default::default(),
             event_handler: Default::default(),
             show_poster: Cell::new(true),
+            load_deferred: Cell::new(false),
             duration: Cell::new(f64::NAN),
             current_playback_position: Cell::new(0.),
             official_playback_position: Cell::new(0.),
@@ -888,6 +892,7 @@ impl HTMLMediaElement {
         // Step 5. Set the media element's can autoplay flag to false.
         self.autoplaying.set(false);
 
+        self.resume_waiting_load();
         self.update_media_state();
     }
 
@@ -1531,6 +1536,7 @@ impl HTMLMediaElement {
 
         *current_fetch_context = Some(HTMLMediaElementFetchContext::new(
             request.id,
+            offset.unwrap_or(0),
             global.core_resource_thread(),
         ));
         let listener =
@@ -1572,6 +1578,97 @@ impl HTMLMediaElement {
         // TODO: Feature policy: https://html.spec.whatwg.org/iframe-embed-object.html#allowed-to-use
     }
 
+    /// Whether nothing has asked for playback yet, so that the `preload` attribute decides how
+    /// much of the media resource is fetched: nothing with `none`, and what it takes to show the
+    /// first frame with `metadata`.
+    /// <https://html.spec.whatwg.org/multipage/#attr-media-preload>
+    fn load_can_wait_for_playback(&self) -> bool {
+        // The can autoplay flag is true until `play()` or `pause()` is called.
+        self.autoplaying.get() && self.Paused() && !self.Autoplay()
+    }
+
+    /// Whether the fetch of the media resource should stop here, with the first frame already
+    /// decoded, until playback is asked for.
+    fn load_should_suspend(&self) -> bool {
+        self.Preload() != "auto" &&
+            self.load_can_wait_for_playback() &&
+            self.ready_state.get() >= ReadyState::HaveCurrentData &&
+            !self.seeking.get() &&
+            self.media_source.get().is_none()
+    }
+
+    /// Carry on with a load that `preload` held back, once the element is asked to play or the
+    /// attributes no longer ask to wait.
+    fn resume_waiting_load(&self) {
+        let can_wait = self.load_can_wait_for_playback();
+
+        if self.load_deferred.get() {
+            if can_wait && self.Preload() == "none" {
+                return;
+            }
+            self.load_deferred.set(false);
+
+            let Some(url) = self.resource_url.borrow().clone() else {
+                return;
+            };
+            if let Err(e) = self.create_media_player(&Resource::Url(url)) {
+                error!("Create media player error {:?}", e);
+                self.resource_selection_algorithm_failure_steps();
+                return;
+            }
+            self.network_state.set(NetworkState::Loading);
+            self.fetch_request(None, None);
+            return;
+        }
+
+        if can_wait && self.Preload() != "auto" {
+            return;
+        }
+        let suspended = self
+            .current_fetch_context
+            .borrow()
+            .as_ref()
+            .is_some_and(|current_fetch_context| {
+                *current_fetch_context.cancel_reason() == Some(CancelReason::Suspend)
+            });
+        if suspended {
+            self.network_state.set(NetworkState::Loading);
+            self.continue_fetch();
+        }
+    }
+
+    /// Fetch again from the first byte of the media resource that the media player has not been
+    /// given, after the previous fetch was cancelled.
+    fn continue_fetch(&self) {
+        let Some((start_offset, next_offset, resource_length)) = self
+            .current_fetch_context
+            .borrow()
+            .as_ref()
+            .map(|current_fetch_context| {
+                let data_source = current_fetch_context.data_source().borrow();
+                (
+                    data_source.start_offset,
+                    data_source.next_offset(),
+                    current_fetch_context.resource_length,
+                )
+            })
+        else {
+            return;
+        };
+        self.fetch_request(Some(next_offset), None);
+
+        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() {
+            current_fetch_context.resource_length = resource_length;
+
+            let mut data_source = current_fetch_context.data_source().borrow_mut();
+            // The media player keeps what it was given before the fetch was cancelled.
+            data_source.start_offset = start_offset;
+            // The media player is already waiting for this data and will not signal NeedData
+            // again before it gets some.
+            data_source.set_locked(false);
+        }
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
     fn resource_fetch_algorithm(&self, resource: Resource) {
         // <https://w3c.github.io/media-source/#mediasource-attach>
@@ -1584,7 +1681,13 @@ impl HTMLMediaElement {
             resource => resource,
         };
 
-        if let Err(e) = self.create_media_player(&resource) {
+        // With `preload="none"` nothing is fetched until playback is asked for, so the media
+        // player is not needed until then either.
+        let defer_load = matches!(resource, Resource::Url(_)) &&
+            self.Preload() == "none" &&
+            self.load_can_wait_for_playback();
+
+        if !defer_load && let Err(e) = self.create_media_player(&resource) {
             error!("Create media player error {:?}", e);
             self.resource_selection_algorithm_failure_steps();
             return;
@@ -1604,7 +1707,10 @@ impl HTMLMediaElement {
                 // behavior if the user agent intends to not attempt to fetch the resource until the
                 // user requests it explicitly (e.g. as a way to implement the preload attribute's
                 // none keyword).
-                if self.Preload() == "none" && !self.autoplaying.get() {
+                if defer_load {
+                    *self.resource_url.borrow_mut() = Some(url);
+                    self.load_deferred.set(true);
+
                     // Step 5.remote.1.1. Set the networkState to NETWORK_IDLE.
                     self.network_state.set(NetworkState::Idle);
 
@@ -1634,10 +1740,8 @@ impl HTMLMediaElement {
                     // FIXME(nox): Somehow we should wait for the task from previous
                     // step to be ran before continuing.
 
-                    // TODO Steps 5.remote.1.5-5.remote.1.7.
-                    // FIXME(nox): Wait for an implementation-defined event and
-                    // then continue with the normal set of steps instead of just
-                    // returning.
+                    // Steps 5.remote.1.5-5.remote.1.7. The implementation-defined event is the
+                    // element being asked to play, see `resume_waiting_load`.
                     return;
                 }
 
@@ -1832,6 +1936,7 @@ impl HTMLMediaElement {
 
         // Reset the media player for any previously playing media resource (see Step 11).
         self.reset_media_player();
+        self.load_deferred.set(false);
 
         // Step 7. If the media element's networkState is not set to NETWORK_EMPTY, then:
         if network_state != NetworkState::Empty {
@@ -2795,19 +2900,16 @@ impl HTMLMediaElement {
         // The media engine signals that the source needs more data. If we already have a valid
         // fetch request, we do nothing. Otherwise, if we have no request and the previous request
         // was cancelled because we got an EnoughData event, we restart fetching where we left.
-        if let Some(ref current_fetch_context) = *self.current_fetch_context.borrow() &&
-            let Some(reason) = current_fetch_context.cancel_reason()
-        {
-            // XXX(ferjm) Ideally we should just create a fetch request from
-            // where we left. But keeping track of the exact next byte that the
-            // media backend expects is not the easiest task, so I'm simply
-            // seeking to the current playback position for now which will create
-            // a new fetch request for the last rendered frame.
-            if *reason == CancelReason::Backoff {
-                self.seek(
-                    self.current_playback_position.get(),
-                    /* approximate_for_speed */ false,
-                );
+        let cancel_reason = match *self.current_fetch_context.borrow() {
+            Some(ref current_fetch_context) => match current_fetch_context.cancel_reason() {
+                Some(reason) => Some(*reason == CancelReason::Backoff),
+                None => None,
+            },
+            None => None,
+        };
+        if let Some(backed_off) = cancel_reason {
+            if backed_off {
+                self.continue_fetch();
             }
             return;
         }
@@ -3346,8 +3448,8 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
         Preload,
         "preload",
         "none" | "metadata" | "auto",
-        missing => "auto",
-        invalid => "auto"
+        missing => "metadata",
+        invalid => "metadata"
     );
 
     // https://html.spec.whatwg.org/multipage/#attr-media-preload
@@ -3560,6 +3662,28 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
                 let _ = buffered.add(range.start, range.end);
             }
         }
+
+        // The media player does not know what was fetched of a resource it is given piece by
+        // piece. The part it was given is where playback can go on from without fetching more,
+        // and its place in time is told from its place in the resource, which is right as far as
+        // the bit rate is constant.
+        let duration = self.duration.get();
+        if buffered.is_empty() &&
+            self.media_source.get().is_none() &&
+            duration.is_finite() &&
+            let Some(ref current_fetch_context) = *self.current_fetch_context.borrow() &&
+            let Some(resource_length) = current_fetch_context.resource_length &&
+            resource_length > 0
+        {
+            let data_source = current_fetch_context.data_source().borrow();
+            let time_of = |offset: u64| {
+                duration * (offset.min(resource_length) as f64 / resource_length as f64)
+            };
+            let _ = buffered.add(
+                time_of(data_source.start_offset),
+                time_of(data_source.next_offset()),
+            );
+        }
         TimeRanges::new(self.global().as_window(), buffered, can_gc)
     }
 
@@ -3689,6 +3813,7 @@ impl VirtualMethods for HTMLMediaElement {
                     self.media_element_load_algorithm(cx);
                 }
             },
+            local_name!("autoplay") | local_name!("preload") => self.resume_waiting_load(),
             local_name!("controls") => {
                 if mutation.new_value(attr).is_some() {
                     self.render_controls(cx);
@@ -3836,14 +3961,25 @@ struct BufferedDataSource {
     locked: Cell<bool>,
     /// Temporary storage for incoming data.
     buffers: VecDeque<DataBuffer>,
+    /// The offset in the media resource of the first byte the media player was given since it
+    /// last asked for another position.
+    start_offset: u64,
+    /// The offset in the media resource of the next byte the media player has not been given.
+    next_offset: u64,
 }
 
 impl BufferedDataSource {
-    fn new() -> BufferedDataSource {
+    fn new(offset: u64) -> BufferedDataSource {
         BufferedDataSource {
             locked: Cell::new(true),
             buffers: VecDeque::default(),
+            start_offset: offset,
+            next_offset: offset,
         }
+    }
+
+    fn next_offset(&self) -> u64 {
+        self.next_offset
     }
 
     fn set_locked(&self, locked: bool) {
@@ -3872,10 +4008,12 @@ impl BufferedDataSource {
         while let Some(buffer) = self.buffers.pop_front() {
             match buffer {
                 DataBuffer::Payload(payload) => {
+                    let length = payload.len() as u64;
                     if let Err(error) = player.lock().unwrap().push_data(payload) {
                         warn!("Could not push input data to player: {error:?}");
                         return Err(error);
                     }
+                    self.next_offset += length;
                 },
                 DataBuffer::EndOfStream => {
                     if let Err(error) = player.lock().unwrap().end_of_stream() {
@@ -3900,6 +4038,8 @@ impl BufferedDataSource {
 enum CancelReason {
     /// We were asked to stop pushing data to the player.
     Backoff,
+    /// The `preload` attribute asks not to fetch more until the element is played.
+    Suspend,
     /// An error ocurred while fetching the media data.
     Error,
     /// The fetching process is aborted by the user.
@@ -3916,6 +4056,8 @@ pub(crate) struct HTMLMediaElementFetchContext {
     is_seekable: bool,
     /// Indicates whether the fetched stream is origin clean.
     origin_clean: bool,
+    /// The size in bytes of the media resource, once the response tells it.
+    resource_length: Option<u64>,
     /// The buffered data source which to be processed by media backend.
     data_source: RefCell<BufferedDataSource>,
     /// Fetch canceller. Allows cancelling the current fetch request by
@@ -3926,6 +4068,7 @@ pub(crate) struct HTMLMediaElementFetchContext {
 impl HTMLMediaElementFetchContext {
     fn new(
         request_id: RequestId,
+        offset: u64,
         core_resource_thread: CoreResourceThread,
     ) -> HTMLMediaElementFetchContext {
         HTMLMediaElementFetchContext {
@@ -3933,7 +4076,8 @@ impl HTMLMediaElementFetchContext {
             cancel_reason: None,
             is_seekable: false,
             origin_clean: true,
-            data_source: RefCell::new(BufferedDataSource::new()),
+            resource_length: None,
+            data_source: RefCell::new(BufferedDataSource::new(offset)),
             fetch_canceller: FetchCanceller::new(request_id, false, core_resource_thread),
         }
     }
@@ -4066,6 +4210,10 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
             }
         }
 
+        if let Some(ref mut current_fetch_context) = *element.current_fetch_context.borrow_mut() {
+            current_fetch_context.resource_length = self.expected_content_length;
+        }
+
         // Explicit media player initialization with live/seekable source.
         if let Some(expected_content_length) = self.expected_content_length &&
             let Err(e) = element
@@ -4094,6 +4242,20 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
         // If an error was received previously, we skip processing the payload.
         if let Some(ref mut current_fetch_context) = *element.current_fetch_context.borrow_mut() {
             if let Some(CancelReason::Backoff) = current_fetch_context.cancel_reason() {
+                return;
+            }
+
+            // The fetch can only be carried on later from where it stops with range requests.
+            if current_fetch_context.is_seekable() && element.load_should_suspend() {
+                current_fetch_context.cancel(CancelReason::Suspend);
+
+                // <https://html.spec.whatwg.org/multipage/#concept-media-load-resource>
+                // If the user agent ever discards any media data and then needs to resume the
+                // network activity to obtain it again, then it must queue a media element task
+                // given the media element to set the networkState to NETWORK_LOADING. Until then
+                // the networkState is NETWORK_IDLE and a suspend event is fired.
+                element.network_state.set(NetworkState::Idle);
+                element.queue_media_element_task_to_fire_event(atom!("suspend"));
                 return;
             }
 
@@ -4232,7 +4394,10 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
         // Whether the current fetch request was cancelled due to a network or decoding error, or
         // was aborted by the user.
         if let Some(cancel_reason) = current_fetch_context.cancel_reason() &&
-            matches!(*cancel_reason, CancelReason::Error | CancelReason::Abort)
+            matches!(
+                *cancel_reason,
+                CancelReason::Error | CancelReason::Abort | CancelReason::Suspend
+            )
         {
             return false;
         }

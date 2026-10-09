@@ -624,37 +624,10 @@ impl GStreamerPlayer {
         let signal_adapter = gstreamer_play::PlaySignalAdapter::new_sync_emit(&player);
         let pipeline = player.pipeline();
 
-        // FIXME(#282): The progressive downloading breaks playback on Windows and Android.
-        if !cfg!(any(target_os = "windows", target_os = "android")) &&
-            self.stream_type != StreamType::MediaSource
-        {
-            // Set player to perform progressive downloading. This will make the
-            // player store the downloaded media in a local temporary file for
-            // faster playback of already-downloaded chunks.
-            let flags = pipeline.property_value("flags");
-            let flags_class = match glib::FlagsClass::with_type(flags.type_()) {
-                Some(flags) => flags,
-                None => {
-                    return Err(PlayerError::Backend(
-                        "FlagsClass creation failed".to_owned(),
-                    ));
-                },
-            };
-            let flags_class = match flags_class.builder_with_value(flags) {
-                Some(class) => class,
-                None => {
-                    return Err(PlayerError::Backend(
-                        "FlagsClass creation failed".to_owned(),
-                    ));
-                },
-            };
-            let Some(flags) = flags_class.set_by_nick("download").build() else {
-                return Err(PlayerError::Backend(
-                    "FlagsClass creation failed".to_owned(),
-                ));
-            };
-            pipeline.set_property_from_value("flags", &flags);
-        }
+        // The progressive downloading of playbin is not used: its download buffer cannot give
+        // the end of the media resource, which is looked at to find its type, before it has
+        // all of it, so nothing could be played or even known about the media before the
+        // download was over. The data is fetched again if it is ever needed again.
 
         // Set max size for the player buffer.
         pipeline.set_property("buffer-size", MAX_BUFFER_SIZE);
