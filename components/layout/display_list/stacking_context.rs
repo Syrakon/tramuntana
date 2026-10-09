@@ -688,6 +688,23 @@ impl StackingContext {
             if let Some(clip_chain_id) = clip_chain_id {
                 common.clip_chain_id = clip_chain_id;
             }
+            // The backdrop is filtered inside the border edge, rounded corners
+            // included. WebRender only clips the item to `clip_rect`, so the
+            // radii need a clip of their own on top of the inherited chain.
+            let radii = fragment.border_radius();
+            if !radii.is_zero() {
+                let rounded_clip = builder.wr().define_clip_rounded_rect(
+                    spatial_id,
+                    wr::ComplexClipRegion {
+                        rect: border_rect,
+                        radii,
+                        mode: wr::ClipMode::Clip,
+                    },
+                );
+                common.clip_chain_id = builder
+                    .wr()
+                    .define_clip_chain(clip_chain_id, [rounded_clip]);
+            }
             builder
                 .wr()
                 .push_backdrop_filter(&common, &backdrop_filters, &[], &[]);
