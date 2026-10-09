@@ -125,6 +125,7 @@ use crate::dom::bindings::conversions::{
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
+use crate::dom::refuse_canvas_readback;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::csp::{CspReporting, GlobalCspReporting, Violation};
 use crate::dom::customelementregistry::{
@@ -876,6 +877,7 @@ impl ScriptThread {
         image_cache_factory: Arc<dyn ImageCacheFactory>,
         background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
     ) -> (Rc<ScriptThread>, js::context::JSContext) {
+        refuse_canvas_readback(state.temporary_session);
         let (self_sender, self_receiver) = unbounded();
         let mut runtime =
             Runtime::new(Some(ScriptEventLoopSender::MainThread(self_sender.clone())));

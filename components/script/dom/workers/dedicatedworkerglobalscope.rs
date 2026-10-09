@@ -40,6 +40,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
+use crate::dom::{canvas_readback_refused, refuse_canvas_readback};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::structuredclone;
 use crate::dom::bindings::trace::{CustomTraceable, RootedTraceableBox};
@@ -394,11 +395,13 @@ impl DedicatedWorkerGlobalScope {
         let worker_type = worker_options.type_;
         let worker_name = worker_options.name.to_string();
         let credentials = worker_options.credentials.convert();
+        let refuse_readback = canvas_readback_refused();
 
         thread::Builder::new()
             .name(format!("WW:{}", worker_url.debug_compact()))
             .spawn(move || {
                 thread_state::initialize(ThreadState::SCRIPT | ThreadState::IN_WORKER);
+                refuse_canvas_readback(refuse_readback);
                 ScriptEventLoopId::install(event_loop_id);
 
                 let WorkerScriptLoadOrigin {

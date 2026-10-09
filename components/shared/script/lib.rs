@@ -408,6 +408,10 @@ pub struct InitialScriptState {
     pub player_context: WindowGLContext,
     /// A list of URLs that can access privileged internal APIs.
     pub privileged_urls: Vec<ServoUrl>,
+    /// Whether the pages of this event loop are in a temporary session. Such
+    /// pages are kept from what tells one machine from another: they cannot read
+    /// back what a canvas drew.
+    pub temporary_session: bool,
     /// A copy of constellation's `UserContentManagerId` to `UserContents` map.
     pub user_contents_for_manager_id: FxHashMap<UserContentManagerId, UserContents>,
 }

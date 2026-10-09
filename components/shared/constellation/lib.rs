@@ -72,6 +72,9 @@ pub enum EmbedderToConstellationMessage {
     NewWebView(ServoUrl, NewWebViewDetails),
     /// Close a top level browsing context.
     CloseWebView(WebViewId),
+    /// End the temporary session with this id and forget what it stored. If
+    /// some of its webviews are still open, it ends when the last one closes.
+    CloseTemporarySession(u64),
     /// Panic a top level browsing context.
     SendError(Option<WebViewId>, String),
     /// Make a webview focused. [EmbedderMsg::WebViewFocused] will be sent with

@@ -1182,6 +1182,18 @@ impl ScriptToEmbedderChan {
     }
 }
 
+/// A browsing session of its own, kept only in memory: its cookies, HTTP cache
+/// and site storage are shared with no other session, and are gone once the
+/// embedder closes it. The embedder picks the `id`; every `WebView` created
+/// with the same `id` belongs to the same session.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TemporarySession {
+    pub id: u64,
+    /// Whether the session stores the cookies that sites set. When `false`
+    /// its cookie jar stays empty.
+    pub accept_cookies: bool,
+}
+
 /// Used for communicating the details of a new `WebView` created by the embedder
 /// back to the constellation.
 #[derive(Deserialize, Serialize)]
@@ -1189,6 +1201,9 @@ pub struct NewWebViewDetails {
     pub webview_id: WebViewId,
     pub viewport_details: ViewportDetails,
     pub user_content_manager_id: Option<UserContentManagerId>,
+    /// The temporary session this `WebView` belongs to, if it is not part of
+    /// the embedder's ordinary one.
+    pub session: Option<TemporarySession>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

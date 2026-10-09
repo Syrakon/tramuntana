@@ -770,6 +770,12 @@ pub enum CoreResourceMsg {
     /// Break the load handler loop, send a reply when done cleaning up local resources
     /// and exit
     Exit(GenericOneshotSender<()>),
+    /// Start a session of its own that lives only in memory: cookies, HTTP
+    /// cache, HSTS list and credentials shared with no other session. The
+    /// `bool` is whether the session stores the cookies that sites set. The
+    /// reply is the channel of the new session, or `None` if it could not be
+    /// created. The session ends when every sender of that channel is gone.
+    NewTemporarySession(bool, GenericSender<Option<CoreResourceThread>>),
     CollectMemoryReport(ReportsChan),
     RevokeTokenForFile(BlobTokenRevocationRequest),
     RefreshTokenForFile(BlobTokenRefreshRequest),

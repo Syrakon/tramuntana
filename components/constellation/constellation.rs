@@ -111,7 +111,8 @@ use embedder_traits::{
     GenericEmbedderProxy, InputEvent, InputEventAndId, InputEventOutcome, JSValue,
     JavaScriptEvaluationError, JavaScriptEvaluationId, KeyboardEvent, MediaSessionActionType,
     MediaSessionEvent, MediaSessionPlaybackState, MouseButton, MouseButtonAction, MouseButtonEvent,
-    NewWebViewDetails, PaintHitTestResult, Theme, ViewportDetails, WakeLockDelegate, WakeLockType,
+    NewWebViewDetails, PaintHitTestResult, TemporarySession, Theme, ViewportDetails,
+    WakeLockDelegate, WakeLockType,
     WebDriverCommandMsg, WebDriverLoadStatus, WebDriverScriptCommand,
 };
 use euclid::Size2D;
@@ -142,7 +143,7 @@ use script_traits::{
 };
 use servo_background_hang_monitor::HangMonitorRegister;
 use servo_base::generic_channel::{
-    GenericCallback, GenericSend, GenericSender, RoutedReceiver, SendError,
+    GenericCallback, GenericReceiver, GenericSend, GenericSender, RoutedReceiver, SendError,
 };
 use servo_base::id::{
     BrowsingContextGroupId, BrowsingContextId, CONSTELLATION_PIPELINE_NAMESPACE_ID,
@@ -362,6 +363,22 @@ pub struct Constellation<STF, SWF> {
     /// browsing.
     pub(crate) private_storage_threads: StorageThreads,
 
+    /// The resource and storage threads of each live temporary session, by
+    /// the id the embedder gave it. No other session uses them.
+    temporary_sessions: FxHashMap<u64, (ResourceThreads, StorageThreads)>,
+
+    /// The temporary session of each webview that is in one. A closed webview
+    /// stays here until its last pipeline has exited, since until then a
+    /// script thread may still use the threads of the session.
+    webview_sessions: FxHashMap<WebViewId, u64>,
+
+    /// The temporary sessions that the embedder closed while they were still
+    /// in use. Each ends when the last of its webviews is gone.
+    closing_temporary_sessions: FxHashSet<u64>,
+
+    /// Makes the storage threads of a new temporary session.
+    temporary_storage_factory: TemporaryStorageFactory,
+
     /// A channel for the constellation to send messages to the font
     /// cache thread.
     pub(crate) system_font_service: Arc<SystemFontServiceProxy>,
@@ -568,6 +585,9 @@ pub struct InitialConstellationState {
     /// A channel to the storage thread.
     pub private_storage_threads: StorageThreads,
 
+    /// Makes the storage threads of a new temporary session.
+    pub temporary_storage_factory: TemporaryStorageFactory,
+
     /// A channel to the time profiler thread.
     pub time_profiler_chan: time::ProfilerChan,
 
@@ -595,6 +615,10 @@ pub struct InitialConstellationState {
     /// The wake lock provider for acquiring and releasing OS-level screen wake locks.
     pub wake_lock_provider: Box<dyn WakeLockDelegate>,
 }
+
+/// Makes the storage threads of a new temporary session, given the id of the
+/// session. They must start empty and write nothing to the profile.
+pub type TemporaryStorageFactory = Box<dyn Fn(u64) -> StorageThreads + Send>;
 
 /// When we are exiting a pipeline, we can either force exiting or not. A normal exit
 /// waits for `Paint` to update its state before exiting, and delegates layout exit to
@@ -707,6 +731,10 @@ where
                     private_resource_threads: state.private_resource_threads,
                     public_storage_threads: state.public_storage_threads,
                     private_storage_threads: state.private_storage_threads,
+                    temporary_sessions: Default::default(),
+                    webview_sessions: Default::default(),
+                    closing_temporary_sessions: Default::default(),
+                    temporary_storage_factory: state.temporary_storage_factory,
                     system_font_service: state.system_font_service,
                     sw_managers: Default::default(),
                     swmanager_receiver,
@@ -1014,7 +1042,7 @@ where
             return Ok(event_loop);
         }
 
-        let event_loop = EventLoop::spawn(self, is_private)?;
+        let event_loop = EventLoop::spawn(self, webview_id, is_private)?;
         if let Some(registered_domain_name) = registered_domain_name {
             self.set_event_loop(&event_loop, registered_domain_name, webview_id, opener);
         }
@@ -1454,6 +1482,9 @@ where
             EmbedderToConstellationMessage::CloseWebView(webview_id) => {
                 self.handle_close_top_level_browsing_context(webview_id);
             },
+            EmbedderToConstellationMessage::CloseTemporarySession(session_id) => {
+                self.handle_close_temporary_session(session_id);
+            },
             // Panic a top level browsing context.
             EmbedderToConstellationMessage::SendError(webview_id, error) => {
                 warn!("Constellation got a SendError message from WebView {webview_id:?}: {error}");
@@ -1809,8 +1840,9 @@ where
                 {
                     return warn!("Attempt to add channel name from an unexpected origin.");
                 }
+                let session = self.temporary_session_of(source_pipeline_id);
                 self.broadcast_channels
-                    .new_broadcast_channel_name_in_router(router_id, channel_name, origin);
+                    .new_broadcast_channel_name_in_router(router_id, channel_name, origin, session);
             },
             ScriptToConstellationMessage::RemoveBroadcastChannelNameInRouter(
                 router_id,
@@ -1823,8 +1855,13 @@ where
                 {
                     return warn!("Attempt to remove channel name from an unexpected origin.");
                 }
-                self.broadcast_channels
-                    .remove_broadcast_channel_name_in_router(router_id, channel_name, origin);
+                let session = self.temporary_session_of(source_pipeline_id);
+                self.broadcast_channels.remove_broadcast_channel_name_in_router(
+                    router_id,
+                    channel_name,
+                    origin,
+                    session,
+                );
             },
             ScriptToConstellationMessage::RemoveBroadcastChannelRouter(router_id, origin) => {
                 if self
@@ -1845,8 +1882,9 @@ where
                         "Attempt to schedule broadcast from an origin not matching the origin of the msg."
                     );
                 }
+                let session = self.temporary_session_of(source_pipeline_id);
                 self.broadcast_channels
-                    .schedule_broadcast(router_id, message);
+                    .schedule_broadcast(router_id, message, session);
             },
             ScriptToConstellationMessage::PipelineExited => {
                 self.handle_pipeline_exited(source_pipeline_id);
@@ -2693,8 +2731,15 @@ where
         .iter()
         .filter_map(|interested_id| self.pipelines.get(interested_id));
 
+        let session = self.webview_sessions.get(&source_pipeline.webview_id);
         for pipeline in interested {
             if pipeline.id == pipeline_id || pipeline.url.origin() != origin {
+                continue;
+            }
+
+            // A temporary session has storage of its own: what changes in it is
+            // told to its own pages and to no others.
+            if self.webview_sessions.get(&pipeline.webview_id) != session {
                 continue;
             }
 
@@ -2850,6 +2895,15 @@ where
             }
         }
 
+        debug!("Exiting the storage threads of temporary sessions.");
+        let mut temporary_client_storage_receivers = Vec::new();
+        for (session_id, (_resource_threads, storage_threads)) in self.temporary_sessions.drain() {
+            temporary_client_storage_receivers.extend(Self::exit_temporary_storage_threads(
+                session_id,
+                &storage_threads,
+            ));
+        }
+
         debug!("Exiting public client storage thread.");
         if let Err(e) = generic_channel::GenericSend::send(
             &self.public_storage_threads,
@@ -2969,6 +3023,11 @@ where
         if let Err(e) = core_ipc_receiver.recv() {
             warn!("Exit resource thread failed ({:?})", e);
         }
+        for receiver in temporary_client_storage_receivers {
+            if let Err(e) = receiver.recv() {
+                warn!("Exit client storage thread of a temporary session failed ({:?})", e);
+            }
+        }
         if let Err(e) = public_client_storage_generic_receiver.recv() {
             warn!("Exit public client storage thread failed ({:?})", e);
         }
@@ -3000,6 +3059,7 @@ where
         let Some(pipeline) = self.pipelines.remove(&pipeline_id) else {
             return;
         };
+        self.release_temporary_sessions();
 
         // Clean up any registered interests for this pipeline.
         self.pipeline_interests.retain(|_, set| {
@@ -3318,12 +3378,21 @@ where
             webview_id,
             viewport_details,
             user_content_manager_id,
+            session,
         }: NewWebViewDetails,
     ) {
+        // A webview that asked for a temporary session and cannot have it is
+        // not loaded at all: the ordinary session would keep what it stores.
+        if let Some(session) = session &&
+            !self.join_temporary_session(webview_id, session)
+        {
+            return warn!("{webview_id}: Not loading, its temporary session could not start");
+        }
+
         let pipeline_id = PipelineId::new();
         let browsing_context_id = BrowsingContextId::from(webview_id);
         let load_data = LoadData::new_for_new_unrelated_webview(url);
-        let is_private = false;
+        let is_private = session.is_some();
         let throttled = false;
 
         // Register this new top-level browsing context id as a webview and set
@@ -3373,6 +3442,145 @@ where
             .prefetch_font_keys_for_painter(painter_id);
     }
 
+    /// The resource and storage threads that the script threads of this
+    /// webview must use, if the webview is in a temporary session.
+    pub(crate) fn temporary_session_threads(
+        &self,
+        webview_id: WebViewId,
+    ) -> Option<(ResourceThreads, StorageThreads)> {
+        let session_id = self.webview_sessions.get(&webview_id)?;
+        self.temporary_sessions.get(session_id).cloned()
+    }
+
+    /// Puts a new webview in a temporary session, starting the session if
+    /// this is its first webview. A session keeps the settings it started
+    /// with. Returns `false` if the session could not be started.
+    /// The temporary session the page in `pipeline_id` belongs to, if any.
+    fn temporary_session_of(&self, pipeline_id: PipelineId) -> Option<u64> {
+        let pipeline = self.pipelines.get(&pipeline_id)?;
+        self.webview_sessions.get(&pipeline.webview_id).copied()
+    }
+
+    fn join_temporary_session(&mut self, webview_id: WebViewId, session: TemporarySession) -> bool {
+        if !self.temporary_sessions.contains_key(&session.id) {
+            let Some((sender, receiver)) = generic_channel::channel() else {
+                warn!("Failed to create channel");
+                return false;
+            };
+            if let Err(error) = self.public_resource_threads.send(
+                net_traits::CoreResourceMsg::NewTemporarySession(session.accept_cookies, sender),
+            ) {
+                warn!("Asking for a temporary session failed ({error})");
+                return false;
+            }
+            let Ok(Some(core_thread)) = receiver.recv() else {
+                warn!("The resource thread did not start a temporary session");
+                return false;
+            };
+            let storage_threads = (self.temporary_storage_factory)(session.id);
+            self.temporary_sessions.insert(
+                session.id,
+                (ResourceThreads::new(core_thread), storage_threads),
+            );
+        }
+        self.webview_sessions.insert(webview_id, session.id);
+        true
+    }
+
+    fn handle_close_temporary_session(&mut self, session_id: u64) {
+        if !self.temporary_sessions.contains_key(&session_id) {
+            return;
+        }
+        self.closing_temporary_sessions.insert(session_id);
+        self.release_temporary_sessions();
+    }
+
+    /// Forgets the webviews of temporary sessions that are closed and have no
+    /// pipeline left, then ends the sessions that the embedder closed and
+    /// that no webview uses any longer.
+    fn release_temporary_sessions(&mut self) {
+        if self.webview_sessions.is_empty() && self.closing_temporary_sessions.is_empty() {
+            return;
+        }
+
+        let webviews = &self.webviews;
+        let pipelines = &self.pipelines;
+        self.webview_sessions.retain(|webview_id, _| {
+            webviews.contains_key(webview_id) ||
+                pipelines
+                    .values()
+                    .any(|pipeline| pipeline.webview_id == *webview_id)
+        });
+
+        let webview_sessions = &self.webview_sessions;
+        let ended: Vec<u64> = self
+            .closing_temporary_sessions
+            .iter()
+            .copied()
+            .filter(|session_id| !webview_sessions.values().any(|id| id == session_id))
+            .collect();
+        for session_id in ended {
+            self.closing_temporary_sessions.remove(&session_id);
+            let Some((_resource_threads, storage_threads)) =
+                self.temporary_sessions.remove(&session_id)
+            else {
+                continue;
+            };
+            // The resource thread drops the state of the session once every
+            // sender of its channel is gone, this one included. The storage
+            // threads each hold a sender to themselves, so they need telling.
+            // Nobody waits for them here: the constellation goes on.
+            drop(Self::exit_temporary_storage_threads(session_id, &storage_threads));
+        }
+    }
+
+    /// Asks the storage threads of an ended temporary session to stop,
+    /// without waiting for them. Returns where the client storage thread answers
+    /// once it has removed the directory of the session, for the caller that is
+    /// about to end the process and has to wait for that.
+    fn exit_temporary_storage_threads(
+        session_id: u64,
+        storage_threads: &StorageThreads,
+    ) -> Option<GenericReceiver<()>> {
+        // Each thread answers on its sender when it stops. Nobody listens to the
+        // other two.
+        let (
+            Some((client_storage_sender, client_storage_receiver)),
+            Some((indexeddb_sender, _)),
+            Some((web_storage_sender, _)),
+        ) = (
+            generic_channel::channel(),
+            generic_channel::channel(),
+            generic_channel::channel(),
+        )
+        else {
+            warn!("Failed to create channel");
+            return None;
+        };
+        let client_storage_asked = match generic_channel::GenericSend::send(
+            storage_threads,
+            ClientStorageThreadMessage::Exit(client_storage_sender),
+        ) {
+            Ok(()) => Some(client_storage_receiver),
+            Err(error) => {
+                warn!("Exit client storage thread of session {session_id} failed ({error})");
+                None
+            },
+        };
+        if let Err(error) = storage_threads.send(IndexedDBThreadMsg::Sync(SyncOperation::Exit(
+            indexeddb_sender,
+        ))) {
+            warn!("Exit indexeddb thread of session {session_id} failed ({error})");
+        }
+        if let Err(error) = generic_channel::GenericSend::send(
+            storage_threads,
+            WebStorageThreadMsg::Exit(web_storage_sender),
+        ) {
+            warn!("Exit web storage thread of session {session_id} failed ({error})");
+        }
+        client_storage_asked
+    }
+
     #[servo_tracing::instrument(skip_all)]
     /// <https://html.spec.whatwg.org/multipage/#destroy-a-top-level-traversable>
     fn handle_close_top_level_browsing_context(&mut self, webview_id: WebViewId) {
@@ -3383,6 +3591,7 @@ where
             self.close_browsing_context(browsing_context_id, ExitPipelineMode::Normal);
         // Step 4. Remove traversable from the user interface (e.g., close or hide its tab in a tabbed browser).
         self.webviews.remove(&webview_id);
+        self.release_temporary_sessions();
         self.constellation_to_embedder_proxy
             .send(ConstellationToEmbedderMsg::WebViewClosed(webview_id));
 
@@ -3669,6 +3878,9 @@ where
             webview_id: new_webview_id,
             viewport_details,
             user_content_manager_id,
+            // An auxiliary webview is in the session of its opener, whatever
+            // the embedder asked for.
+            session: _,
         } = match webview_id_receiver.recv() {
             Ok(Some(new_webview_details)) => new_webview_details,
             Ok(None) | Err(_) => {
@@ -3725,6 +3937,9 @@ where
                 user_content_manager_id,
             ),
         );
+        if let Some(session_id) = self.webview_sessions.get(&opener_webview_id).copied() {
+            self.webview_sessions.insert(new_webview_id, session_id);
+        }
 
         // https://html.spec.whatwg.org/multipage/#bcg-append
         let Some(opener) = self.browsing_contexts.get(&opener_browsing_context_id) else {

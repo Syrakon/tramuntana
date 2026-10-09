@@ -672,7 +672,12 @@ impl ClientStorageThreadFactory for ClientStorageThreadHandle {
         let mut temp_dir: Option<tempfile::TempDir> = None;
         let base_dir = config_dir
             .unwrap_or_else(|| {
-                let tmp_dir = tempfile::tempdir().unwrap();
+                // In the user's runtime directory when there is one: it is kept in
+                // memory and is the user's alone, which the system's temporary
+                // directory may not be.
+                let tmp_dir = std::env::var_os("XDG_RUNTIME_DIR")
+                    .and_then(|runtime_dir| tempfile::tempdir_in(runtime_dir).ok())
+                    .unwrap_or_else(|| tempfile::tempdir().unwrap());
                 let path = tmp_dir.path().to_path_buf();
                 temp_dir = Some(tmp_dir);
                 path
@@ -690,13 +695,14 @@ impl ClientStorageThreadFactory for ClientStorageThreadHandle {
         thread::Builder::new()
             .name("ClientStorageThread".to_owned())
             .spawn(move || {
-                // Keep temp_dir alive while the thread runs.
-                let _ = temp_dir;
                 let engine = SqliteEngine::new(storage_dir).unwrap_or_else(|error| {
                     warn!("Failed to initialize ClientStorage engine into storage dir: {error:?}");
                     SqliteEngine::memory().unwrap()
                 });
-                ClientStorageThread::new(sender_clone, generic_receiver, engine).start();
+                // The thread keeps `temp_dir`, so the directory lasts as long as it
+                // serves and is removed when it is told to exit.
+                ClientStorageThread::new(sender_clone, generic_receiver, engine, temp_dir)
+                    .start();
             })
             .expect("Thread spawning failed");
 
@@ -708,6 +714,9 @@ struct ClientStorageThread<E: RegistryEngine> {
     receiver: GenericReceiver<ClientStorageThreadMessage>,
     sender: GenericSender<ClientStorageThreadMessage>,
     engine: E,
+    /// The directory the engine keeps its files in, when it was made for this
+    /// thread alone. Removed on `Exit`.
+    temp_dir: Option<tempfile::TempDir>,
 }
 
 impl<E> ClientStorageThread<E>
@@ -718,11 +727,13 @@ where
         sender: GenericSender<ClientStorageThreadMessage>,
         receiver: GenericReceiver<ClientStorageThreadMessage>,
         engine: E,
+        temp_dir: Option<tempfile::TempDir>,
     ) -> ClientStorageThread<E> {
         ClientStorageThread {
             sender,
             receiver,
             engine,
+            temp_dir,
         }
     }
 
@@ -775,6 +786,13 @@ where
                     let _ = sender.send(self.engine.estimate(origin));
                 },
                 ClientStorageThreadMessage::Exit(sender) => {
+                    // Before answering: whoever waits for the answer may end the
+                    // process as soon as it comes.
+                    if let Some(temp_dir) = self.temp_dir.take() {
+                        if let Err(error) = temp_dir.close() {
+                            warn!("Failed to remove the ClientStorage directory: {error}");
+                        }
+                    }
                     let _ = sender.send(());
                     break;
                 },

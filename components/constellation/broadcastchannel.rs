@@ -17,8 +17,15 @@ pub(crate) struct BroadcastChannels {
     routers: FxHashMap<BroadcastChannelRouterId, IpcSender<BroadcastChannelMsg>>,
 
     /// A map of origin to a map of channel name to a list of relevant routers.
-    channels: HashMap<ImmutableOrigin, HashMap<String, Vec<BroadcastChannelRouterId>>>,
+    /// The origin comes with the temporary session of the page, if it is in one:
+    /// a channel does not reach from one session into another, nor into the
+    /// pages outside any.
+    channels: HashMap<ChannelScope, HashMap<String, Vec<BroadcastChannelRouterId>>>,
 }
+
+/// Where a channel name is heard: an origin, within a temporary session or outside
+/// them all.
+type ChannelScope = (Option<u64>, ImmutableOrigin);
 
 impl BroadcastChannels {
     /// Add a new broadcast router.
@@ -58,8 +65,9 @@ impl BroadcastChannels {
         router_id: BroadcastChannelRouterId,
         channel_name: String,
         origin: ImmutableOrigin,
+        session: Option<u64>,
     ) {
-        let channels = self.channels.entry(origin).or_default();
+        let channels = self.channels.entry((session, origin)).or_default();
         let routers = channels.entry(channel_name).or_default();
         routers.push(router_id);
     }
@@ -71,7 +79,9 @@ impl BroadcastChannels {
         router_id: BroadcastChannelRouterId,
         channel_name: String,
         origin: ImmutableOrigin,
+        session: Option<u64>,
     ) {
+        let origin = (session, origin);
         if let Some(channels) = self.channels.get_mut(&origin) {
             let is_empty = if let Some(routers) = channels.get_mut(&channel_name) {
                 routers.retain(|router| router != &router_id);
@@ -99,8 +109,9 @@ impl BroadcastChannels {
         &self,
         router_id: BroadcastChannelRouterId,
         message: BroadcastChannelMsg,
+        session: Option<u64>,
     ) {
-        if let Some(channels) = self.channels.get(&message.origin) {
+        if let Some(channels) = self.channels.get(&(session, message.origin.clone())) {
             let routers = match channels.get(&message.channel_name) {
                 Some(routers) => routers,
                 None => return warn!("Broadcast to channel name without active routers."),

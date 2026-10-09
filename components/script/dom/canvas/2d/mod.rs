@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 mod canvas_state;
+pub(crate) use canvas_state::{canvas_readback_refused, refuse_canvas_readback};
 pub(crate) mod canvasgradient;
 pub(crate) mod canvaspattern;
 #[expect(dead_code)]

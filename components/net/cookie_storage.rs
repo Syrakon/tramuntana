@@ -26,6 +26,10 @@ pub struct CookieStorage {
     version: u32,
     cookies_map: HashMap<String, Vec<ServoCookie>>,
     max_per_host: usize,
+    /// Whether this storage refuses every cookie it is given, so that it
+    /// stays empty. It is a property of the session, not of what is stored.
+    #[serde(skip)]
+    rejects_all: bool,
 }
 
 #[derive(Debug)]
@@ -40,6 +44,15 @@ impl CookieStorage {
             version: 1,
             cookies_map: HashMap::new(),
             max_per_host: max_cookies,
+            rejects_all: false,
+        }
+    }
+
+    /// A storage that keeps no cookie at all, whatever its source.
+    pub fn rejecting_all() -> CookieStorage {
+        CookieStorage {
+            rejects_all: true,
+            ..CookieStorage::new(0)
         }
     }
 
@@ -153,6 +166,10 @@ impl CookieStorage {
 
     // http://tools.ietf.org/html/rfc6265#section-5.3
     pub fn push(&mut self, mut cookie: ServoCookie, url: &ServoUrl, source: CookieSource) {
+        if self.rejects_all {
+            return;
+        }
+
         // https://www.ietf.org/id/draft-ietf-httpbis-cookie-alone-01.txt Step 1
         if cookie.cookie.secure().unwrap_or(false) && !url.is_secure_scheme() {
             return;

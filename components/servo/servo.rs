@@ -62,7 +62,8 @@ use servo_config::{opts, pref, prefs};
 use servo_constellation::content_process_sandbox_profile;
 use servo_constellation::{
     Constellation, ConstellationToEmbedderMsg, FromEmbedderLogger, FromScriptLogger,
-    InitialConstellationState, NewScriptEventLoopProcessInfo, UnprivilegedContent,
+    InitialConstellationState, NewScriptEventLoopProcessInfo, TemporaryStorageFactory,
+    UnprivilegedContent,
 };
 use servo_constellation_traits::{EmbedderToConstellationMessage, ScriptToConstellationSender};
 use servo_geometry::{
@@ -71,7 +72,7 @@ use servo_geometry::{
 use servo_media::ServoMedia;
 use servo_media::player::context::GlContext;
 use servo_wakelock::DefaultWakeLockDelegate;
-use storage::new_storage_threads;
+use storage::{new_storage_threads, new_temporary_storage_threads};
 use storage_traits::StorageThreads;
 use style::global_style_data::StyleThreadPool;
 
@@ -956,6 +957,16 @@ impl Servo {
             opts.temporary_storage,
         );
 
+        let temporary_storage_factory: TemporaryStorageFactory = {
+            let mem_profiler_chan = mem_profiler_chan.clone();
+            Box::new(move |session_id| {
+                new_temporary_storage_threads(
+                    mem_profiler_chan.clone(),
+                    &format!("temporary-{session_id}"),
+                )
+            })
+        };
+
         create_constellation(
             embedder_to_constellation_receiver,
             &paint.borrow(),
@@ -971,6 +982,7 @@ impl Servo {
             async_runtime,
             public_storage_threads.clone(),
             private_storage_threads.clone(),
+            temporary_storage_factory,
         );
 
         net::connector::prewarm_tls();
@@ -1060,6 +1072,17 @@ impl Servo {
         let mut preferences = prefs::get().clone();
         preferences.set_value(name, value);
         prefs::set(preferences);
+    }
+
+    /// End the [`TemporarySession`](embedder_traits::TemporarySession) with
+    /// this id: its cookies, cache and site storage are dropped. If some of
+    /// its `WebView`s are still open, the session ends when the last of them
+    /// closes. Once it has ended, a `WebView` created with the same id starts
+    /// a new, empty session.
+    pub fn close_temporary_session(&self, id: u64) {
+        self.0
+            .constellation_proxy
+            .send(EmbedderToConstellationMessage::CloseTemporarySession(id));
     }
 
     pub fn network_manager<'a>(&'a self) -> Ref<'a, NetworkManager> {
@@ -1172,6 +1195,7 @@ fn create_constellation(
     async_runtime: Box<dyn net_traits::AsyncRuntime>,
     public_storage_threads: StorageThreads,
     private_storage_threads: StorageThreads,
+    temporary_storage_factory: TemporaryStorageFactory,
 ) {
     // Global configuration options, parsed from the command line.
     let opts = opts::get();
@@ -1202,6 +1226,7 @@ fn create_constellation(
         private_resource_threads,
         public_storage_threads,
         private_storage_threads,
+        temporary_storage_factory,
         time_profiler_chan,
         mem_profiler_chan,
         #[cfg(feature = "webxr")]

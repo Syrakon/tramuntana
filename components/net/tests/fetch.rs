@@ -381,6 +381,52 @@ fn test_cors_preflight_fetch() {
     };
 }
 
+/// A session that sends no referrer to another site: whatever the referrer
+/// policy says, the request to another site goes without one, and a request
+/// within the site keeps its own.
+#[test]
+fn test_no_cross_site_referrer() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_by_server = seen.clone();
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            let referrer = request
+                .headers()
+                .get(header::REFERER)
+                .map(|value| value.to_str().unwrap().to_owned());
+            seen_by_server.lock().unwrap().push(referrer);
+            *response.body_mut() = make_body(b"ACK".to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let same_site = url.join("a.html").unwrap();
+    let cross_site = ServoUrl::parse("http://elsewhere.example/a.html").unwrap();
+    for referrer in [same_site.clone(), cross_site] {
+        let mut request = RequestBuilder::new(
+            Some(TEST_WEBVIEW_ID),
+            url.clone(),
+            Referrer::ReferrerUrl(referrer),
+        )
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+        request.referrer_policy = ReferrerPolicy::UnsafeUrl;
+        let mut context = new_fetch_context(None, None);
+        Arc::get_mut(&mut context.state)
+            .unwrap()
+            .no_cross_site_referrer = true;
+        let fetch_response = fetch_with_context(request, &mut context);
+        assert!(!fetch_response.is_network_error());
+    }
+    let _ = server.close();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some(same_site.into_string()), None]
+    );
+}
+
 #[test]
 fn test_cors_preflight_cache_fetch() {
     static ACK: &'static [u8] = b"ACK";

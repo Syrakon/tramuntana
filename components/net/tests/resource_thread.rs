@@ -4,14 +4,17 @@
 
 use std::net::IpAddr;
 
+use cookie::Cookie;
+use hyper_serde::Serde;
 use net::connector::CACertificates;
 use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_core_resource_thread;
 use net::test::parse_hostsfile;
-use net_traits::CoreResourceMsg;
+use net_traits::{CookieSource, CoreResourceMsg, CoreResourceThread};
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use profile_traits::time::ProfilerChan;
 use servo_base::generic_channel;
+use servo_url::ServoUrl;
 
 use crate::create_generic_embedder_proxy;
 
@@ -41,6 +44,84 @@ fn test_exit() {
     // Workaround for https://github.com/servo/servo/issues/32912
     #[cfg(windows)]
     std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+fn set_cookie(resource_thread: &CoreResourceThread, url: &ServoUrl, cookie: &str) {
+    let (sender, receiver) = generic_channel::channel().unwrap();
+    resource_thread
+        .send(CoreResourceMsg::SetCookieForUrl(
+            url.clone(),
+            Serde(Cookie::parse(cookie.to_owned()).unwrap()),
+            CookieSource::HTTP,
+            Some(sender),
+        ))
+        .unwrap();
+    receiver.recv().unwrap();
+}
+
+fn cookie_string(resource_thread: &CoreResourceThread, url: &ServoUrl) -> Option<String> {
+    let (sender, receiver) = generic_channel::channel().unwrap();
+    resource_thread
+        .send(CoreResourceMsg::GetCookieStringForUrl(
+            url.clone(),
+            sender,
+            CookieSource::HTTP,
+        ))
+        .unwrap();
+    receiver.recv().unwrap()
+}
+
+fn new_temporary_session(
+    resource_thread: &CoreResourceThread,
+    accept_cookies: bool,
+) -> CoreResourceThread {
+    let (sender, receiver) = generic_channel::channel().unwrap();
+    resource_thread
+        .send(CoreResourceMsg::NewTemporarySession(accept_cookies, sender))
+        .unwrap();
+    receiver.recv().unwrap().unwrap()
+}
+
+#[test]
+fn test_temporary_sessions_have_their_own_cookies() {
+    let (tx, _rx) = generic_channel::channel().unwrap();
+    let (mtx, _mrx) = generic_channel::channel().unwrap();
+    let (public, private) = new_core_resource_thread(
+        None,
+        ProfilerChan(Some(tx)),
+        MemProfilerChan(mtx),
+        create_generic_embedder_proxy(),
+        None,
+        None,
+        CACertificates::Default,
+        false, /* ignore_certificate_errors */
+        std::sync::Arc::new(ProtocolRegistry::default()),
+        None,
+    );
+    let url = ServoUrl::parse("https://example.org/").unwrap();
+
+    let keeping = new_temporary_session(&public, true);
+    let other = new_temporary_session(&public, true);
+    let rejecting = new_temporary_session(&public, false);
+
+    set_cookie(&keeping, &url, "kept=1");
+    set_cookie(&rejecting, &url, "refused=1");
+    set_cookie(&public, &url, "public=1");
+
+    assert_eq!(cookie_string(&keeping, &url), Some("kept=1".to_owned()));
+    assert_eq!(cookie_string(&other, &url), None);
+    assert_eq!(cookie_string(&rejecting, &url), None);
+    assert_eq!(cookie_string(&private, &url), None);
+    assert_eq!(cookie_string(&public, &url), Some("public=1".to_owned()));
+
+    // Ending a session leaves the resource thread serving the others.
+    drop(keeping);
+    assert_eq!(cookie_string(&public, &url), Some("public=1".to_owned()));
+    assert_eq!(cookie_string(&other, &url), None);
+
+    let (sender, receiver) = generic_channel::oneshot().unwrap();
+    public.send(CoreResourceMsg::Exit(sender)).unwrap();
+    receiver.recv().unwrap();
 }
 
 #[test]

@@ -538,3 +538,17 @@ fn test_parse_date() {
         Some(datetime!(2024-06-26 15:35:10).assume_utc())
     );
 }
+
+#[test]
+fn test_storage_rejecting_all_stays_empty() {
+    let mut storage = CookieStorage::rejecting_all();
+    let url = ServoUrl::parse("https://example.org/").unwrap();
+
+    add_cookie_to_storage(&mut storage, &url, "http=1; Secure");
+    let cookie = cookie::Cookie::parse("script=1".to_owned()).unwrap();
+    let cookie = ServoCookie::new_wrapped(cookie, &url, CookieSource::NonHTTP).unwrap();
+    storage.push(cookie, &url, CookieSource::NonHTTP);
+
+    assert_eq!(storage.cookies_for_url(&url, CookieSource::HTTP), None);
+    assert!(storage.cookie_site_descriptors().is_empty());
+}

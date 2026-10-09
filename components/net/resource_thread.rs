@@ -249,12 +249,38 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy: embedder_proxy.clone(),
+        no_cross_site_referrer: false,
     };
 
+    let private_http_state = memory_only_http_state(
+        CookieStorage::new(150),
+        ca_certificates,
+        ignore_certificate_errors,
+        embedder_proxy,
+        false,
+    );
+
+    let http_state = Arc::new(http_state);
+    if let Some(config_dir) = config_dir {
+        spawn_http_state_persister(Arc::downgrade(&http_state), config_dir.to_owned());
+    }
+
+    (http_state, Arc::new(private_http_state))
+}
+
+/// The state of a session that starts empty and of which nothing is written
+/// to disk: the private session and every temporary one.
+fn memory_only_http_state(
+    cookie_jar: CookieStorage,
+    ca_certificates: CACertificates<'static>,
+    ignore_certificate_errors: bool,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    no_cross_site_referrer: bool,
+) -> HttpState {
     let override_manager = CertificateErrorOverrideManager::new();
-    let private_http_state = HttpState {
+    HttpState {
         hsts_list: RwLock::new(HstsList::default()),
-        cookie_jar: RwLock::new(CookieStorage::new(150)),
+        cookie_jar: RwLock::new(cookie_jar),
         auth_cache: RwLock::new(AuthCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
         http_cache: HttpCache::default(),
@@ -265,14 +291,8 @@ fn create_http_states(
         )),
         override_manager,
         embedder_proxy,
-    };
-
-    let http_state = Arc::new(http_state);
-    if let Some(config_dir) = config_dir {
-        spawn_http_state_persister(Arc::downgrade(&http_state), config_dir.to_owned());
+        no_cross_site_referrer,
     }
-
-    (http_state, Arc::new(private_http_state))
 }
 
 /// How often the public cookie jar, HSTS list and auth cache are written to
@@ -369,11 +389,20 @@ impl ResourceChannelManager {
         let revoker_id = rx_set.add(revoke_receiver);
         let refresh_id = rx_set.add(refresh_receiver);
 
+        // The state of each temporary session, by the id of its channel.
+        let mut temporary_http_states: FxHashMap<u64, Arc<HttpState>> = FxHashMap::default();
+
         loop {
             for received in rx_set.select().into_iter() {
-                // Handles case where profiler thread shuts down before resource thread.
                 match received {
-                    GenericSelectionResult::ChannelClosed(_) => continue,
+                    // The last sender of a temporary session is gone: forget
+                    // everything the session held. For the other channels,
+                    // this handles the case where the profiler thread shuts
+                    // down before the resource thread.
+                    GenericSelectionResult::ChannelClosed(id) => {
+                        temporary_http_states.remove(&id);
+                        continue;
+                    },
                     GenericSelectionResult::Error(error) => {
                         log::error!("Found selection error: {error}")
                     },
@@ -408,17 +437,54 @@ impl ResourceChannelManager {
                                     report_chan,
                                     &public_http_state,
                                     &private_http_state,
+                                    &temporary_http_states,
                                 );
                                 continue;
                             } else {
                                 log::error!("memory reporter should only send CollectMemoryReport");
                             }
+                        } else if let CoreResourceMsg::NewTemporarySession(accept_cookies, reply) =
+                            msg
+                        {
+                            let session = generic_channel::channel().map(|(sender, receiver)| {
+                                let cookie_jar = if accept_cookies {
+                                    CookieStorage::new(150)
+                                } else {
+                                    CookieStorage::rejecting_all()
+                                };
+                                let http_state = memory_only_http_state(
+                                    cookie_jar,
+                                    self.ca_certificates.clone(),
+                                    self.ignore_certificate_errors,
+                                    embedder_proxy.clone(),
+                                    true,
+                                );
+                                temporary_http_states
+                                    .insert(rx_set.add(receiver), Arc::new(http_state));
+                                sender
+                            });
+                            if reply.send(session).is_err() {
+                                warn!("Nobody waited for the new temporary session");
+                            }
                         } else {
                             let group = if id == private_id {
                                 &private_http_state
-                            } else {
-                                assert_eq!(id, public_id);
+                            } else if id == public_id {
                                 &public_http_state
+                            } else if let Some(temporary_http_state) =
+                                temporary_http_states.get(&id)
+                            {
+                                // `Exit` writes the state of the session it arrives
+                                // on to disk and stops every session; neither is
+                                // for a temporary session to do.
+                                if matches!(msg, CoreResourceMsg::Exit(_)) {
+                                    log::error!("Temporary session asked the resource thread to exit");
+                                    continue;
+                                }
+                                temporary_http_state
+                            } else {
+                                log::error!("Message from an unknown resource channel: {id}");
+                                continue;
                             };
                             if !self.process_msg(msg, group, Arc::clone(&protocols)) {
                                 return;
@@ -435,10 +501,16 @@ impl ResourceChannelManager {
         msg: ReportsChan,
         public_http_state: &Arc<HttpState>,
         private_http_state: &Arc<HttpState>,
+        temporary_http_states: &FxHashMap<u64, Arc<HttpState>>,
     ) {
         perform_memory_report(|ops| {
             let mut reports = public_http_state.memory_reports("public", ops);
             reports.extend(private_http_state.memory_reports("private", ops));
+            for (id, temporary_http_state) in temporary_http_states {
+                reports.extend(
+                    temporary_http_state.memory_reports(&format!("temporary-{id}"), ops),
+                );
+            }
             reports.extend(vec![
                 Report {
                     path: path!["hsts-preload-list"],
@@ -757,7 +829,9 @@ impl ResourceChannelManager {
                 let _ = sender.send(());
                 return false;
             },
-            // Ignore these messages as they are only sent on very specific channels.
+            // Ignore these messages as they are only sent on very specific channels,
+            // or are handled before reaching here.
+            CoreResourceMsg::NewTemporarySession(..) |
             CoreResourceMsg::CollectMemoryReport(_) |
             CoreResourceMsg::RevokeTokenForFile(..) |
             CoreResourceMsg::RefreshTokenForFile(..) => {},

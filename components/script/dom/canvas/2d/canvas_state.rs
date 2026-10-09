@@ -75,6 +75,26 @@ use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
 use crate::dom::textmetrics::TextMetrics;
 use crate::script_runtime::CanGc;
 
+thread_local! {
+    /// Whether the canvases of this thread refuse to be read back.
+    static READBACK_REFUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Say whether the canvases made on this thread from now on refuse to be read
+/// back, as those of a temporary session do: what a canvas draws depends on the
+/// machine, and reading it tells one visitor from another. Such a canvas starts
+/// out as one that drew an image of another origin, so every way of reading it
+/// throws a `SecurityError`.
+pub(crate) fn refuse_canvas_readback(refuse: bool) {
+    READBACK_REFUSED.set(refuse);
+}
+
+/// Whether the canvases of this thread refuse to be read back. A worker takes
+/// the answer of the thread that starts it.
+pub(crate) fn canvas_readback_refused() -> bool {
+    READBACK_REFUSED.get()
+}
+
 const HANGING_BASELINE_DEFAULT: f64 = 0.8;
 const IDEOGRAPHIC_BASELINE_DEFAULT: f64 = 0.5;
 
@@ -245,7 +265,7 @@ impl CanvasState {
             canvas_id,
             size: Cell::new(size),
             state: DomRefCell::new(CanvasContextState::new()),
-            origin_clean: Cell::new(true),
+            origin_clean: Cell::new(!canvas_readback_refused()),
             image_cache: global.image_cache(),
             base_url: global.api_base_url(),
             missing_image_urls: DomRefCell::new(Vec::new()),
@@ -342,7 +362,7 @@ impl CanvasState {
         // width or the height content attribute of the canvas element to which a
         // CanvasRenderingContext2D is bound, the bitmap is cleared and its origin-clean flag is
         // reset.
-        self.set_origin_clean(true);
+        self.set_origin_clean(!canvas_readback_refused());
     }
 
     pub(super) fn reset_bitmap(&self) {

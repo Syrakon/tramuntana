@@ -23,6 +23,7 @@ use net_traits::fetch::headers::{determine_nosniff, extract_mime_type_as_mime};
 use net_traits::filemanager_thread::{FileTokenCheck, RelativePos};
 use net_traits::http_status::HttpStatus;
 use net_traits::policy_container::{PolicyContainer, RequestPolicyContainer};
+use net_traits::pub_domains::is_same_site;
 use net_traits::request::{
     BodyChunkRequest, BodyChunkResponse, CredentialsMode, Destination, Initiator,
     InsecureRequestsPolicy, Origin, ParserMetadata, RedirectMode, Referrer, Request, RequestBody,
@@ -515,6 +516,12 @@ pub async fn main_fetch(
             )
         },
     };
+    // A session that tells no site where its visitor came from. Checked again on
+    // each redirect, which comes back through here with the new URL.
+    let referrer_url = referrer_url.filter(|referrer_url| {
+        !context.state.no_cross_site_referrer ||
+            is_same_site(&referrer_url.origin(), &request.current_url().origin())
+    });
     request.referrer = referrer_url.map_or(Referrer::NoReferrer, Referrer::ReferrerUrl);
 
     // Step 9.

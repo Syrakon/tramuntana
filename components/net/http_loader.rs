@@ -118,6 +118,9 @@ pub struct HttpState {
     pub client: ServoClient,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    /// Whether a request to another site goes without a referrer, whatever the
+    /// referrer policy of the page allows. True for a temporary session.
+    pub no_cross_site_referrer: bool,
 }
 
 impl HttpState {

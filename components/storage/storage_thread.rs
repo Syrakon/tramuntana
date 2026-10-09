@@ -34,6 +34,17 @@ fn new_storage_thread_group(
     StorageThreads::new(client_storage.into(), idb, web_storage)
 }
 
+/// Storage threads for a temporary session: they start empty, share nothing
+/// with the public or private groups, and take no `config_dir`, so nothing of
+/// the session lands in the profile. `label` tells the memory reporters of
+/// one session from those of another and has to be unique among live groups.
+pub fn new_temporary_storage_threads(
+    mem_profiler_chan: MemProfilerChan,
+    label: &str,
+) -> StorageThreads {
+    new_storage_thread_group(mem_profiler_chan, None, true, label)
+}
+
 pub fn new_storage_threads(
     mem_profiler_chan: MemProfilerChan,
     config_dir: Option<PathBuf>,

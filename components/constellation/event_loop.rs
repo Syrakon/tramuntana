@@ -19,7 +19,7 @@ use media::WindowGLContext;
 use script_traits::{InitialScriptState, ScriptThreadMessage};
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender, SendError};
-use servo_base::id::ScriptEventLoopId;
+use servo_base::id::{ScriptEventLoopId, WebViewId};
 use servo_config::opts::{self, Opts};
 use servo_config::prefs::{self, Preferences};
 use servo_constellation_traits::ServiceWorkerManagerFactory;
@@ -65,6 +65,7 @@ impl Drop for EventLoop {
 impl EventLoop {
     pub(crate) fn spawn<STF: ScriptThreadFactory, SWF: ServiceWorkerManagerFactory>(
         constellation: &mut Constellation<STF, SWF>,
+        webview_id: WebViewId,
         is_private: bool,
     ) -> Result<Rc<Self>, IpcError> {
         let (script_chan, script_port) =
@@ -74,16 +75,22 @@ impl EventLoop {
         let eventloop_waker = constellation.embedder_proxy.event_loop_waker.clone();
         let script_to_embedder_sender = ScriptToEmbedderChan::new(embedder_chan, eventloop_waker);
 
-        let resource_threads = if is_private {
-            constellation.private_resource_threads.clone()
-        } else {
-            constellation.public_resource_threads.clone()
-        };
-        let storage_threads = if is_private {
-            constellation.private_storage_threads.clone()
-        } else {
-            constellation.public_storage_threads.clone()
-        };
+        // A webview in a temporary session uses the threads of that session
+        // for everything it loads, the crash page included.
+        let session_threads = constellation.temporary_session_threads(webview_id);
+        let temporary_session = session_threads.is_some();
+        let (resource_threads, storage_threads) =
+            match session_threads {
+                Some(session_threads) => session_threads,
+                None if is_private => (
+                    constellation.private_resource_threads.clone(),
+                    constellation.private_storage_threads.clone(),
+                ),
+                None => (
+                    constellation.public_resource_threads.clone(),
+                    constellation.public_storage_threads.clone(),
+                ),
+            };
 
         let event_loop_id = ScriptEventLoopId::new();
         let initial_script_state = InitialScriptState {
@@ -103,13 +110,17 @@ impl EventLoop {
             constellation_to_script_receiver: script_port,
             pipeline_namespace_id: constellation.next_pipeline_namespace_id(),
             cross_process_paint_api: constellation.paint_proxy.cross_process_paint_api.clone(),
+            // Without the channel no WebGL context can be made, and a page of a
+            // temporary session is not to learn what the graphics card is.
             webgl_chan: constellation
                 .webgl_threads
                 .as_ref()
+                .filter(|_| !temporary_session)
                 .map(|threads| threads.pipeline()),
             webxr_registry: constellation.webxr_registry.clone(),
             player_context: WindowGLContext::get(),
             privileged_urls: constellation.privileged_urls.clone(),
+            temporary_session,
             user_contents_for_manager_id: constellation.user_contents_for_manager_id.clone(),
         };
 

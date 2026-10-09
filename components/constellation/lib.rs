@@ -20,7 +20,9 @@ mod sandboxing;
 mod serviceworker;
 mod session_history;
 
-pub use crate::constellation::{Constellation, InitialConstellationState};
+pub use crate::constellation::{
+    Constellation, InitialConstellationState, TemporaryStorageFactory,
+};
 pub use crate::embedder::ConstellationToEmbedderMsg;
 pub use crate::event_loop::{EventLoop, NewScriptEventLoopProcessInfo};
 pub use crate::logging::{FromEmbedderLogger, FromScriptLogger};

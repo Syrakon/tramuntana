@@ -15,7 +15,7 @@ use embedder_traits::{
     ContextMenuAction, ContextMenuItem, Cursor, EmbedderControlId, EmbedderControlRequest, Image,
     InputEvent, InputEventAndId, InputEventId, JSValue, JavaScriptEvaluationError, LoadStatus,
     MediaSessionActionType, NewWebViewDetails, ScreenGeometry, ScreenshotCaptureError, Scroll,
-    Theme, TraversalId, UrlRequest, ViewportDetails, WebViewPoint, WebViewRect,
+    TemporarySession, Theme, TraversalId, UrlRequest, ViewportDetails, WebViewPoint, WebViewRect,
 };
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
@@ -197,6 +197,7 @@ impl WebView {
             webview_id: webview.id(),
             viewport_details,
             user_content_manager_id,
+            session: builder.temporary_session,
         };
 
         // There are two possibilities here. Either the WebView is a new toplevel
@@ -965,6 +966,7 @@ pub struct WebViewBuilder {
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     create_new_webview_responder: Option<IpcResponder<Option<NewWebViewDetails>>>,
     user_content_manager: Option<Rc<UserContentManager>>,
+    temporary_session: Option<TemporarySession>,
     clipboard_delegate: Option<Rc<dyn ClipboardDelegate>>,
     #[cfg(feature = "gamepad")]
     gamepad_delegate: Option<Rc<dyn GamepadDelegate>>,
@@ -980,6 +982,7 @@ impl WebViewBuilder {
             delegate: Rc::new(DefaultWebViewDelegate),
             create_new_webview_responder: None,
             user_content_manager: None,
+            temporary_session: None,
             clipboard_delegate: None,
             #[cfg(feature = "gamepad")]
             gamepad_delegate: None,
@@ -1019,6 +1022,20 @@ impl WebViewBuilder {
     /// to the `UserContentManager` will take effect only after the document is reloaded.
     pub fn user_content_manager(mut self, user_content_manager: Rc<UserContentManager>) -> Self {
         self.user_content_manager = Some(user_content_manager);
+        self
+    }
+
+    /// Put the `WebView` being created in a [`TemporarySession`] instead of the
+    /// ordinary one: its cookies, cache and site storage are kept in memory and
+    /// shared only with the other `WebView`s of the same session. The session
+    /// starts with the first `WebView` that names its id and lasts until
+    /// [`Servo::close_temporary_session`] is called.
+    ///
+    /// This has no effect on a `WebView` created in answer to
+    /// [`WebViewDelegate::request_create_new`]: that one is always in the
+    /// session of the `WebView` that opened it.
+    pub fn temporary_session(mut self, temporary_session: TemporarySession) -> Self {
+        self.temporary_session = Some(temporary_session);
         self
     }
 
