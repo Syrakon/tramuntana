@@ -115,7 +115,7 @@ use crate::devtools::DevtoolsState;
 use crate::document_collection::DocumentCollection;
 use crate::document_loader::DocumentLoader;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
-    DocumentMethods, DocumentReadyState,
+    DocumentMethods, DocumentReadyState, DocumentVisibilityState,
 };
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::NavigatorMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
@@ -1790,7 +1790,7 @@ impl ScriptThread {
                 self.handle_set_document_activity_msg(cx, pipeline_id, activity)
             },
             ScriptThreadMessage::SetThrottled(webview_id, pipeline_id, throttled) => {
-                self.handle_set_throttled_msg(webview_id, pipeline_id, throttled)
+                self.handle_set_throttled_msg(cx, webview_id, pipeline_id, throttled)
             },
             ScriptThreadMessage::SetThrottledInContainingIframe(
                 _,
@@ -2770,6 +2770,7 @@ impl ScriptThread {
 
     fn handle_set_throttled_msg(
         &self,
+        cx: &mut js::context::JSContext,
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         throttled: bool,
@@ -2789,6 +2790,16 @@ impl ScriptThread {
         match window {
             Some(window) => {
                 window.set_throttled(throttled);
+                // The embedder throttles a webview when it stops showing it, which is the
+                // only signal script gets about the page being on screen.
+                window.Document().update_visibility_state(
+                    cx,
+                    if throttled {
+                        DocumentVisibilityState::Hidden
+                    } else {
+                        DocumentVisibilityState::Visible
+                    },
+                );
                 return;
             },
             None => {
@@ -3646,6 +3657,10 @@ impl ScriptThread {
 
         if incomplete.throttled {
             window.set_throttled(true);
+        } else {
+            // A document loading in a webview that is on screen is visible from the
+            // start, not only once it is reactivated from session history.
+            document.set_initially_visible();
         }
 
         document.get_current_parser().unwrap()

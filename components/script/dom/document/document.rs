@@ -4589,8 +4589,15 @@ impl Document {
         *self.declarative_refresh.borrow_mut() = Some(refresh);
     }
 
+    /// Start this document out as visible. Meant for a document that is created in a
+    /// webview that is on screen; no entry is queued and no event fires, since nothing
+    /// has changed from the point of view of the page.
+    pub(crate) fn set_initially_visible(&self) {
+        self.visibility_state.set(DocumentVisibilityState::Visible);
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#visibility-state>
-    fn update_visibility_state(
+    pub(crate) fn update_visibility_state(
         &self,
         cx: &mut js::context::JSContext,
         visibility_state: DocumentVisibilityState,
