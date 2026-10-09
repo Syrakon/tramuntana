@@ -1102,6 +1102,7 @@ impl Document {
         // FIXME(emilio): This is very inefficient, ideally the flag above would
         // be enough and incremental layout could figure out from there.
         node.dirty(NodeDamage::ContentOrHeritage);
+        self.note_relative_selector_change(node);
     }
 
     /// Remove any existing association between the provided id and any elements in this document.
@@ -4095,6 +4096,24 @@ impl Document {
             .map(|elements| DomRoot::from_ref(&*elements[0]))
     }
 
+    /// Restyle `node` and its ancestors because something below them changed, so that a
+    /// `:has()` selector with one of them as its subject is matched again.
+    ///
+    /// Stylo can work out exactly which elements a relative selector depends on, but
+    /// that machinery is only wired up for Gecko. Restyling the ancestor chain is
+    /// coarser and still cheap: an element whose style comes out the same stops the
+    /// traversal there. `:has()` with a sibling combinator is not covered.
+    pub(crate) fn note_relative_selector_change(&self, node: &Node) {
+        if !node.is_connected() {
+            return;
+        }
+        for ancestor in node.inclusive_ancestors(ShadowIncluding::No) {
+            if let Some(element) = ancestor.downcast::<Element>() {
+                element.restyle(NodeDamage::Style);
+            }
+        }
+    }
+
     pub(crate) fn ensure_pending_restyle(&self, el: &Element) -> RefMut<'_, PendingRestyle> {
         let map = self.pending_restyles.borrow_mut();
         RefMut::map(map, |m| {
@@ -4111,6 +4130,13 @@ impl Document {
         // I'm getting rid of the whole hashtable soon anyway, since all it does
         // right now is populate the element restyle data in layout, and we
         // could in theory do it in the DOM I think.
+        // The style attribute cannot change what a selector matches.
+        if attr.local_name() != &local_name!("style") &&
+            let Some(parent) = el.upcast::<Node>().GetParentNode()
+        {
+            self.note_relative_selector_change(&parent);
+        }
+
         let mut entry = self.ensure_pending_restyle(el);
         if entry.snapshot.is_none() {
             entry.snapshot = Some(Snapshot::new());
