@@ -102,7 +102,12 @@ impl SVGSVGElement {
         // onto the root `<svg>` as a presentation attribute so `currentColor`
         // resolves to the inherited colour; any `color` set inside the SVG
         // still wins over a presentation attribute.
-        if let Some(style) = self.upcast::<Element>().style() {
+        //
+        // This runs while `Window::reflow` handles the results of a reflow, so
+        // the styles are current. Asking for a new reflow here re-enters
+        // `Window::reflow`, which finds this element pending again and recurses
+        // until the stack overflows.
+        if let Some(style) = self.upcast::<Element>().style_without_reflow() {
             let color = style.get_inherited_text().clone_color().to_css_string();
             xml_source = xml_source.replacen("<svg", &format!("<svg color=\"{color}\""), 1);
         }
