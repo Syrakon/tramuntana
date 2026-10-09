@@ -154,6 +154,11 @@ impl ExternalTextureCache {
         self.entries.first().map(|(_, texture)| texture)
     }
 
+    /// Drops the import of `buffer_id`, so the next lookup imports it again.
+    fn forget(&mut self, buffer_id: u64) {
+        self.entries.retain(|(id, _)| *id != buffer_id);
+    }
+
     fn clear(&mut self) {
         self.entries.clear();
     }
@@ -1589,7 +1594,9 @@ impl WgpuRenderer {
                 // fence is single-use per paint; on frames where Servo produced
                 // nothing new `fence()` returns None and we skip, since that
                 // buffer was already waited on when first exported.
-                if let Some(fence) = sprite.handle.fence() {
+                let fence = sprite.handle.fence();
+                let rewritten = fence.is_some();
+                if let Some(fence) = fence {
                     crate::external_texture_import::wait_external_fence(fence);
                 }
 
@@ -1599,6 +1606,14 @@ impl WgpuRenderer {
                 // Vulkan import only run on a cache miss; steady-state frames
                 // just wait the fence and re-sample the cached texture.
                 let mut cache = resources.external_texture_cache.borrow_mut();
+                // The producer wrote this buffer since we last sampled it (it
+                // hands out a fence exactly once per export). Import it again:
+                // an import kept across a producer write can go on showing
+                // what the buffer held before, a black page after a resize on
+                // NVIDIA. Frames with nothing new still reuse the import.
+                if rewritten {
+                    cache.forget(buffer_id);
+                }
                 let texture = match cache.get_or_import(buffer_id, || {
                     let descriptor = sprite.handle.descriptor()?;
                     crate::external_texture_import::import_external_texture(
