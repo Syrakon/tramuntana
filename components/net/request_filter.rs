@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use content_security_policy::Destination;
 use http::Method;
-use net_traits::request::{Origin, Request};
+use net_traits::request::{Origin, Request, RequestMode};
 use servo_base::id::WebViewId;
 use servo_url::{ImmutableOrigin, ServoUrl};
 
@@ -43,6 +43,10 @@ pub struct FilteredRequest<'a> {
     pub method: &'a Method,
     /// Whether this request navigates the top-level frame of a [`WebViewId`].
     pub is_for_main_frame: bool,
+    /// Whether this request opens a WebSocket. Its URL has already been given an
+    /// HTTP scheme and its destination is empty, like that of `fetch()`, so the mode
+    /// is the only thing that tells the two apart.
+    pub is_websocket: bool,
     /// The `WebView` this request belongs to, when it belongs to one.
     pub webview_id: Option<WebViewId>,
 }
@@ -57,6 +61,7 @@ impl<'a> FilteredRequest<'a> {
             destination: request.destination,
             method: &request.method,
             is_for_main_frame: matches!(request.destination, Destination::Document),
+            is_websocket: matches!(request.mode, RequestMode::WebSocket { .. }),
             webview_id: request.target_webview_id,
         }
     }
