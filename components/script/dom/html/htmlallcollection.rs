@@ -4,8 +4,8 @@
 
 use dom_struct::dom_struct;
 use html5ever::{local_name, ns};
-use js::context::JSContext;
-use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+use js::context::{JSContext, NoGC};
+use script_bindings::reflector::{Reflector, reflect_dom_object};
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::HTMLAllCollectionBinding::HTMLAllCollectionMethods;
@@ -48,10 +48,10 @@ impl HTMLAllCollection {
     ) -> DomRoot<HTMLAllCollection> {
         let collection =
             HTMLCollection::new_with_filter_fn(cx, window, document.upcast(), |_, _| true);
-        reflect_dom_object_with_cx(
+        reflect_dom_object(
+            cx,
             Box::new(HTMLAllCollection::new_inherited(&collection)),
             window,
-            cx,
         )
     }
 
@@ -71,14 +71,17 @@ impl HTMLAllCollection {
         // the HTMLAllCollection object, whose filter matches only elements that are either
         // "all"-named elements with a name attribute equal to name, or elements with an ID equal
         // to name.
-        let mut matches = self
-            .collection
-            .elements_iter()
-            .filter(|element| matches_all_name(element, &name));
-        let first = matches.next()?;
+        let (first, is_only_match) = {
+            let mut matches = self
+                .collection
+                .elements_iter(cx.no_gc())
+                .filter(|element| matches_all_name(element, &name));
+            let first = matches.next()?.as_rooted();
+            (first, matches.next().is_none())
+        };
 
         // Step 3. If there is exactly one element in subCollection, then return that element.
-        if matches.next().is_none() {
+        if is_only_match {
             return Some(HTMLCollectionOrElement::Element(first));
         }
 
@@ -144,13 +147,13 @@ fn parse_array_index(value: &str) -> Option<u32> {
 
 impl HTMLAllCollectionMethods<crate::DomTypeHolder> for HTMLAllCollection {
     /// <https://html.spec.whatwg.org/multipage/#dom-htmlallcollection-length>
-    fn Length(&self) -> u32 {
-        self.collection.Length()
+    fn Length(&self, cx: &JSContext) -> u32 {
+        self.collection.Length(cx)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-htmlallcollection-item>
-    fn IndexedGetter(&self, index: u32) -> Option<DomRoot<Element>> {
-        self.collection.Item(index)
+    fn IndexedGetter(&self, cx: &JSContext, index: u32) -> Option<DomRoot<Element>> {
+        self.collection.Item(cx, index)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-htmlallcollection-nameditem>
@@ -178,14 +181,14 @@ impl HTMLAllCollectionMethods<crate::DomTypeHolder> for HTMLAllCollection {
         if let Some(index) = parse_array_index(&name_or_index.str()) {
             return self
                 .collection
-                .Item(index)
+                .Item(cx, index)
                 .map(HTMLCollectionOrElement::Element);
         }
         self.all_named_elements(cx, name_or_index)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#the-htmlallcollection-interface:supported-property-names>
-    fn SupportedPropertyNames(&self) -> Vec<DOMString> {
+    fn SupportedPropertyNames(&self, no_gc: &NoGC) -> Vec<DOMString> {
         let mut names: Vec<DOMString> = vec![];
         let mut push = |name: &Atom| {
             if name.is_empty() {
@@ -196,7 +199,7 @@ impl HTMLAllCollectionMethods<crate::DomTypeHolder> for HTMLAllCollection {
                 names.push(name);
             }
         };
-        for element in self.collection.elements_iter() {
+        for element in self.collection.elements_iter(no_gc) {
             if let Some(id) = element.get_id() {
                 push(&id);
             }

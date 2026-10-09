@@ -32,7 +32,6 @@ use crate::dom::html::htmlmediaelement::HTMLMediaElement;
 use crate::dom::sourcebuffer::SourceBuffer;
 use crate::dom::sourcebufferlist::SourceBufferList;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 /// <https://w3c.github.io/media-source/#mediasource>
 #[dom_struct]
@@ -80,20 +79,20 @@ impl MediaSource {
     }
 
     fn new_with_proto(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<MediaSource> {
-        let source_buffers = SourceBufferList::new(window, can_gc);
-        let active_source_buffers = SourceBufferList::new(window, can_gc);
+        let source_buffers = SourceBufferList::new(cx, window);
+        let active_source_buffers = SourceBufferList::new(cx, window);
         reflect_dom_object_with_proto(
+            cx,
             Box::new(MediaSource::new_inherited(
                 &source_buffers,
                 &active_source_buffers,
             )),
             window,
             proto,
-            can_gc,
         )
     }
 
@@ -241,7 +240,7 @@ impl MediaSource {
     }
 
     /// <https://w3c.github.io/media-source/#duration-change-algorithm>
-    fn change_duration(&self, new_duration: f64) -> ErrorResult {
+    fn change_duration(&self, cx: &mut JSContext, new_duration: f64) -> ErrorResult {
         // Step 1. If the current value of duration is equal to new duration, then return.
         if self.duration.get() == new_duration {
             return Ok(());
@@ -267,7 +266,7 @@ impl MediaSource {
             warn!("Could not set the duration of the media player: {error:?}");
         }
         if let Some(element) = self.media_element.get() {
-            element.media_source_duration_changed(new_duration);
+            element.media_source_duration_changed(cx, new_duration);
         }
         Ok(())
     }
@@ -289,7 +288,7 @@ impl MediaSource {
                 // Run the duration change algorithm with new duration set to the largest
                 // track buffer ranges end time across all the track buffers across all
                 // SourceBuffer objects in sourceBuffers.
-                if let Err(error) = self.change_duration(self.highest_buffered_end()) {
+                if let Err(error) = self.change_duration(cx, self.highest_buffered_end()) {
                     warn!("Could not set the duration of an ended media source: {error:?}");
                 }
 
@@ -298,7 +297,7 @@ impl MediaSource {
                 {
                     warn!("Could not end the media source of the media player: {error:?}");
                 }
-                element.media_source_data_changed();
+                element.media_source_data_changed(cx);
             },
             Some(EndOfStreamError::Network) => element.media_source_failed(MEDIA_ERR_NETWORK, cx),
             Some(EndOfStreamError::Decode) => element.media_source_failed(MEDIA_ERR_DECODE, cx),
@@ -330,7 +329,7 @@ impl MediaSource {
             // media player does not tell the duration found in an initialization
             // segment, so it is unbounded until the page sets it.
             if self.duration.get().is_nan() &&
-                let Err(error) = self.change_duration(f64::INFINITY)
+                let Err(error) = self.change_duration(cx, f64::INFINITY)
             {
                 warn!("Could not set the duration of a media source: {error:?}");
             }
@@ -349,25 +348,25 @@ impl MediaSource {
                 .iter()
                 .find_map(|source_buffer| source_buffer.video_size());
             element.media_source_received_metadata(
+                cx,
                 self.duration.get(),
                 has_audio,
                 video_size,
-                CanGc::from_cx(cx),
             );
         }
 
-        element.media_source_data_changed();
+        element.media_source_data_changed(cx);
     }
 }
 
 impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
     /// <https://w3c.github.io/media-source/#dom-mediasource-constructor>
     fn Constructor(
+        cx: &mut JSContext,
         window: &Window,
         proto: Option<HandleObject>,
-        can_gc: CanGc,
     ) -> DomRoot<MediaSource> {
-        MediaSource::new_with_proto(window, proto, can_gc)
+        MediaSource::new_with_proto(cx, window, proto)
     }
 
     /// <https://w3c.github.io/media-source/#dom-mediasource-sourcebuffers>
@@ -397,7 +396,7 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
     }
 
     /// <https://w3c.github.io/media-source/#dom-mediasource-duration>
-    fn SetDuration(&self, duration: f64) -> ErrorResult {
+    fn SetDuration(&self, cx: &mut JSContext, duration: f64) -> ErrorResult {
         // Step 1. If the value being set is negative or NaN then throw a TypeError.
         if duration.is_nan() || duration < 0. {
             return Err(Error::Type(cformat!("Invalid duration: {}", duration)));
@@ -417,7 +416,7 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
 
         // Step 4. Run the duration change algorithm with new duration set to the value
         // being assigned to this attribute.
-        self.change_duration(duration)
+        self.change_duration(cx, duration)
     }
 
     // https://w3c.github.io/media-source/#dom-mediasource-onsourceopen
@@ -430,7 +429,11 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
     event_handler!(sourceclose, GetOnsourceclose, SetOnsourceclose);
 
     /// <https://w3c.github.io/media-source/#dom-mediasource-addsourcebuffer>
-    fn AddSourceBuffer(&self, type_: DOMString, can_gc: CanGc) -> Fallible<DomRoot<SourceBuffer>> {
+    fn AddSourceBuffer(
+        &self,
+        cx: &mut JSContext,
+        type_: DOMString,
+    ) -> Fallible<DomRoot<SourceBuffer>> {
         // Step 1. If type is an empty string then throw a TypeError exception.
         if type_.is_empty() {
             return Err(Error::Type(cformat!("The media type is empty")));
@@ -464,7 +467,7 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
             })?;
 
         // Step 5. Create a new SourceBuffer object and associated resources.
-        let source_buffer = SourceBuffer::new(self.global().as_window(), self, id, can_gc);
+        let source_buffer = SourceBuffer::new(cx, self.global().as_window(), self, id);
 
         // Step 9. Add the new object to sourceBuffers and queue a task to fire an event
         // named addsourcebuffer at sourceBuffers.

@@ -1952,6 +1952,7 @@ impl ScriptThread {
                 // stylesheets swapped in place, so a change reaches the page the user
                 // is looking at rather than only the next one.
                 self.update_user_stylesheets_of_live_documents(
+                    cx.no_gc(),
                     user_content_manager_id,
                     user_stylesheets,
                 );
@@ -3163,7 +3164,6 @@ impl ScriptThread {
         pipeline_id: PipelineId,
         metadata: Option<&Metadata>,
         origin: MutableOrigin,
-        cx: &mut js::context::JSContext,
     ) -> Option<DomRoot<Document>> {
         if self.closed_pipelines.borrow().contains(&pipeline_id) {
             // If the pipeline closed, do not process the headers.
@@ -4619,6 +4619,7 @@ impl ScriptThread {
     /// rules are applied on the next reflow.
     fn update_user_stylesheets_of_live_documents(
         &self,
+        no_gc: &js::context::NoGC,
         user_content_manager_id: UserContentManagerId,
         user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
     ) {
@@ -4636,7 +4637,7 @@ impl ScriptThread {
             document
                 .window()
                 .replace_user_stylesheets(user_stylesheets.clone());
-            document.dirty_all_nodes();
+            document.dirty_all_nodes(no_gc);
         }
     }
 

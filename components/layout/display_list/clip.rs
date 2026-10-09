@@ -447,6 +447,8 @@ fn opaque_mask_bands(style: &ComputedValues) -> Option<u8> {
             MaskClip::ContentBox => CONTENT_BAND,
             MaskClip::PaddingBox => CONTENT_BAND | PADDING_BAND,
             MaskClip::BorderBox => CONTENT_BAND | PADDING_BAND | BORDER_BAND,
+            // Only `background-clip` takes this value.
+            MaskClip::BorderArea => return None,
         };
         // `mask-composite` combines a layer with the layers below it, so the last layer has
         // nothing to be combined with.

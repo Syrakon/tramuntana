@@ -645,7 +645,7 @@ impl DisplayListBuilder<'_> {
                 flags: primitive_flags,
             };
             self.wr()
-                .push_backdrop_filter(&common, &backdrop_filters, &[], &[]);
+                .push_backdrop_filter(&common, &backdrop_filters, &[]);
         }
 
         true

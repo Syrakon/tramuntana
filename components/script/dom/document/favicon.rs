@@ -30,8 +30,10 @@ use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::document::Document;
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::types::GlobalScope;
-use crate::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
-use crate::network_listener::{FetchResponseListener, ResourceTimingListener, submit_timing};
+use crate::fetch::fetch::{RequestWithGlobalScope, create_a_potential_cors_request};
+use crate::fetch::network_listener::{
+    FetchResponseListener, ResourceTimingListener, submit_timing,
+};
 
 /// The size a vector favicon is rasterized at. The embedder scales the result
 /// down to whatever its chrome uses, so this only sets the ceiling on detail.
@@ -232,11 +234,11 @@ impl FetchResponseListener for DefaultFaviconFetchContext {
         &mut self,
         _: &mut js::context::JSContext,
         request_id: RequestId,
-        chunk: Vec<u8>,
+        chunk: bytes::Bytes,
     ) {
         self.image_cache.notify_pending_response(
             self.id,
-            FetchResponseMsg::ProcessResponseChunk(request_id, chunk.into()),
+            FetchResponseMsg::ProcessResponseChunk(request_id, chunk),
         );
     }
 
@@ -254,9 +256,14 @@ impl FetchResponseListener for DefaultFaviconFetchContext {
         submit_timing(cx, &self, &response, &timing);
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
+    fn process_csp_violations(
+        &mut self,
+        cx: &mut js::context::JSContext,
+        _request_id: RequestId,
+        violations: Vec<Violation>,
+    ) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations, None, None);
+        global.report_csp_violations(cx, violations, None, None);
     }
 }
 

@@ -101,11 +101,14 @@ impl URL {
     pub(crate) fn create_blob_url(global: &GlobalScope, blob: &Blob) -> DOMString {
         // XXX: Second field is an unicode-serialized Origin, it is a temporary workaround
         //      and should not be trusted. See issue https://github.com/servo/servo/issues/11722
-        let origin = global.origin().immutable();
+        let origin = global.origin();
 
         let id = blob.get_blob_url_id();
 
-        DOMString::from(URL::unicode_serialization_blob_url(origin, &id))
+        DOMString::from(URL::unicode_serialization_blob_url(
+            origin.immutable(),
+            &id,
+        ))
     }
 
     /// <https://w3c.github.io/FileAPI/#unicodeBlobURL>
@@ -212,8 +215,9 @@ impl URLMethods<crate::DomTypeHolder> for URL {
             BlobOrMediaSource::Blob(blob) => URL::create_blob_url(global, &blob),
             // <https://w3c.github.io/media-source/#dom-url-createobjecturl>
             BlobOrMediaSource::MediaSource(media_source) => {
-                let origin = global.origin().immutable();
-                let url = URL::unicode_serialization_blob_url(origin, &Uuid::new_v4());
+                let origin = global.origin();
+                let url =
+                    URL::unicode_serialization_blob_url(origin.immutable(), &Uuid::new_v4());
                 // A media source is not in the blob URL store: only the media elements
                 // of the window that made the URL can load it.
                 if let Some(window) = global.downcast::<Window>() {

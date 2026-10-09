@@ -1176,6 +1176,7 @@ impl HTMLMediaElement {
             self.direction_of_playback() == PlaybackDirection::Forwards
         {
             self.seek(
+                cx,
                 self.earliest_possible_position(),
                 /* approximate_for_speed */ false,
             );
@@ -1241,7 +1242,7 @@ impl HTMLMediaElement {
         // Step 5. Set the media element's can autoplay flag to false.
         self.autoplaying.set(false);
 
-        self.resume_waiting_load();
+        self.resume_waiting_load(cx);
         self.update_media_state();
     }
 
@@ -1330,7 +1331,6 @@ impl HTMLMediaElement {
     /// <https://html.spec.whatwg.org/multipage/#ready-states>
     fn change_ready_state(&self, cx: &mut JSContext, ready_state: ReadyState) {
         let old_ready_state = self.ready_state.get();
-        let was_potentially_playing = self.is_potentially_playing();
         self.ready_state.set(ready_state);
 
         // > When the ready state of a media element whose networkState is not NETWORK_EMPTY changes,
@@ -1404,9 +1404,12 @@ impl HTMLMediaElement {
                 // > to fire an event named timeupdate at the element,
                 // > and queue a media element task given the media element
                 // > to fire an event named waiting at the element.
-                if was_potentially_playing &&
+                // The ready state is HAVE_NOTHING when the media resource is let go of, which
+                // is not playback running out of data.
+                if new != ReadyState::HaveNothing &&
+                    !self.paused.get() &&
                     !self.ended_playback(LoopCondition::Included) &&
-                    !self.error.get().is_none() &&
+                    !self.in_error_state() &&
                     !self.is_paused_for_user_interaction() &&
                     !self.is_paused_for_in_band_content()
                 {
@@ -1415,7 +1418,7 @@ impl HTMLMediaElement {
                 }
 
                 // The media player has to stop too: its clock does not wait for the data.
-                self.update_media_state();
+                // `update_media_state` below does that.
             },
 
             // => "If the previous ready state was HAVE_CURRENT_DATA or less,
@@ -2154,7 +2157,7 @@ impl HTMLMediaElement {
                 // fetched at all, due to network errors, causing the user agent to give up
                 // trying to fetch the resource" steps of the resource fetch algorithm.
                 if !media_source.attach(self) {
-                    self.resource_selection_algorithm_failure_steps();
+                    self.resource_selection_algorithm_failure_steps(cx);
                     return;
                 }
                 self.media_source.set(Some(&media_source));
@@ -2172,7 +2175,7 @@ impl HTMLMediaElement {
                             return;
                         }
 
-                        this.delay_load_event(false, cx);
+                        this.delay_load_event(cx, false);
                     }));
             },
         }
@@ -2555,7 +2558,7 @@ impl HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-seek>
-    fn seek(&self, time: f64, _approximate_for_speed: bool) {
+    fn seek(&self, cx: &mut JSContext, time: f64, _approximate_for_speed: bool) {
         // Step 1. Set the media element's show poster flag to false.
         self.show_poster.set(false);
 
@@ -2653,7 +2656,7 @@ impl HTMLMediaElement {
         // play back that position.
         // The rest of the steps are handled when the media engine signals a ready state change or
         // otherwise satisfies seek completion and signals a position change.
-        self.media_source_data_changed();
+        self.media_source_data_changed(cx);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-seek>
@@ -2904,6 +2907,7 @@ impl HTMLMediaElement {
         // posible position of the media resource and return.
         if self.Loop() {
             self.seek(
+                cx,
                 self.earliest_possible_position(),
                 /* approximate_for_speed */ false,
             );
@@ -3208,6 +3212,7 @@ impl HTMLMediaElement {
         // seek to that time, and let jumped be true.
         if self.default_playback_start_position.get() > 0. {
             self.seek(
+                cx,
                 self.default_playback_start_position.get(),
                 /* approximate_for_speed */ false,
             );
@@ -3229,6 +3234,7 @@ impl HTMLMediaElement {
                 !jumped
             {
                 self.seek(
+                    cx,
                     initial_playback_position,
                     /* approximate_for_speed */ false,
                 )
@@ -3253,7 +3259,7 @@ impl HTMLMediaElement {
         );
     }
 
-    fn playback_duration_changed(&self, duration: Option<Duration>) {
+    fn playback_duration_changed(&self, cx: &mut JSContext, duration: Option<Duration>) {
         let duration = duration.map_or(f64::INFINITY, |duration| duration.as_secs_f64());
 
         if self.duration.get() == duration {
@@ -3273,7 +3279,7 @@ impl HTMLMediaElement {
         // than the time of the end of the media resource, then the user agent must also seek to the
         // time of the end of the media resource.
         if self.current_playback_position.get() > duration {
-            self.seek(duration, /* approximate_for_speed */ false);
+            self.seek(cx, duration, /* approximate_for_speed */ false);
         }
     }
 
@@ -3309,7 +3315,7 @@ impl HTMLMediaElement {
         }
     }
 
-    fn playback_need_data(&self) {
+    fn playback_need_data(&self, cx: &JSContext) {
         // The media engine signals that the source needs more data. If we already have a valid
         // fetch request, we do nothing. Otherwise, if we have no request and the previous request
         // was cancelled because we got an EnoughData event, we restart fetching where we left.
@@ -3322,7 +3328,7 @@ impl HTMLMediaElement {
         };
         if let Some(backed_off) = cancel_reason {
             if backed_off {
-                self.continue_fetch();
+                self.continue_fetch(cx);
             }
             return;
         }
@@ -3399,7 +3405,7 @@ impl HTMLMediaElement {
             MediaSessionEvent::SetPositionState(media_position_state),
         );
 
-        self.media_source_data_changed();
+        self.media_source_data_changed(cx);
     }
 
     fn playback_seek_done(&self, cx: &JSContext, position: f64) {
@@ -3489,10 +3495,10 @@ impl HTMLMediaElement {
     /// <https://w3c.github.io/media-source/#sourcebuffer-init-segment-received>
     pub(crate) fn media_source_received_metadata(
         &self,
+        cx: &mut JSContext,
         duration: f64,
         has_audio: bool,
         video_size: Option<(u32, u32)>,
-        can_gc: CanGc,
     ) {
         if self.ready_state.get() != ReadyState::HaveNothing {
             return;
@@ -3511,18 +3517,18 @@ impl HTMLMediaElement {
             is_live: false,
             title: None,
         };
-        self.playback_metadata_updated(&metadata, can_gc);
+        self.playback_metadata_updated(cx, &metadata);
     }
 
     /// The duration of the media source attached to this element is another one.
     /// <https://w3c.github.io/media-source/#duration-change-algorithm>
-    pub(crate) fn media_source_duration_changed(&self, duration: f64) {
+    pub(crate) fn media_source_duration_changed(&self, cx: &mut JSContext, duration: f64) {
         // The duration is part of the metadata for as long as the element has not got it.
         if self.ready_state.get() == ReadyState::HaveNothing {
             return;
         }
 
-        self.playback_duration_changed(Duration::try_from_secs_f64(duration).ok());
+        self.playback_duration_changed(cx, Duration::try_from_secs_f64(duration).ok());
     }
 
     /// The end of stream algorithm of the media source attached to this element has run
@@ -3534,16 +3540,16 @@ impl HTMLMediaElement {
         }
 
         if self.ready_state.get() == ReadyState::HaveNothing {
-            self.media_data_processing_failure_steps();
+            self.media_data_processing_failure_steps(cx);
         } else {
-            self.media_data_processing_fatal_steps(error, cx);
+            self.media_data_processing_fatal_steps(cx, error);
         }
     }
 
     /// Set the ready state from what the media source attached to this element holds for the
     /// current playback position. To be called whenever either of them changes.
     /// <https://w3c.github.io/media-source/#buffer-monitoring>
-    pub(crate) fn media_source_data_changed(&self) {
+    pub(crate) fn media_source_data_changed(&self, cx: &mut JSContext) {
         let Some(media_source) = self.media_source.get() else {
             return;
         };
@@ -3609,7 +3615,7 @@ impl HTMLMediaElement {
         };
 
         if ready_state != old_ready_state {
-            self.change_ready_state(ready_state);
+            self.change_ready_state(cx, ready_state);
         }
     }
 
@@ -4176,12 +4182,12 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-currenttime>
-    fn SetCurrentTime(&self, _cx: &mut JSContext, time: Finite<f64>) {
+    fn SetCurrentTime(&self, cx: &mut JSContext, time: Finite<f64>) {
         if self.ready_state.get() == ReadyState::HaveNothing {
             self.default_playback_start_position.set(*time);
         } else {
             self.official_playback_position.set(*time);
-            self.seek(*time, /* approximate_for_speed */ false);
+            self.seek(cx, *time, /* approximate_for_speed */ false);
         }
     }
 
@@ -4197,8 +4203,8 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-fastseek>
-    fn FastSeek(&self, time: Finite<f64>) {
-        self.seek(*time, /* approximate_for_speed */ true);
+    fn FastSeek(&self, cx: &mut JSContext, time: Finite<f64>) {
+        self.seek(cx, *time, /* approximate_for_speed */ true);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-played>
@@ -4373,7 +4379,7 @@ impl VirtualMethods for HTMLMediaElement {
                     self.media_element_load_algorithm(cx);
                 }
             },
-            local_name!("autoplay") | local_name!("preload") => self.resume_waiting_load(),
+            local_name!("autoplay") | local_name!("preload") => self.resume_waiting_load(cx),
             local_name!("controls") => {
                 if mutation.new_value(attr).is_some() {
                     self.render_controls(cx);
@@ -5078,7 +5084,7 @@ impl HTMLMediaElementEventHandler {
             // buffers got, not the ones the media player finds.
             PlayerEvent::DurationChanged(duration) => {
                 if element.media_source.get().is_none() {
-                    element.playback_duration_changed(duration)
+                    element.playback_duration_changed(cx, duration)
                 }
             },
             PlayerEvent::EndOfStream => element.playback_end(cx),
@@ -5089,7 +5095,7 @@ impl HTMLMediaElementEventHandler {
                     element.playback_metadata_updated(cx, metadata)
                 }
             },
-            PlayerEvent::NeedData => element.playback_need_data(),
+            PlayerEvent::NeedData => element.playback_need_data(cx),
             PlayerEvent::PositionChanged(position) => {
                 element.playback_position_changed(cx, position)
             },

@@ -16,7 +16,6 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::credentialmanagement::authenticatorresponse::AuthenticatorResponse;
 use crate::dom::credentialmanagement::publickeycredential::same_buffer;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 /// What the authenticator signed, as the parts an
 /// [`AuthenticatorAssertionResponse`] shows to script.
@@ -56,14 +55,14 @@ impl AuthenticatorAssertionResponse {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         assertion: Assertion,
-        can_gc: CanGc,
     ) -> DomRoot<AuthenticatorAssertionResponse> {
         reflect_dom_object(
+            cx,
             Box::new(AuthenticatorAssertionResponse::new_inherited(assertion)),
             global,
-            can_gc,
         )
     }
 }

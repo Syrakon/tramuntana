@@ -4783,7 +4783,10 @@ impl Document {
         }
         for ancestor in node.inclusive_ancestors(ShadowIncluding::No) {
             if let Some(element) = ancestor.downcast::<Element>() {
-                element.restyle(NodeDamage::Style);
+                // What `Element::restyle` does for `NodeDamage::Style`.
+                self.ensure_pending_restyle(element)
+                    .hint
+                    .insert(RestyleHint::RESTYLE_SELF);
             }
         }
     }

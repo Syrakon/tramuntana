@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::ptr;
-use std::rc::Rc;
 
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dom_struct::dom_struct;
@@ -11,7 +10,6 @@ use js::context::JSContext;
 use js::jsapi::JSObject;
 use js::typedarray::{ArrayBufferU8, HeapArrayBuffer};
 use script_bindings::error::{Error, Fallible};
-use script_bindings::realms::{AlreadyInRealm, InRealm};
 use script_bindings::reflector::reflect_dom_object;
 use script_bindings::str::{DOMString, USVString};
 use script_bindings::trace::RootedTraceableBox;
@@ -25,9 +23,8 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::credentialmanagement::authenticatorresponse::AuthenticatorResponse;
 use crate::dom::credentialmanagement::credential::Credential;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{Promise, RootedPromise};
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 /// `bytes` as the `ArrayBuffer` kept in `slot`: made on first use, the same
 /// object from then on, as `[SameObject]` asks.
@@ -37,7 +34,7 @@ pub(super) fn same_buffer(
     bytes: &[u8],
 ) -> Fallible<RootedTraceableBox<HeapArrayBuffer>> {
     if !slot.is_initialized() {
-        slot.set_data(cx.into(), bytes, CanGc::from_cx(cx))
+        slot.set_data(cx, bytes)
             .map_err(|_| Error::JSFailed)?;
     }
     slot.get_typed_array().map_err(|_| Error::JSFailed)
@@ -49,13 +46,8 @@ pub(super) fn new_buffer(
     bytes: &[u8],
 ) -> Fallible<RootedTraceableBox<HeapArrayBuffer>> {
     rooted!(&in(cx) let mut object = ptr::null_mut::<JSObject>());
-    create_buffer_source::<ArrayBufferU8>(
-        cx.into(),
-        bytes,
-        object.handle_mut(),
-        CanGc::from_cx(cx),
-    )
-    .map_err(|_| Error::JSFailed)
+    create_buffer_source::<ArrayBufferU8>(cx, bytes, object.handle_mut())
+        .map_err(|_| Error::JSFailed)
 }
 
 /// <https://www.w3.org/TR/webauthn-2/#iface-pkcredential>
@@ -82,15 +74,15 @@ impl PublicKeyCredential {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         raw_id: Vec<u8>,
         response: &AuthenticatorResponse,
-        can_gc: CanGc,
     ) -> DomRoot<PublicKeyCredential> {
         reflect_dom_object(
+            cx,
             Box::new(PublicKeyCredential::new_inherited(raw_id, response)),
             global,
-            can_gc,
         )
     }
 }
@@ -120,14 +112,12 @@ impl PublicKeyCredentialMethods<DomTypeHolder> for PublicKeyCredential {
     /// <https://www.w3.org/TR/webauthn-2/#dom-publickeycredential-isuserverifyingplatformauthenticatoravailable>
     fn IsUserVerifyingPlatformAuthenticatorAvailable(
         cx: &mut JSContext,
-        _global: &Window,
-    ) -> Rc<Promise> {
-        let in_realm_proof = AlreadyInRealm::assert::<DomTypeHolder>();
-        let promise =
-            Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), CanGc::from_cx(cx));
+        global: &Window,
+    ) -> RootedPromise {
+        let promise = Promise::new(cx, global.as_global_scope());
         // Whether the embedder has an authenticator is not known here: it is
         // asked only when a passkey is. Saying yes lets the page offer one.
-        promise.resolve_native(&true, CanGc::from_cx(cx));
+        promise.resolve_native(cx, &true);
         promise
     }
 }

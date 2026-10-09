@@ -154,6 +154,10 @@ pub struct LayoutThread {
     /// Whether or not user agent stylesheets have been added to the Stylist or not.
     have_added_user_agent_stylesheets: bool,
 
+    /// Whether the user stylesheets in the `Stylist` were replaced since the last
+    /// reflow, so that their `@font-face` rules have to be looked at again.
+    user_stylesheets_replaced: bool,
+
     // A vector of parsed `DocumentStyleSheet`s representing the corresponding `UserStyleSheet`s
     // associated with the `WebView` to which this `Layout` belongs. The `DocumentStylesheet`s might
     // be shared with `Layout`s in the same `ScriptThread`.
@@ -322,7 +326,6 @@ impl Layout for LayoutThread {
     fn replace_user_stylesheets(
         &mut self,
         user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
-        document_context: &WebFontDocumentContext,
     ) {
         // The user stylesheets held here are appended to the `Stylist` by the first
         // reflow, not when they arrive. Before that reflow the `Stylist` has none of
@@ -332,18 +335,14 @@ impl Layout for LayoutThread {
             for stylesheet in self.user_stylesheets.iter() {
                 let guard = stylesheet.0.shared_lock.read();
                 self.stylist.remove_stylesheet(stylesheet.clone(), &guard);
-                self.font_context
-                    .remove_all_web_fonts_from_stylesheet(stylesheet);
             }
             for stylesheet in user_stylesheets.iter() {
                 let guard = stylesheet.0.shared_lock.read();
                 self.stylist.append_stylesheet(stylesheet.clone(), &guard);
-                self.load_all_web_fonts_from_stylesheet_with_guard(
-                    stylesheet,
-                    &guard,
-                    document_context,
-                );
             }
+            // The next reflow loads their web fonts and drops the ones of the
+            // stylesheets that went away.
+            self.user_stylesheets_replaced = true;
         }
         self.user_stylesheets = user_stylesheets;
     }
@@ -892,6 +891,7 @@ impl LayoutThread {
             image_cache: config.image_cache,
             font_context: config.font_context,
             have_added_user_agent_stylesheets: false,
+            user_stylesheets_replaced: false,
             have_ever_generated_display_list: Cell::new(false),
             last_display_list_was_empty: Cell::new(true),
             device_has_changed: false,
@@ -1237,21 +1237,24 @@ impl LayoutThread {
 
         let invalidation_set = self.stylist.flush(guards);
 
-        let changed_web_fonts =
-            if need_user_agent_stylesheet_addition || reflow_request.stylesheets_changed() {
-                self.font_context.invalidate_font_feature_values_map();
-                // Load new @font-face rules and remove old ones if necessary.
-                // TODO: Can we make the invalidation set tell us whether any @font-face rules changed?
-                self.font_context.rebuild_font_face_set(
-                    self.webview_id,
-                    &self.stylist,
-                    guards,
-                    self.web_font_finished_loading_callback.clone(),
-                    &reflow_request.document_context,
-                )
-            } else {
-                WebFontSetDifference::default()
-            };
+        let user_stylesheets_replaced = std::mem::take(&mut self.user_stylesheets_replaced);
+        let changed_web_fonts = if need_user_agent_stylesheet_addition ||
+            reflow_request.stylesheets_changed() ||
+            user_stylesheets_replaced
+        {
+            self.font_context.invalidate_font_feature_values_map();
+            // Load new @font-face rules and remove old ones if necessary.
+            // TODO: Can we make the invalidation set tell us whether any @font-face rules changed?
+            self.font_context.rebuild_font_face_set(
+                self.webview_id,
+                &self.stylist,
+                guards,
+                self.web_font_finished_loading_callback.clone(),
+                &reflow_request.document_context,
+            )
+        } else {
+            WebFontSetDifference::default()
+        };
 
         StylistStylesheetUpdate {
             invalidation_set,

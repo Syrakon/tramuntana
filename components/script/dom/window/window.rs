@@ -929,14 +929,9 @@ impl Window {
     /// Swap the user stylesheets of the document already on screen: remove the ones
     /// this `Window` installed and install `user_stylesheets` in their place. The
     /// caller is responsible for dirtying the document afterwards.
-    pub(crate) fn replace_user_stylesheets(
-        &self,
-        user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
-    ) {
+    pub(crate) fn replace_user_stylesheets(&self, user_stylesheets: Rc<Vec<DocumentStyleSheet>>) {
         *self.user_stylesheets.borrow_mut() = user_stylesheets.clone();
-        let web_font_context = self.web_font_context();
-        self.layout_mut()
-            .replace_user_stylesheets(user_stylesheets, &web_font_context);
+        self.layout_mut().replace_user_stylesheets(user_stylesheets);
     }
 
     pub(crate) fn get_player_context(&self) -> WindowGLContext {

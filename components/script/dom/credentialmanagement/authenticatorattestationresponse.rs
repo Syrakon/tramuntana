@@ -17,7 +17,6 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::credentialmanagement::authenticatorresponse::AuthenticatorResponse;
 use crate::dom::credentialmanagement::publickeycredential::{new_buffer, same_buffer};
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::CanGc;
 
 /// What the authenticator made, as the parts an
 /// [`AuthenticatorAttestationResponse`] shows to script.
@@ -56,14 +55,14 @@ impl AuthenticatorAttestationResponse {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         global: &GlobalScope,
         attestation: Attestation,
-        can_gc: CanGc,
     ) -> DomRoot<AuthenticatorAttestationResponse> {
         reflect_dom_object(
+            cx,
             Box::new(AuthenticatorAttestationResponse::new_inherited(attestation)),
             global,
-            can_gc,
         )
     }
 }

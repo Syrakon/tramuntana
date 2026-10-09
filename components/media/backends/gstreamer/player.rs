@@ -580,9 +580,6 @@ pub struct GStreamerPlayer {
     stream_type: StreamType,
     /// Decorator used to setup the video sink and process the produced frames.
     render: Arc<Mutex<GStreamerRender>>,
-    /// Whether to enable download buffering. This is only enabled heuristically for some media,
-    /// because it causes issues in certain situations. See <https://github.com/servo/servo/issues/23241>.
-    download_buffering_enabled: AtomicBool,
 }
 
 impl GStreamerPlayer {
@@ -614,7 +611,6 @@ impl GStreamerPlayer {
             is_ready: Arc::new(Once::new()),
             stream_type,
             render: Arc::new(Mutex::new(GStreamerRender::new(gl_context))),
-            download_buffering_enabled: AtomicBool::new(false),
         }
     }
 
@@ -638,37 +634,10 @@ impl GStreamerPlayer {
         let signal_adapter = gstreamer_play::PlaySignalAdapter::new_sync_emit(&player);
         let pipeline = player.pipeline();
 
-        // FIXME(#282): The progressive downloading breaks playback on Windows and Android.
-        if !cfg!(any(target_os = "windows", target_os = "android")) &&
-            self.download_buffering_enabled.load(Ordering::Relaxed)
-        {
-            // Set player to perform progressive downloading. This will make the
-            // player store the downloaded media in a local temporary file for
-            // faster playback of already-downloaded chunks.
-            let flags = pipeline.property_value("flags");
-            let flags_class = match glib::FlagsClass::with_type(flags.type_()) {
-                Some(flags) => flags,
-                None => {
-                    return Err(PlayerError::Backend(
-                        "FlagsClass creation failed".to_owned(),
-                    ));
-                },
-            };
-            let flags_class = match flags_class.builder_with_value(flags) {
-                Some(class) => class,
-                None => {
-                    return Err(PlayerError::Backend(
-                        "FlagsClass creation failed".to_owned(),
-                    ));
-                },
-            };
-            let Some(flags) = flags_class.set_by_nick("download").build() else {
-                return Err(PlayerError::Backend(
-                    "FlagsClass creation failed".to_owned(),
-                ));
-            };
-            pipeline.set_property_from_value("flags", &flags);
-        }
+        // The progressive downloading of playbin is not used: its download buffer cannot give
+        // the end of the media resource, which is looked at to find its type, before it has
+        // all of it, so nothing could be played or even known about the media before the
+        // download was over. The data is fetched again if it is ever needed again.
 
         // Set max size for the player buffer.
         pipeline.set_property("buffer-size", MAX_BUFFER_SIZE);
@@ -1251,13 +1220,8 @@ impl Player for GStreamerPlayer {
         self.with_inner(|inner| inner.remove_source_buffer_range(id, range))
     }
 
-    fn set_download_buffering_enabled(&self, enable: bool) -> Result<(), PlayerError> {
-        // We can't use the default implementation because we need to set the
-        // download_buffering_enabled flag before calling setup, which is where
-        // the "download" flag is set on the pipeline. That has to happen before
-        // the URI is set.
-        self.download_buffering_enabled
-            .store(enable, Ordering::Relaxed);
+    fn set_download_buffering_enabled(&self, _enable: bool) -> Result<(), PlayerError> {
+        // Never enabled: see the note about progressive downloading in `setup`.
         self.setup()?;
         Ok(())
     }

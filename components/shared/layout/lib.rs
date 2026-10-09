@@ -320,11 +320,7 @@ pub trait Layout {
     /// [`Layout::remove_stylesheet`], this is safe to call before the first reflow: the
     /// user stylesheets only reach the `Stylist` when that reflow happens, so until then
     /// there is nothing there to remove.
-    fn replace_user_stylesheets(
-        &mut self,
-        user_stylesheets: Rc<Vec<DocumentStyleSheet>>,
-        font_context: &WebFontDocumentContext,
-    );
+    fn replace_user_stylesheets(&mut self, user_stylesheets: Rc<Vec<DocumentStyleSheet>>);
 
     /// Inform the layout that its ScriptThread is about to exit.
     fn exit_now(&mut self);

@@ -32,7 +32,6 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::mediasource::MediaSource;
 use crate::dom::timeranges::{TimeRanges, TimeRangesContainer};
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 /// <https://w3c.github.io/media-source/#sourcebuffer>
 #[dom_struct]
@@ -87,15 +86,15 @@ impl SourceBuffer {
     }
 
     pub(crate) fn new(
+        cx: &mut JSContext,
         window: &Window,
         media_source: &MediaSource,
         id: SourceBufferId,
-        can_gc: CanGc,
     ) -> DomRoot<SourceBuffer> {
         reflect_dom_object(
+            cx,
             Box::new(SourceBuffer::new_inherited(media_source, id)),
             window,
-            can_gc,
         )
     }
 
@@ -278,7 +277,7 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
     }
 
     /// <https://w3c.github.io/media-source/#dom-sourcebuffer-buffered>
-    fn GetBuffered(&self, can_gc: CanGc) -> Fallible<DomRoot<TimeRanges>> {
+    fn GetBuffered(&self, cx: &mut JSContext) -> Fallible<DomRoot<TimeRanges>> {
         // Step 1. If this object has been removed from the sourceBuffers attribute of the
         // parent media source then throw an InvalidStateError exception.
         if self.media_source.get().is_none() {
@@ -286,9 +285,9 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
         }
 
         Ok(TimeRanges::new(
+            cx,
             self.global().as_window(),
             self.buffered.borrow().clone(),
-            can_gc,
         ))
     }
 
@@ -394,7 +393,9 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
         let data = match data {
             ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
             ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
-        };
+        }
+        // A detached buffer has no bytes left to copy.
+        .unwrap_or_default();
 
         // The media player parses the bytes before it returns, which is what lets it
         // tell here that the source buffer is full. The steps of the buffer append

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
+use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::reflect_dom_object;
 use stylo_atoms::Atom;
@@ -15,7 +16,6 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::sourcebuffer::SourceBuffer;
 use crate::dom::window::Window;
-use crate::script_runtime::CanGc;
 
 /// <https://w3c.github.io/media-source/#sourcebufferlist>
 #[dom_struct]
@@ -32,8 +32,8 @@ impl SourceBufferList {
         }
     }
 
-    pub(crate) fn new(window: &Window, can_gc: CanGc) -> DomRoot<SourceBufferList> {
-        reflect_dom_object(Box::new(SourceBufferList::new_inherited()), window, can_gc)
+    pub(crate) fn new(cx: &mut JSContext, window: &Window) -> DomRoot<SourceBufferList> {
+        reflect_dom_object(cx, Box::new(SourceBufferList::new_inherited()), window)
     }
 
     pub(crate) fn item(&self, index: usize) -> Option<DomRoot<SourceBuffer>> {

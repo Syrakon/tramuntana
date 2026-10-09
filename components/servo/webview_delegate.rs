@@ -150,7 +150,7 @@ impl AllowOrDenyRequest {
 pub struct PasskeyRequest {
     origin: String,
     operation: PasskeyOperation,
-    responder: IpcResponder<PasskeyResponse>,
+    responder: AutomaticResponder<PasskeyResponse>,
     error_sender: ServoErrorSender,
 }
 
@@ -164,7 +164,7 @@ impl PasskeyRequest {
         Self {
             origin,
             operation,
-            responder: IpcResponder::new_same_process(
+            responder: AutomaticResponder::new_same_process(
                 Box::new(callback),
                 PasskeyResponse::Refused,
             ),

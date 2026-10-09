@@ -32,14 +32,15 @@ use crate::dom::credentialmanagement::publickeycredential::PublicKeyCredential;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::{Promise, RootedPromise};
 use crate::routed_promise::{RoutedPromiseListener, callback_promise};
-use crate::script_runtime::CanGc;
 
 /// The bytes of a `BufferSource`, copied out.
 fn bytes_of(source: &ArrayBufferViewOrArrayBuffer) -> Vec<u8> {
+    // A detached buffer has no bytes left to copy.
     match source {
         ArrayBufferViewOrArrayBuffer::ArrayBufferView(view) => view.to_vec(),
         ArrayBufferViewOrArrayBuffer::ArrayBuffer(buffer) => buffer.to_vec(),
     }
+    .unwrap_or_default()
 }
 
 /// The ids of the descriptors that name a public key credential.
@@ -135,7 +136,8 @@ impl CredentialsContainer {
         operation: PasskeyOperation,
     ) -> RootedPromise {
         let promise = Promise::new_in_realm(cx);
-        let origin = global.origin().immutable();
+        let origin = global.origin();
+        let origin = origin.immutable();
         let webview_id = match global.webview_id() {
             Some(id) if global.as_window().is_top_level() && origin.is_tuple() => id,
             _ => {
@@ -143,11 +145,12 @@ impl CredentialsContainer {
                 return promise;
             },
         };
-        let task_source = global.task_manager().dom_manipulation_task_source();
+        let task_manager = global.task_manager();
+        let task_source = task_manager.dom_manipulation_task_source();
         let callback = callback_promise(&promise, self, task_source);
         global.send_to_embedder(EmbedderMsg::RequestPasskey(
             webview_id,
-            origin.ascii_serialization(),
+            origin.ascii_serialization().into_owned(),
             operation,
             callback,
         ));
@@ -179,7 +182,7 @@ impl CredentialsContainer {
     fn create_credential(
         &self,
         cx: &mut CurrentRealm,
-        _options: &CredentialCreationOptions<DomTypeHolder>,
+        options: &CredentialCreationOptions<DomTypeHolder>,
     ) -> Fallible<RootedPromise> {
         // Step 1. Let settings be the current settings object.
         let global = GlobalScope::from_current_realm(cx);
@@ -234,7 +237,6 @@ impl RoutedPromiseListener<DomTypeHolder, PasskeyResponse> for CredentialsContai
         response: PasskeyResponse,
         promise: &RootedPromise,
     ) {
-        let can_gc = CanGc::from_cx(cx);
         let global = self.global();
         match response {
             PasskeyResponse::Created {
@@ -246,6 +248,7 @@ impl RoutedPromiseListener<DomTypeHolder, PasskeyResponse> for CredentialsContai
                 algorithm,
             } => {
                 let response = AuthenticatorAttestationResponse::new(
+                    cx,
                     &global,
                     Attestation {
                         client_data_json,
@@ -254,13 +257,12 @@ impl RoutedPromiseListener<DomTypeHolder, PasskeyResponse> for CredentialsContai
                         public_key,
                         algorithm,
                     },
-                    can_gc,
                 );
                 let credential = PublicKeyCredential::new(
+                    cx,
                     &global,
                     credential_id,
                     response.upcast::<AuthenticatorResponse>(),
-                    can_gc,
                 );
                 promise.resolve_native(cx, &credential);
             },
@@ -272,6 +274,7 @@ impl RoutedPromiseListener<DomTypeHolder, PasskeyResponse> for CredentialsContai
                 user_handle,
             } => {
                 let response = AuthenticatorAssertionResponse::new(
+                    cx,
                     &global,
                     Assertion {
                         client_data_json,
@@ -279,13 +282,12 @@ impl RoutedPromiseListener<DomTypeHolder, PasskeyResponse> for CredentialsContai
                         signature,
                         user_handle,
                     },
-                    can_gc,
                 );
                 let credential = PublicKeyCredential::new(
+                    cx,
                     &global,
                     credential_id,
                     response.upcast::<AuthenticatorResponse>(),
-                    can_gc,
                 );
                 promise.resolve_native(cx, &credential);
             },

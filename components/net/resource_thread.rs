@@ -67,7 +67,7 @@ use crate::fetch::methods::{
 };
 use crate::filemanager_thread::FileManager;
 use crate::hsts::{self, HstsList};
-use crate::http_cache::{HttpCache, HttpCacheAssignment};
+use crate::http_cache::HttpCache;
 use crate::http_loader::{HttpState, http_redirect_fetch};
 use crate::protocols::ProtocolRegistry;
 use crate::request_filter::SharedRequestFilter;
@@ -237,7 +237,12 @@ fn create_http_states(
         cookie_jar: RwLock::new(cookie_jar),
         auth_cache: RwLock::new(auth_cache),
         history_states: RwLock::new(FxHashMap::default()),
-        http_cache: HttpCache::new(HttpCacheAssignment::Public),
+        http_cache: HttpCache::new(cache_dir.map(|cache_dir| {
+            (
+                cache_dir.join("http"),
+                servo_config::pref!(network_http_cache_disk_size),
+            )
+        })),
         client: create_http_client(create_tls_config(
             ca_certificates.clone(),
             ignore_certificate_errors,
@@ -279,7 +284,7 @@ fn memory_only_http_state(
         cookie_jar: RwLock::new(cookie_jar),
         auth_cache: RwLock::new(AuthCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
-        http_cache: HttpCache::new(HttpCacheAssignment::Private),
+        http_cache: HttpCache::default(),
         client: create_http_client(create_tls_config(
             ca_certificates,
             ignore_certificate_errors,
