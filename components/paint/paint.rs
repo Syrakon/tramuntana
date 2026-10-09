@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::create_dir_all;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitflags::bitflags;
 use crossbeam_channel::Sender;
@@ -44,12 +44,22 @@ use webgl::webgl_thread::WebGLContextBusyMap;
 #[cfg(feature = "webgpu")]
 use webgpu::canvas_context::WebGpuExternalImageMap;
 use webrender::{CaptureBits, MemoryReport};
-use webrender_api::units::{DevicePixel, DevicePoint};
+use webrender_api::units::{DevicePixel, DevicePoint, LayoutVector2D};
 use webrender_api::{FontInstanceKey, FontKey, ImageKey};
 
 use crate::InitialPaintState;
 use crate::painter::Painter;
 use crate::webview_renderer::UnknownWebView;
+
+/// The vertical scroll position of a WebView's viewport, in CSS pixels. Servo paints
+/// no scrollbars, so an embedder needs this to draw its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewportScrollExtent {
+    /// How far the content is scrolled down from its top.
+    pub offset: f32,
+    pub viewport_height: f32,
+    pub content_height: f32,
+}
 
 /// An option to control what kind of WebRender debugging is enabled while Servo is running.
 #[derive(Copy, Clone)]
@@ -155,6 +165,8 @@ bitflags! {
         const StartedFlinging = 1 << 4;
         /// A blinking text caret requires a redraw.
         const BlinkingCaret = 1 << 5;
+        /// A wheel glide has started and a repaint needs to happen to process the animation.
+        const StartedWheelGlide = 1 << 6;
     }
 }
 
@@ -802,6 +814,19 @@ impl Paint {
             .notify_input_event(webview_id, event)
     }
 
+    /// Glide the scroll of a wheel event that was passed to [`Self::notify_input_event`]
+    /// and is still waiting for script, instead of applying it in one jump.
+    pub fn glide_wheel_event(
+        &self,
+        webview_id: WebViewId,
+        input_event_id: InputEventId,
+        time_constant: Duration,
+    ) {
+        if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
+            painter.glide_wheel_event(webview_id, input_event_id, time_constant);
+        }
+    }
+
     pub fn notify_scroll_event(&self, webview_id: WebViewId, scroll: Scroll, point: WebViewPoint) {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
@@ -825,6 +850,19 @@ impl Paint {
 
     pub fn pinch_zoom(&self, webview_id: WebViewId) -> f32 {
         self.painter(webview_id.into()).pinch_zoom(webview_id)
+    }
+
+    pub fn viewport_scroll_extent(&self, webview_id: WebViewId) -> Option<ViewportScrollExtent> {
+        self.maybe_painter(webview_id.into())?
+            .viewport_scroll_extent(webview_id)
+    }
+
+    /// Scroll the viewport of the given WebView vertically by `delta` CSS pixels,
+    /// whatever is under the pointer.
+    pub fn scroll_viewport_by(&self, webview_id: WebViewId, delta: f32) {
+        if let Some(mut painter) = self.maybe_painter_mut(webview_id.into()) {
+            painter.scroll_viewport_by_delta(webview_id, LayoutVector2D::new(0.0, delta));
+        }
     }
 
     pub fn device_pixels_per_page_pixel(

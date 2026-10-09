@@ -41,7 +41,7 @@ use crate::servo::PendingHandledInputEvent;
 use crate::webview_delegate::{CreateNewWebViewRequest, DefaultWebViewDelegate, WebViewDelegate};
 use crate::{
     ColorPicker, ContextMenu, EmbedderControl, InputMethodControl, SelectElement, Servo,
-    UserContentManager, WebRenderDebugOption,
+    UserContentManager, ViewportScrollExtent, WebRenderDebugOption,
 };
 
 pub(crate) const MINIMUM_WEBVIEW_SIZE: Size2D<i32, DevicePixel> = Size2D::new(1, 1);
@@ -567,6 +567,16 @@ impl WebView {
         event_id
     }
 
+    /// Glide the scroll of a wheel event just passed to [`Self::notify_input_event`]: if the
+    /// page does not prevent it, the scroll is spread over the following frames, covering
+    /// about two thirds of what is left every `time_constant`, instead of jumping there.
+    pub fn glide_wheel_event(&self, event_id: InputEventId, time_constant: Duration) {
+        self.inner()
+            .servo
+            .paint()
+            .glide_wheel_event(self.id(), event_id, time_constant);
+    }
+
     pub fn notify_media_session_action_event(&self, event: MediaSessionActionType) {
         self.inner()
             .servo
@@ -615,6 +625,18 @@ impl WebView {
     /// Get the pinch zoom of the [`WebView`].
     pub fn pinch_zoom(&self) -> f32 {
         self.inner().servo.paint().pinch_zoom(self.id())
+    }
+
+    /// The vertical scroll position of the viewport, or `None` when it cannot be
+    /// scrolled. Servo paints no scrollbars; this is what an embedder draws one from.
+    pub fn viewport_scroll_extent(&self) -> Option<ViewportScrollExtent> {
+        self.inner().servo.paint().viewport_scroll_extent(self.id())
+    }
+
+    /// Scroll the viewport vertically by `delta` CSS pixels. Unlike
+    /// [`Self::notify_scroll_event`] this never scrolls a nested scroller.
+    pub fn scroll_viewport_by(&self, delta: f32) {
+        self.inner().servo.paint().scroll_viewport_by(self.id(), delta);
     }
 
     pub fn device_pixels_per_css_pixel(&self) -> Scale<f32, CSSPixel, DevicePixel> {

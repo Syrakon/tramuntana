@@ -5,6 +5,7 @@
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use embedder_traits::{
@@ -15,7 +16,7 @@ use embedder_traits::{
 use euclid::{Scale, Vector2D};
 use log::{debug, warn};
 use malloc_size_of::MallocSizeOf;
-use paint_api::display_list::ScrollType;
+use paint_api::display_list::{ScrollType, SpatialTreeNodeInfo};
 use paint_api::viewport_description::{
     DEFAULT_PAGE_ZOOM, MAX_PAGE_ZOOM, MIN_PAGE_ZOOM, ViewportDescription,
 };
@@ -33,9 +34,10 @@ use webrender_api::{DocumentId, ExternalScrollId, ScrollLocation};
 
 use crate::paint::RepaintReason;
 use crate::painter::Painter;
+use crate::paint::ViewportScrollExtent;
 use crate::pinch_zoom::PinchZoom;
 use crate::pipeline_details::PipelineDetails;
-use crate::refresh_driver::BaseRefreshDriver;
+use crate::refresh_driver::{BaseRefreshDriver, RefreshDriverObserver};
 use crate::touch::{
     PendingTouchInputEvent, TouchHandler, TouchIdMoveTracking, TouchMoveAllowed, TouchSequenceState,
 };
@@ -97,6 +99,13 @@ pub(crate) struct WebViewRenderer {
     /// but are waiting for processing. When they are handled by script, they may trigger
     /// scroll events depending on whether `preventDefault()` was called on the event.
     pending_wheel_events: FxHashMap<InputEventId, WheelEvent>,
+    /// The pending wheel events whose scroll the embedder asked to glide, with the time
+    /// constant of each glide.
+    wheel_event_glides: FxHashMap<InputEventId, Duration>,
+    /// The scroll that gliding wheel events still owe the page, if any.
+    wheel_glide: Option<WheelGlide>,
+    /// Whether or not a [`WheelGlideRefreshDriverObserver`] is currently observing frames.
+    observing_frames_for_wheel_glide: bool,
     /// Touch input state machine
     touch_handler: TouchHandler,
     /// "Desktop-style" zoom that resizes the viewport to fit the window.
@@ -148,6 +157,9 @@ impl WebViewRenderer {
             touch_handler: TouchHandler::new(webview_id),
             pending_scroll_zoom_events: Default::default(),
             pending_wheel_events: Default::default(),
+            wheel_event_glides: Default::default(),
+            wheel_glide: None,
+            observing_frames_for_wheel_glide: false,
             page_zoom: DEFAULT_PAGE_ZOOM,
             pinch_zoom: PinchZoom::new(rect),
             hidpi_scale_factor: Scale::new(hidpi_scale_factor.0),
@@ -371,6 +383,78 @@ impl WebViewRenderer {
             fling_action.cursor,
         );
         true
+    }
+
+    /// Glide the scroll of the pending wheel event with the given id instead of applying
+    /// it in one jump, once script has handled the event without preventing it.
+    pub(crate) fn glide_wheel_event(&mut self, id: InputEventId, time_constant: Duration) {
+        if !time_constant.is_zero() && self.pending_wheel_events.contains_key(&id) {
+            self.wheel_event_glides.insert(id, time_constant);
+        }
+    }
+
+    /// Add the scroll of a wheel event to the glide in progress, or start one.
+    fn add_to_wheel_glide(
+        &mut self,
+        delta: DeviceVector2D,
+        point: WebViewPoint,
+        time_constant: Duration,
+        repaint_reason: &Cell<RepaintReason>,
+    ) {
+        let now = Instant::now();
+        let glide = self.wheel_glide.get_or_insert(WheelGlide {
+            left: DeviceVector2D::zero(),
+            point,
+            time_constant,
+            last_frame: now,
+        });
+        // Turning the wheel the other way drops what was left: the page answers the
+        // new direction at once.
+        let keep = |left: f32, delta: f32| if left * delta < 0.0 { 0.0 } else { left };
+        glide.left = DeviceVector2D::new(
+            keep(glide.left.x, delta.x) + delta.x,
+            keep(glide.left.y, delta.y) + delta.y,
+        );
+        glide.point = point;
+        glide.time_constant = time_constant;
+
+        if !self.observing_frames_for_wheel_glide {
+            glide.last_frame = now;
+            self.refresh_driver
+                .add_observer(Rc::new(WheelGlideRefreshDriverObserver {
+                    webview_id: self.id,
+                }));
+            self.observing_frames_for_wheel_glide = true;
+        }
+        repaint_reason.set(repaint_reason.get().union(RepaintReason::StartedWheelGlide));
+    }
+
+    /// Scroll the part of the wheel glide that this frame owes the page, during a
+    /// `RefreshDriver`-based frame tick. Returns `true` if we should continue observing
+    /// frames (the glide is ongoing) or `false` if we should stop (the glide has finished).
+    pub(crate) fn update_wheel_glide_at_new_frame_start(&mut self) -> bool {
+        let Some(glide) = self.wheel_glide.as_mut() else {
+            self.observing_frames_for_wheel_glide = false;
+            return false;
+        };
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(glide.last_frame);
+        glide.last_frame = now;
+        let step = DeviceVector2D::new(
+            wheel_glide_step(glide.left.x, elapsed, glide.time_constant),
+            wheel_glide_step(glide.left.y, elapsed, glide.time_constant),
+        );
+        glide.left -= step;
+        let point = glide.point;
+        let ongoing = glide.left != DeviceVector2D::zero();
+        if !ongoing {
+            self.wheel_glide = None;
+            self.observing_frames_for_wheel_glide = false;
+        }
+
+        self.notify_scroll_event(Scroll::Delta(step.into()), point);
+        ongoing
     }
 
     fn dispatch_input_event_with_hit_testing(
@@ -833,6 +917,8 @@ impl WebViewRenderer {
             );
         } else {
             self.touch_handler.stop_fling_if_needed();
+            // Nothing under the pointer scrolls any further, so neither does the glide.
+            self.wheel_glide = None;
         }
 
         // Additionally notify pinch zoom update to the script.
@@ -904,6 +990,30 @@ impl WebViewRenderer {
             }
         }
         None
+    }
+
+    /// The vertical scroll position and extent of the viewport (root pipeline, root
+    /// scroll node) of this WebView, or `None` when input cannot scroll it.
+    pub(crate) fn viewport_scroll_extent(&self) -> Option<ViewportScrollExtent> {
+        let root_pipeline_id = self.root_pipeline_id?;
+        let root_pipeline = self.pipelines.get(&root_pipeline_id)?;
+        let root_scroll_id = ExternalScrollId(0, root_pipeline_id.into());
+        root_pipeline
+            .scroll_tree
+            .nodes
+            .iter()
+            .find_map(|node| match node.info {
+                SpatialTreeNodeInfo::Scroll(ref info) if info.external_id == root_scroll_id => {
+                    Some(info)
+                },
+                _ => None,
+            })
+            .filter(|info| info.scroll_sensitivity.y.contains(ScrollType::InputEvents))
+            .map(|info| ViewportScrollExtent {
+                offset: info.offset.y,
+                viewport_height: info.clip_rect.height(),
+                content_height: info.content_rect.height(),
+            })
     }
 
     /// Scroll the viewport (root pipeline, root scroll node) of this WebView, but first
@@ -1123,16 +1233,105 @@ impl WebViewRenderer {
                 );
         }
 
+        let glide_time_constant = self.wheel_event_glides.remove(&id);
         if let Some(wheel_event) = self.pending_wheel_events.remove(&id) &&
             !result.contains(InputEventResult::DefaultPrevented)
         {
             // A scroll delta for a wheel event is the inverse of the wheel delta.
             let scroll_delta =
                 DeviceVector2D::new(-wheel_event.delta.x as f32, -wheel_event.delta.y as f32);
-            self.notify_scroll_event(Scroll::Delta(scroll_delta.into()), wheel_event.point);
+            match glide_time_constant {
+                Some(time_constant) => self.add_to_wheel_glide(
+                    scroll_delta,
+                    wheel_event.point,
+                    time_constant,
+                    repaint_reason,
+                ),
+                None => {
+                    self.notify_scroll_event(Scroll::Delta(scroll_delta.into()), wheel_event.point)
+                },
+            }
         }
+    }
+}
+
+/// The scroll that wheel events still owe the page. It is played out a frame at a time
+/// from `Paint`, after script has handled the events, so that the page moves once per
+/// painted frame whatever the pace at which script answers.
+struct WheelGlide {
+    /// The scroll still to do, in device pixels.
+    left: DeviceVector2D,
+    /// Where the pointer was at the last wheel event.
+    point: WebViewPoint,
+    /// How long the glide takes to cover about two thirds of what is left.
+    time_constant: Duration,
+    /// When the last step of the glide was taken.
+    last_frame: Instant,
+}
+
+/// How much of `left`, the scroll a wheel glide still owes the page, a frame that comes
+/// `elapsed` after the last one scrolls. The scroll decays with the given time constant,
+/// so it starts fast and eases out whatever the frame rate. A frame scrolls whole pixels,
+/// as a page left between two of them draws its text between two of them, and never
+/// less than one, so the glide ends; what is left under a pixel goes in one piece.
+fn wheel_glide_step(left: f32, elapsed: Duration, time_constant: Duration) -> f32 {
+    if left.abs() < 1.0 {
+        return left;
+    }
+    let share = 1.0 - (-elapsed.as_secs_f32() / time_constant.as_secs_f32()).exp();
+    let step = (left * share).round();
+    if step == 0.0 { left.signum() } else { step }
+}
+
+pub(crate) struct WheelGlideRefreshDriverObserver {
+    pub webview_id: WebViewId,
+}
+
+impl RefreshDriverObserver for WheelGlideRefreshDriverObserver {
+    fn frame_started(&self, painter: &mut Painter) -> bool {
+        painter
+            .webview_renderer_mut(self.webview_id)
+            .is_some_and(WebViewRenderer::update_wheel_glide_at_new_frame_start)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UnknownWebView(pub WebViewId);
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::wheel_glide_step;
+
+    /// A wheel step is played out in full, easing out, and never overshoots.
+    #[test]
+    fn wheel_glide_covers_the_whole_step_and_ends() {
+        let frame = Duration::from_secs_f32(1.0 / 60.0);
+        let time_constant = Duration::from_millis(120);
+        let mut left = 160.0_f32;
+        let mut moved = 0.0;
+        let mut last = f32::MAX;
+        let mut frames = 0;
+        while left != 0.0 {
+            let step = wheel_glide_step(left, frame, time_constant);
+            assert!(step > 0.0 && step <= left, "frame {frames}: {step} of {left}");
+            assert!(step <= last, "each frame moves no more than the one before");
+            assert_eq!(step.fract(), 0.0, "a frame moves whole pixels");
+            last = step;
+            left -= step;
+            moved += step;
+            frames += 1;
+            assert!(frames < 200, "the glide ends");
+        }
+        assert_eq!(moved, 160.0);
+        // A step that is not a whole number of pixels still arrives whole.
+        let frame = Duration::from_secs_f32(1.0 / 144.0);
+        let time_constant = Duration::from_millis(200);
+        let mut left = -100.5_f32;
+        while left != 0.0 {
+            left -= wheel_glide_step(left, frame, time_constant);
+            assert!(left <= 0.0, "never past where the wheel asked");
+        }
+    }
+}

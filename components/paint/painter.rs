@@ -6,6 +6,7 @@ use std::cell::{Cell, LazyCell};
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
@@ -56,7 +57,7 @@ use wr_malloc_size_of::MallocSizeOfOps;
 
 use crate::Paint;
 use crate::largest_contentful_paint_calculator::LargestContentfulPaintCalculator;
-use crate::paint::{RepaintReason, WebRenderDebugOption};
+use crate::paint::{RepaintReason, ViewportScrollExtent, WebRenderDebugOption};
 use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};
 use crate::render_notifier::RenderNotifier;
 use crate::screenshot::ScreenshotTaker;
@@ -925,6 +926,15 @@ impl Painter {
         );
     }
 
+    pub(crate) fn viewport_scroll_extent(
+        &self,
+        webview_id: WebViewId,
+    ) -> Option<ViewportScrollExtent> {
+        self.webview_renderers
+            .get(&webview_id)
+            .and_then(WebViewRenderer::viewport_scroll_extent)
+    }
+
     pub(crate) fn update_epoch(
         &mut self,
         webview_id: WebViewId,
@@ -1402,6 +1412,17 @@ impl Painter {
         self.send_to_constellation(EmbedderToConstellationMessage::RequestScreenshotReadiness(
             webview_id,
         ));
+    }
+
+    pub(crate) fn glide_wheel_event(
+        &mut self,
+        webview_id: WebViewId,
+        input_event_id: InputEventId,
+        time_constant: Duration,
+    ) {
+        if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) {
+            webview_renderer.glide_wheel_event(input_event_id, time_constant);
+        }
     }
 
     pub(crate) fn notify_input_event_handled(
