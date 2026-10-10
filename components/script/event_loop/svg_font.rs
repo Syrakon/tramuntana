@@ -2,13 +2,14 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use app_units::Au;
 use fonts::{
     FallbackFontSelectionOptions, FontContext, FontDescriptor, FontFamilyDescriptor,
     FontSearchScope, fallback_font_families,
 };
+use fonts_traits::FontDataAndIndex;
 use net_traits::image_cache::FontResolver;
 use resvg::usvg::{Font, FontFamily, FontStretch, FontStyle, fontdb};
 use rustc_hash::FxHashMap;
@@ -23,11 +24,16 @@ use style::values::computed::{
 use webrender_api::FontVariation;
 
 /// Used to dynamically query fonts used in SVGs and insert them into the fontDB used when rasterizing.
+///
+/// The caches hold font data, not [`fontdb::ID`]s: usvg clones the database of its
+/// options for every tree it parses, so an ID is only meaningful in the database
+/// that issued it. An ID remembered from one SVG names nothing, or another font,
+/// in the database of the next one, and usvg then drops the text.
 #[derive(MallocSizeOf)]
 pub struct SvgFontResolver {
-    /// Cache for Font to ID
-    font_id_cache: Mutex<FxHashMap<Font, fontdb::ID>>,
-    fallback_id_cache: Mutex<FxHashMap<char, Vec<fontdb::ID>>>,
+    /// Cache for Font to its data
+    font_cache: Mutex<FxHashMap<Font, FontDataAndIndex>>,
+    fallback_cache: Mutex<FxHashMap<char, Vec<FontDataAndIndex>>>,
     #[conditional_malloc_size_of]
     context: Arc<FontContext>,
 }
@@ -35,21 +41,24 @@ pub struct SvgFontResolver {
 impl SvgFontResolver {
     pub(crate) fn new(context: Arc<FontContext>) -> Self {
         Self {
-            font_id_cache: Mutex::new(FxHashMap::default()),
-            fallback_id_cache: Mutex::new(FxHashMap::default()),
+            font_cache: Mutex::new(FxHashMap::default()),
+            fallback_cache: Mutex::new(FxHashMap::default()),
             context,
         }
     }
 
-    /// Insert the font into the database in [`SvgFontResolver`] and into the cache.
-    fn insert_into_database(
-        &self,
-        font: &Font,
-        database: &mut Arc<fontdb::Database>,
-    ) -> Option<fontdb::ID> {
+    /// Find the data of the first family of `font` that is available.
+    fn find_font(&self, font: &Font) -> Option<FontDataAndIndex> {
         let font_descriptor = font_to_fontdescriptor(font);
 
-        for family in font.families() {
+        // usvg gives text without a `font-family` the family named in its options,
+        // "Times New Roman" by default, and a list may name only fonts that are not
+        // installed. Neither is a reason to lose the text: end on sans-serif.
+        let families = font
+            .families()
+            .iter()
+            .chain(std::iter::once(&FontFamily::SansSerif));
+        for family in families {
             let family_descriptor = FontFamilyDescriptor::new(
                 fontfamily_to_singlefontfamily(family),
                 FontSearchScope::Any,
@@ -74,18 +83,43 @@ impl SvgFontResolver {
             let Ok(data_and_index) = font_ref.font_data_and_index() else {
                 continue;
             };
-            let ids = Arc::make_mut(database).load_font_source(fontdb::Source::Binary(Arc::new(
-                data_and_index.data.clone(),
-            )));
-
-            if let Some(id) = ids.get(data_and_index.index as usize).copied() {
-                self.font_id_cache.lock().unwrap().insert(font.clone(), id);
-                return Some(id);
-            }
+            return Some(data_and_index.clone());
         }
 
         None
     }
+}
+
+/// The caches are plain maps that every writer leaves consistent, so one that was
+/// poisoned by a panic elsewhere is still usable.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The ID of `font` in `database`, loading it there if this database does not have
+/// it yet.
+fn load_into_database(
+    font: &FontDataAndIndex,
+    database: &mut Arc<fontdb::Database>,
+) -> Option<fontdb::ID> {
+    let bytes: &[u8] = font.data.as_ref();
+    let loaded = database.faces().find(|face| {
+        face.index == font.index &&
+            match &face.source {
+                fontdb::Source::Binary(source) => {
+                    let source: &[u8] = (**source).as_ref();
+                    std::ptr::eq(source, bytes)
+                },
+                _ => false,
+            }
+    });
+    if let Some(face) = loaded {
+        return Some(face.id);
+    }
+
+    let ids = Arc::make_mut(database)
+        .load_font_source(fontdb::Source::Binary(Arc::new(font.data.clone())));
+    ids.get(font.index as usize).copied()
 }
 
 fn font_to_fontdescriptor(font: &Font) -> FontDescriptor {
@@ -157,13 +191,16 @@ fn fontfamily_to_singlefontfamily(family: &FontFamily) -> SingleFontFamily {
 
 impl FontResolver for SvgFontResolver {
     fn resolve(&self, font: &Font, database: &mut Arc<fontdb::Database>) -> Option<fontdb::ID> {
-        {
-            let id_cache = self.font_id_cache.lock().unwrap();
-            if let Some(font_id) = id_cache.get(font) {
-                return Some(*font_id);
-            }
-        }
-        self.insert_into_database(font, database)
+        let cached = lock(&self.font_cache).get(font).cloned();
+        let data_and_index = match cached {
+            Some(data_and_index) => data_and_index,
+            None => {
+                let data_and_index = self.find_font(font)?;
+                lock(&self.font_cache).insert(font.clone(), data_and_index.clone());
+                data_and_index
+            },
+        };
+        load_into_database(&data_and_index, database)
     }
 
     fn resolve_fallback(
@@ -172,13 +209,15 @@ impl FontResolver for SvgFontResolver {
         excluded: &[fontdb::ID],
         database: &mut Arc<fontdb::Database>,
     ) -> Option<fontdb::ID> {
-        {
-            let id_cache = self.fallback_id_cache.lock().unwrap();
-            if let Some(font_id) = id_cache
-                .get(&character)
-                .and_then(|font_ids| font_ids.iter().find(|font_id| !excluded.contains(font_id)))
+        let cached = lock(&self.fallback_cache)
+            .get(&character)
+            .cloned()
+            .unwrap_or_default();
+        for data_and_index in &cached {
+            if let Some(id) = load_into_database(data_and_index, database) &&
+                !excluded.contains(&id)
             {
-                return Some(*font_id);
+                return Some(id);
             }
         }
         let fallback_options = FallbackFontSelectionOptions::new(
@@ -212,25 +251,19 @@ impl FontResolver for SvgFontResolver {
                     continue;
                 };
 
-                let ids = Arc::make_mut(database).load_font_source(fontdb::Source::Binary(
-                    Arc::new(data_and_index.data.clone()),
-                ));
-
-                let Some(id) = ids.get(data_and_index.index as usize) else {
+                let Some(id) = load_into_database(data_and_index, database) else {
                     continue;
                 };
 
-                if excluded.contains(id) {
+                if excluded.contains(&id) {
                     continue;
                 }
 
-                self.fallback_id_cache
-                    .lock()
-                    .unwrap()
+                lock(&self.fallback_cache)
                     .entry(character)
                     .or_default()
-                    .push(*id);
-                return Some(*id);
+                    .push(data_and_index.clone());
+                return Some(id);
             }
         }
         None

@@ -842,6 +842,14 @@ impl ComputedValuesExt for ComputedValues {
             return true;
         }
 
+        // From <https://drafts.fxtf.org/filter-effects-2/#BackdropFilterProperty>
+        // > A computed value of other than `none` results in the creation of […] a stacking context
+        // Note `will-change: backdrop-filter` is handled above by `STACKING_CONTEXT_UNCONDITIONAL`.
+        // The display list only applies the filter from the element's own stacking context.
+        if !effects.backdrop_filter.0.is_empty() {
+            return true;
+        }
+
         // From <https://www.w3.org/TR/compositing-1/#mix-blend-mode>
         // > Applying a blendmode other than `normal` to the element must establish a new stacking context
         // Note `will-change: mix-blend-mode` is handled above by `STACKING_CONTEXT_UNCONDITIONAL`.
