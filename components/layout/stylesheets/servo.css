@@ -90,9 +90,19 @@ textarea:not(:placeholder-shown)::placeholder {
   display: none !important;
 }
 
-input:placeholder-shown::-servo-text-control-inner-editor,
+/* The editor stays in the box while the placeholder shows: the caret is painted
+   in it, and a focused empty field with no caret looks as if it took no typing.
+   It is given no room, so the placeholder starts where the caret is. */
+input:placeholder-shown::-servo-text-control-inner-editor {
+  flex: none !important;
+  inline-size: 0 !important;
+  min-width: 0 !important;
+  overflow: visible !important;
+}
+
 textarea:placeholder-shown::-servo-text-control-inner-editor {
-  display: none !important;
+  block-size: 0 !important;
+  overflow: visible !important;
 }
 
 input::placeholder,
