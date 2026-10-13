@@ -845,6 +845,10 @@ impl GStreamerPlayer {
 
         let inner = self.inner.borrow();
         let inner = inner.as_ref().unwrap();
+        // The signal handlers below belong to the signal adapter and to the pipeline,
+        // which the inner player owns. They hold it weakly: a strong reference would
+        // keep the player, its pipeline and its source buffers alive for ever.
+        let weak_inner = Arc::downgrade(inner);
         let observer = self.observer.clone();
         // Handle `end-of-stream` signal.
         signal_adapter.connect_end_of_stream(move |_| {
@@ -857,11 +861,14 @@ impl GStreamerPlayer {
             let _ = notify!(observer, PlayerEvent::Error(error.to_string()));
         });
 
-        let inner_clone = inner.clone();
+        let inner_clone = weak_inner.clone();
         let observer = self.observer.clone();
         // Handle `state-changed` signal.
         signal_adapter.connect_state_changed(move |_, play_state| {
-            inner_clone.lock().unwrap().play_state = play_state;
+            let Some(inner) = inner_clone.upgrade() else {
+                return;
+            };
+            inner.lock().unwrap().play_state = play_state;
 
             let state = match play_state {
                 gstreamer_play::PlayState::Buffering => Some(PlaybackState::Buffering),
@@ -875,12 +882,15 @@ impl GStreamerPlayer {
             }
         });
 
-        let inner_clone = inner.clone();
+        let inner_clone = weak_inner.clone();
         let observer = self.observer.clone();
         // Handle `position-update` signal.
         signal_adapter.connect_position_updated(move |_, position| {
             if let Some(seconds) = position.map(|p| p.seconds_f64()) {
-                if let Ok(inner) = inner_clone.lock() {
+                let Some(inner) = inner_clone.upgrade() else {
+                    return;
+                };
+                if let Ok(inner) = inner.lock() {
                     inner.media_source.set_position(seconds);
                 }
                 let _ = notify!(observer, PlayerEvent::PositionChanged(seconds));
@@ -894,14 +904,17 @@ impl GStreamerPlayer {
         });
 
         // Handle `media-info-updated` signal.
-        let inner_clone = inner.clone();
+        let inner_clone = weak_inner.clone();
         let observer = self.observer.clone();
         signal_adapter.connect_media_info_updated(move |_, info| {
             let Ok(metadata) = metadata_from_media_info(info) else {
                 return;
             };
 
-            let mut inner = inner_clone.lock().unwrap();
+            let Some(inner) = inner_clone.upgrade() else {
+                return;
+            };
+            let mut inner = inner.lock().unwrap();
 
             if inner.last_metadata.as_ref() == Some(&metadata) {
                 return;
@@ -938,7 +951,7 @@ impl GStreamerPlayer {
         });
 
         // Handle `duration-changed` signal.
-        let inner_clone = inner.clone();
+        let inner_clone = weak_inner.clone();
         let observer = self.observer.clone();
         signal_adapter.connect_duration_changed(move |_, duration| {
             let duration = duration.map(|duration| {
@@ -948,7 +961,10 @@ impl GStreamerPlayer {
                 )
             });
 
-            let mut inner = inner_clone.lock().unwrap();
+            let Some(inner) = inner_clone.upgrade() else {
+                return;
+            };
+            let mut inner = inner.lock().unwrap();
             if let Some(ref mut metadata) = inner.last_metadata &&
                 metadata.duration != duration
             {
@@ -1017,7 +1033,7 @@ impl GStreamerPlayer {
         };
 
         let (receiver, error_handler_id) = {
-            let inner_clone = inner.clone();
+            let inner_clone = weak_inner.clone();
             let inner = inner.lock().unwrap();
             let pipeline = inner.player.pipeline();
 
@@ -1030,7 +1046,8 @@ impl GStreamerPlayer {
             pipeline.connect("source-setup", false, move |args| {
                 let source = args[1].get::<gstreamer::Element>().unwrap();
 
-                let mut inner = inner_clone.lock().unwrap();
+                let inner = inner_clone.upgrade()?;
+                let mut inner = inner.lock().unwrap();
                 let source = match inner.stream_type {
                     StreamType::Seekable => {
                         let servosrc = source
@@ -1047,7 +1064,8 @@ impl GStreamerPlayer {
                         let observer_ = observer.clone();
                         let observer__ = observer.clone();
                         let observer___ = observer.clone();
-                        let servosrc_ = servosrc.clone();
+                        // The source owns its callbacks, so they hold it weakly.
+                        let servosrc_ = servosrc.downgrade();
                         let enough_data_ = inner.enough_data.clone();
                         let enough_data__ = inner.enough_data.clone();
                         let seek_channel = Arc::new(Mutex::new(SeekChannel::new()));
@@ -1071,6 +1089,9 @@ impl GStreamerPlayer {
                                     let _ = notify!(observer__, PlayerEvent::EnoughData);
                                 })
                                 .seek_data(move |_, offset| {
+                                    let Some(servosrc_) = servosrc_.upgrade() else {
+                                        return false;
+                                    };
                                     let (ret, ack_channel) = if servosrc_.set_seek_offset(offset) {
                                         let _ = notify!(
                                             observer___,
