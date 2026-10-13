@@ -41,6 +41,11 @@ use crate::dom::workerglobalscope::WorkerGlobalScope;
 const MAX_LOG_DEPTH: usize = 10;
 /// The maximum elements in an object logged by console methods.
 const MAX_LOG_CHILDREN: usize = 15;
+/// How many objects deep the value sent to the devtools describes what an object holds.
+/// With `MAX_LOG_CHILDREN` it bounds the size of that value: without both, an object
+/// that leads to much of the heap of a page was copied whole, and more than once
+/// wherever two paths lead to the same object.
+const MAX_PREVIEW_DEPTH: usize = 3;
 
 /// <https://developer.mozilla.org/en-US/docs/Web/API/Console>
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -206,6 +211,9 @@ fn console_argument_from_handle_value(
                 // FIXME: Handle this properly
                 return Ok(DebuggerValue::StringValue("[circular]".into()));
             }
+            if seen.len() >= MAX_PREVIEW_DEPTH {
+                return Ok(DebuggerValue::StringValue("[object]".into()));
+            }
 
             seen.push(handle_value.asBits_);
             rooted!(&in(cx) let object = handle_value.to_object());
@@ -292,6 +300,9 @@ fn console_map_object_from_handle_value(
 
     let mut entries = Vec::new();
     for_of(cx, iterator.handle(), |cx, entry| {
+        if entries.len() >= MAX_LOG_CHILDREN {
+            return Ok(std::ops::ControlFlow::Break(()));
+        }
         if !entry.is_object() {
             return Err(().into());
         }
@@ -370,7 +381,7 @@ fn console_object_from_handle_value(
         return None;
     }
 
-    for id in ids.iter() {
+    for id in ids.iter().take(MAX_LOG_CHILDREN) {
         rooted!(&in(cx) let id = *id);
         rooted!(&in(cx) let mut descriptor = PropertyDescriptor::default());
 
