@@ -468,6 +468,10 @@ pub(crate) struct Window {
     #[conditional_malloc_size_of]
     user_scripts: Rc<Vec<UserScript>>,
 
+    /// Whether the user scripts have been run in this `Window`. They are for its global
+    /// object, which they must change once.
+    user_scripts_run: Cell<bool>,
+
     /// The `UserContentManager` this `Window` was created with, if any. It is what lets a
     /// later change to that manager find the documents it applies to.
     #[no_trace]
@@ -920,6 +924,11 @@ impl Window {
 
     pub(crate) fn userscripts(&self) -> &[UserScript] {
         &self.user_scripts
+    }
+
+    /// Whether the caller is the first to ask, and so the one to run the user scripts.
+    pub(crate) fn claim_userscripts_run(&self) -> bool {
+        !self.user_scripts_run.replace(true)
     }
 
     pub(crate) fn user_content_manager_id(&self) -> Option<UserContentManagerId> {
@@ -4213,6 +4222,7 @@ impl Window {
             exists_mut_observer: Cell::new(false),
             paint_api,
             user_scripts,
+            user_scripts_run: Cell::new(false),
             user_content_manager_id,
             user_stylesheets: DomRefCell::new(user_stylesheets),
             player_context,

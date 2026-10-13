@@ -11,8 +11,16 @@ use crate::realms::enter_auto_realm;
 
 pub(crate) fn load_script(head: &HTMLHeadElement) {
     let doc = head.owner_document();
+    // A document without a browsing context, such as the one `DOMParser` or
+    // `createHTMLDocument` makes, shares the `Window` of the page that made it. Its
+    // `head` is not a reason to run the scripts in that page again, and neither is a
+    // second `head` in the page itself: a script that wraps a function would wrap it
+    // once more every time.
+    if !doc.has_browsing_context() {
+        return;
+    }
     let userscripts = doc.window().userscripts().to_owned();
-    if userscripts.is_empty() {
+    if userscripts.is_empty() || !doc.window().claim_userscripts_run() {
         return;
     }
     let win = DomRoot::from_ref(doc.window());
