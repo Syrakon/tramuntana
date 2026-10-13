@@ -1009,6 +1009,7 @@ pub struct Window {
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
+    throttle_when_inactive: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
@@ -1319,6 +1320,7 @@ impl Window {
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new();
         let active = Rc::new(Cell::new(platform_window.is_active()));
+        let throttle_when_inactive = Rc::new(Cell::new(true));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
@@ -1349,6 +1351,7 @@ impl Window {
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
             let active = active.clone();
+            let throttle_when_inactive = throttle_when_inactive.clone();
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
@@ -1359,13 +1362,14 @@ impl Window {
 
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
-                // - Inactive window (not focused): cap to ~30fps to save energy
+                // - Inactive window (not focused): cap to ~30fps to save energy,
+                //   unless the window asked to keep its full rate
                 let min_frame_interval = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
-                } else if !active.get() {
+                } else if !active.get() && throttle_when_inactive.get() {
                     Some(Duration::from_micros(33333))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
@@ -1624,6 +1628,7 @@ impl Window {
             appearance_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
             active,
+            throttle_when_inactive,
             hovered,
             needs_present,
             input_rate_tracker,
@@ -2174,6 +2179,14 @@ impl Window {
     /// Returns whether this window is focused by the operating system (receiving key events).
     pub fn is_window_active(&self) -> bool {
         self.active.get()
+    }
+
+    /// Sets whether this window drops to ~30fps while it is not focused. On by
+    /// default. A window that shows video or animation the user still watches
+    /// while typing elsewhere turns it off: the cap halves the frame rate and,
+    /// on a 60Hz display, makes the frame pacing uneven.
+    pub fn set_throttle_when_inactive(&self, throttle: bool) {
+        self.throttle_when_inactive.set(throttle);
     }
 
     /// Returns whether this window is considered to be the window
