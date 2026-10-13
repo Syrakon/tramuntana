@@ -966,8 +966,14 @@ fn invoke_js_timer(
     global: &GlobalScope,
     timers: &JsTimers,
 ) {
-    // step 9.2 can be ignored, because we proactively prevent execution
-    // of this task when its scheduled execution is canceled.
+    // Step 9.2. If id does not exist in global's map of setTimeout and setInterval IDs,
+    // then abort these steps.
+    // Canceling a timer takes it out of the timers that are waiting, which is too late
+    // for one that is due together with the timer whose callback cancels it: the due
+    // ones have all been taken out by then, to be run one after the other.
+    if !timers.active_timers.borrow().contains_key(&data.handle) {
+        return;
+    }
 
     // prep for step ? in nested set_timeout_or_interval calls
     timers.nesting_level.set(data.nesting_level);
