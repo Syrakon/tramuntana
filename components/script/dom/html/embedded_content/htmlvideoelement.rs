@@ -31,6 +31,8 @@ use servo_url::ServoUrl;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 
 use crate::dom::bindings::codegen::Bindings::HTMLVideoElementBinding::HTMLVideoElementMethods;
+use crate::dom::bindings::codegen::Bindings::PerformanceBinding::PerformanceMethods;
+use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomGlobal;
@@ -42,6 +44,7 @@ use crate::dom::element::attributes::storage::AttrRef;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlmediaelement::{HTMLMediaElement, NetworkState, ReadyState};
+use crate::dom::media::videoplaybackquality::VideoPlaybackQuality;
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{Node, NodeDamage, NodeTraits};
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
@@ -423,6 +426,29 @@ impl HTMLVideoElementMethods<crate::DomTypeHolder> for HTMLVideoElement {
     // For testing purposes only. This is not an event from
     // https://html.spec.whatwg.org/multipage/#dom-video-poster
     event_handler!(postershown, GetOnpostershown, SetOnpostershown);
+
+    /// <https://w3c.github.io/media-playback-quality/#dom-htmlvideoelement-getvideoplaybackquality>
+    fn GetVideoPlaybackQuality(&self, cx: &mut JSContext) -> DomRoot<VideoPlaybackQuality> {
+        let quality = self
+            .htmlmediaelement
+            .media_player()
+            .and_then(|player| {
+                player
+                    .lock()
+                    .ok()
+                    .map(|player| player.video_playback_quality())
+            })
+            .unwrap_or_default();
+        let window = self.owner_window();
+        let creation_time = window.Performance(cx).Now();
+        VideoPlaybackQuality::new(
+            cx,
+            &window,
+            creation_time,
+            u32::try_from(quality.dropped_frames).unwrap_or(u32::MAX),
+            u32::try_from(quality.total_frames).unwrap_or(u32::MAX),
+        )
+    }
 }
 
 impl VirtualMethods for HTMLVideoElement {

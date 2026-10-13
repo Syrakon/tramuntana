@@ -130,10 +130,18 @@ impl MediaSource {
         // The containers the media player can take coded frames out of.
         let is_supported_container = matches!(
             (mime.type_().as_str(), mime.subtype().as_str()),
-            ("audio" | "video", "mp4" | "webm")
+            ("audio" | "video", "mp4" | "webm") | ("audio", "mpeg" | "aac")
         );
         is_supported_container &&
             ServoMedia::get().can_play_type(media_type) != SupportsMediaType::No
+    }
+
+    /// Whether the coded frames of the given media type carry no timestamps.
+    /// <https://w3c.github.io/media-source/#sourcebuffer-generate-timestamps-flag>
+    pub(crate) fn generates_timestamps(media_type: &str) -> bool {
+        media_type.parse::<Mime>().is_ok_and(|mime| {
+            mime.type_() == mime::AUDIO && matches!(mime.subtype().as_str(), "mpeg" | "aac")
+        })
     }
 
     /// Run the given closure with the media player of the media element this
@@ -249,11 +257,21 @@ impl MediaSource {
         // Step 2. If new duration is less than the highest presentation timestamp of any
         // buffered coded frames for all SourceBuffer objects in sourceBuffers, then throw
         // an InvalidStateError exception.
-        // The end of the last buffered frame is what is known here, which makes this
-        // stricter than the specification by the duration of that frame.
-        if new_duration < self.highest_buffered_end() {
+        let highest_presentation_timestamp = self
+            .source_buffers
+            .to_vec()
+            .iter()
+            .map(|source_buffer| source_buffer.highest_presentation_timestamp())
+            .fold(0., f64::max);
+        if new_duration < highest_presentation_timestamp {
             return Err(Error::InvalidState(None));
         }
+
+        // Step 3. Let highest end time be the largest track buffer ranges end time across
+        // all the track buffers across all SourceBuffer objects in sourceBuffers.
+        // Step 4. If new duration is less than highest end time, then update new duration
+        // to equal highest end time.
+        let new_duration = new_duration.max(self.highest_buffered_end());
 
         // Step 5. Update duration to new duration.
         self.duration.set(new_duration);
@@ -468,6 +486,8 @@ impl MediaSourceMethods<crate::DomTypeHolder> for MediaSource {
 
         // Step 5. Create a new SourceBuffer object and associated resources.
         let source_buffer = SourceBuffer::new(cx, self.global().as_window(), self, id);
+        // Steps 7-8. The mode is "sequence" if the generate timestamps flag is true.
+        source_buffer.set_generates_timestamps(MediaSource::generates_timestamps(&media_type));
 
         // Step 9. Add the new object to sourceBuffers and queue a task to fire an event
         // named addsourcebuffer at sourceBuffers.

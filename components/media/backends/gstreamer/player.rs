@@ -4,7 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, Once};
 use std::time;
@@ -24,7 +24,7 @@ use servo_media_player::metadata::Metadata;
 use servo_media_player::video::VideoFrameRenderer;
 use servo_media_player::{
     PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, SeekLockMsg, SourceBufferId,
-    SourceBufferState, StreamType,
+    SourceBufferState, StreamType, VideoPlaybackQuality,
 };
 use servo_media_streams::registry::{MediaStreamId, get_stream};
 use servo_media_traits::{BackendMsg, ClientContextId, MediaInstance};
@@ -126,11 +126,37 @@ enum PlayerSource {
     MediaSource(ServoMediaSourceSrc),
 }
 
+/// Counts the video frames handed to the renderer.
+#[derive(Default)]
+struct ShownFrames {
+    count: AtomicU64,
+    /// The presentation time of the frame counted last. A frame comes twice, as the
+    /// preroll and as the first sample, when playback starts or follows a seek.
+    last: Mutex<Option<gstreamer::ClockTime>>,
+}
+
+impl ShownFrames {
+    fn count(&self, presentation_time: Option<gstreamer::ClockTime>) {
+        let Ok(mut last) = self.last.lock() else {
+            return;
+        };
+        if presentation_time.is_some() && *last == presentation_time {
+            return;
+        }
+        *last = presentation_time;
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 struct PlayerInner {
     player: gstreamer_play::Play,
     signal_adapter: gstreamer_play::PlaySignalAdapter,
     source: Option<PlayerSource>,
     video_sink: gstreamer_app::AppSink,
+    shown_frames: Arc<ShownFrames>,
+    /// The frames the video sink dropped before it last started its count again, and
+    /// the count it gave last.
+    dropped_frames: Cell<(u64, u64)>,
     input_size: u64,
     seekable: bool,
     play_state: gstreamer_play::PlayState,
@@ -151,6 +177,28 @@ struct PlayerInner {
 }
 
 impl PlayerInner {
+    pub fn video_playback_quality(&self) -> VideoPlaybackQuality {
+        let dropped_now = self
+            .video_sink
+            .property::<gstreamer::Structure>("stats")
+            .get::<u64>("dropped")
+            .unwrap_or_default();
+        // The sink starts its count again after a flush, which a seek causes. A count
+        // lower than the last one tells that; frames dropped between the last call and
+        // the flush are missed.
+        let (mut dropped_earlier, dropped_last) = self.dropped_frames.get();
+        if dropped_now < dropped_last {
+            dropped_earlier += dropped_last;
+        }
+        self.dropped_frames.set((dropped_earlier, dropped_now));
+
+        let dropped_frames = dropped_earlier + dropped_now;
+        VideoPlaybackQuality {
+            total_frames: self.shown_frames.count.load(Ordering::Relaxed) + dropped_frames,
+            dropped_frames,
+        }
+    }
+
     pub fn set_input_size(&mut self, size: u64) -> Result<(), PlayerError> {
         // Set input_size to proxy its value, since it
         // could be set by the user before calling .setup().
@@ -497,6 +545,14 @@ impl PlayerInner {
         self.media_source()?.set_timestamp_offset(id, offset)
     }
 
+    fn set_source_buffer_sequence_mode(
+        &mut self,
+        id: SourceBufferId,
+        sequence: bool,
+    ) -> Result<(), PlayerError> {
+        self.media_source()?.set_sequence_mode(id, sequence)
+    }
+
     fn set_source_buffer_append_window(
         &mut self,
         id: SourceBufferId,
@@ -642,6 +698,23 @@ impl GStreamerPlayer {
         // Set max size for the player buffer.
         pipeline.set_property("buffer-size", MAX_BUFFER_SIZE);
 
+        // The volume and mute of a media element are applied inside the pipeline,
+        // not on the stream of the audio server. PipeWire and PulseAudio remember
+        // the volume and mute of a stream by the name of the application and give
+        // them to every stream it opens afterwards: a page that mutes one video
+        // would leave the next one silent while its own state says it is not muted.
+        let flags = pipeline.property_value("flags");
+        let flags = glib::FlagsClass::with_type(flags.type_())
+            .and_then(|class| {
+                class
+                    .builder_with_value(flags)
+                    .and_then(|builder| builder.set_by_nick("soft-volume").build())
+            })
+            .ok_or_else(|| {
+                PlayerError::Backend("playbin does not take the soft-volume flag".to_owned())
+            })?;
+        pipeline.set_property_from_value("flags", &flags);
+
         // Set player position interval update to 0.5 seconds. With source buffers
         // the position is also what tells that playback is about to run out of
         // data, which has to be noticed sooner.
@@ -707,6 +780,7 @@ impl GStreamerPlayer {
         }
 
         let video_sink = self.render.lock().unwrap().setup_video_sink(&pipeline)?;
+        let shown_frames = Arc::<ShownFrames>::default();
 
         // There's a known bug in gstreamer that may cause a wrong transition
         // to the ready state while setting the uri property:
@@ -751,6 +825,8 @@ impl GStreamerPlayer {
             signal_adapter: signal_adapter.clone(),
             source: None,
             video_sink,
+            shown_frames: shown_frames.clone(),
+            dropped_frames: Cell::new((0, 0)),
             input_size: 0,
             seekable: true,
             play_state: gstreamer_play::PlayState::Stopped,
@@ -896,6 +972,7 @@ impl GStreamerPlayer {
                 let weak_video_renderer = Arc::downgrade(&video_renderer);
 
                 move |sample: gstreamer::Sample| {
+                    let presentation_time = sample.buffer().and_then(|buffer| buffer.pts());
                     let Some(frame) = render.lock().unwrap().get_frame_from_sample(sample) else {
                         return Err(gstreamer::FlowError::Error);
                     };
@@ -909,6 +986,7 @@ impl GStreamerPlayer {
                         },
                     };
 
+                    shown_frames.count(presentation_time);
                     let _ = notify!(observer, PlayerEvent::VideoFrameUpdated);
                     Ok(gstreamer::FlowSuccess::Ok)
                 }
@@ -1169,6 +1247,11 @@ impl Player for GStreamerPlayer {
     inner_player_proxy_getter!(volume, f64, DEFAULT_VOLUME);
     inner_player_proxy_getter!(buffered, Vec<Range<f64>>, DEFAULT_TIME_RANGES);
     inner_player_proxy_getter!(seekable, Vec<Range<f64>>, DEFAULT_TIME_RANGES);
+    inner_player_proxy_getter!(
+        video_playback_quality,
+        VideoPlaybackQuality,
+        VideoPlaybackQuality::default()
+    );
     inner_player_proxy!(set_stream, stream, &MediaStreamId, only_stream, bool);
     inner_player_proxy!(set_audio_track, stream_index, i32, enabled, bool);
     inner_player_proxy!(set_video_track, stream_index, i32, enabled, bool);
@@ -1180,6 +1263,13 @@ impl Player for GStreamerPlayer {
         SourceBufferId,
         offset,
         f64
+    );
+    inner_player_proxy!(
+        set_source_buffer_sequence_mode,
+        id,
+        SourceBufferId,
+        sequence,
+        bool
     );
     inner_player_proxy!(
         set_source_buffer_append_window,

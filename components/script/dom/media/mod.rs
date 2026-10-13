@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+pub(crate) mod mediacapabilities;
 pub(crate) mod mediadeviceinfo;
 pub(crate) mod mediadevices;
 pub(crate) mod mediaerror;
@@ -16,5 +17,6 @@ pub(crate) mod mediastream;
 pub(crate) mod mediastreamtrack;
 pub(crate) mod sourcebuffer;
 pub(crate) mod sourcebufferlist;
+pub(crate) mod videoplaybackquality;
 pub(crate) mod videotrack;
 pub(crate) mod videotracklist;

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
+use std::ops::Range;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
@@ -44,6 +45,8 @@ pub(crate) struct SourceBuffer {
     id: u32,
     /// <https://w3c.github.io/media-source/#dom-sourcebuffer-mode>
     mode: Cell<AppendMode>,
+    /// <https://w3c.github.io/media-source/#sourcebuffer-generate-timestamps-flag>
+    generates_timestamps: Cell<bool>,
     /// <https://w3c.github.io/media-source/#dom-sourcebuffer-updating>
     updating: Cell<bool>,
     /// Incremented whenever the tasks that end an update are cancelled.
@@ -56,6 +59,10 @@ pub(crate) struct SourceBuffer {
     append_window_end: Cell<f64>,
     /// What the media player held after the last append or removal.
     buffered: DomRefCell<TimeRangesContainer>,
+    /// What `buffered` is once the media source has ended.
+    buffered_when_ended: DomRefCell<TimeRangesContainer>,
+    /// When the last of the coded frames is presented.
+    highest_presentation_timestamp: Cell<f64>,
     /// <https://w3c.github.io/media-source/#dfn-first-initialization-segment-received-flag>
     has_initialization_segment: Cell<bool>,
     has_audio: Cell<bool>,
@@ -71,12 +78,15 @@ impl SourceBuffer {
             media_source: MutNullableDom::new(Some(media_source)),
             id: id.0,
             mode: Cell::new(AppendMode::Segments),
+            generates_timestamps: Cell::new(false),
             updating: Cell::new(false),
             update_generation: Cell::new(0),
             timestamp_offset: Cell::new(0.),
             append_window_start: Cell::new(0.),
             append_window_end: Cell::new(f64::INFINITY),
             buffered: Default::default(),
+            buffered_when_ended: Default::default(),
+            highest_presentation_timestamp: Cell::new(0.),
             has_initialization_segment: Cell::new(false),
             has_audio: Cell::new(false),
             has_video: Cell::new(false),
@@ -96,6 +106,15 @@ impl SourceBuffer {
             Box::new(SourceBuffer::new_inherited(media_source, id)),
             window,
         )
+    }
+
+    /// The coded frames of the media type of this source buffer carry timestamps or
+    /// not. Without them the mode is "sequence"; the media player sets its own.
+    pub(crate) fn set_generates_timestamps(&self, generates_timestamps: bool) {
+        self.generates_timestamps.set(generates_timestamps);
+        if generates_timestamps {
+            self.mode.set(AppendMode::Sequence);
+        }
     }
 
     pub(crate) fn id(&self) -> SourceBufferId {
@@ -121,9 +140,16 @@ impl SourceBuffer {
             .then(|| (self.video_width.get(), self.video_height.get()))
     }
 
-    /// The end of the last buffered range, or zero if nothing is buffered.
+    /// When the last of the coded frames is presented, or zero if nothing is
+    /// buffered.
+    pub(crate) fn highest_presentation_timestamp(&self) -> f64 {
+        self.highest_presentation_timestamp.get()
+    }
+
+    /// Where the track that goes the furthest ends, or zero if nothing is
+    /// buffered.
     pub(crate) fn highest_buffered_end(&self) -> f64 {
-        let buffered = self.buffered.borrow();
+        let buffered = self.buffered_when_ended.borrow();
         match buffered.len() {
             0 => 0.,
             length => buffered.end(length - 1).unwrap_or(0.),
@@ -206,13 +232,24 @@ impl SourceBuffer {
     }
 
     fn set_state(&self, state: &SourceBufferState) {
-        let mut buffered = TimeRangesContainer::default();
-        for range in &state.buffered {
-            if let Err(error) = buffered.add(range.start, range.end) {
-                warn!("Ignoring a buffered range of the media player: {error:?}");
+        let container = |ranges: &[Range<f64>]| {
+            let mut buffered = TimeRangesContainer::default();
+            for range in ranges {
+                if let Err(error) = buffered.add(range.start, range.end) {
+                    warn!("Ignoring a buffered range of the media player: {error:?}");
+                }
             }
+            buffered
+        };
+        *self.buffered.borrow_mut() = container(&state.buffered);
+        *self.buffered_when_ended.borrow_mut() = container(&state.buffered_when_ended);
+        self.highest_presentation_timestamp
+            .set(state.highest_presentation_timestamp);
+
+        // In the "sequence" mode it is the frames appended that set the offset.
+        if self.mode.get() == AppendMode::Sequence {
+            self.timestamp_offset.set(state.timestamp_offset);
         }
-        *self.buffered.borrow_mut() = buffered;
 
         if state.tracks.is_empty() {
             return;
@@ -256,15 +293,26 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
         // exception.
         let media_source = self.media_source_for_change()?;
 
+        // Step 3. If the generate timestamps flag equals true and new mode equals
+        // "segments", then throw a TypeError exception.
+        if self.generates_timestamps.get() && mode == AppendMode::Segments {
+            return Err(Error::Type(cformat!(
+                "The mode cannot be \"segments\" for a media type without timestamps"
+            )));
+        }
+
         // Step 5. If the readyState attribute of the parent media source is in the "ended"
         // state, then set it to "open" and fire an event named sourceopen.
         media_source.reopen_if_ended();
 
-        if mode == AppendMode::Sequence {
-            // FIXME: The media player places the coded frames by their own timestamps
-            // whatever the mode is.
-            warn!("SourceBuffer.mode \"sequence\" is not implemented, timestamps are kept");
-        }
+        // Step 7. If the new mode equals "sequence", then set the group start timestamp
+        // to the group end timestamp.
+        // The media player does it.
+        media_source
+            .with_player(|player| {
+                player.set_source_buffer_sequence_mode(self.id(), mode == AppendMode::Sequence)
+            })
+            .map_err(|_| Error::InvalidState(None))?;
 
         // Step 8. Update the attribute to the new value.
         self.mode.set(mode);
@@ -280,15 +328,18 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
     fn GetBuffered(&self, cx: &mut JSContext) -> Fallible<DomRoot<TimeRanges>> {
         // Step 1. If this object has been removed from the sourceBuffers attribute of the
         // parent media source then throw an InvalidStateError exception.
-        if self.media_source.get().is_none() {
+        let Some(media_source) = self.media_source.get() else {
             return Err(Error::InvalidState(None));
-        }
+        };
 
-        Ok(TimeRanges::new(
-            cx,
-            self.global().as_window(),
-            self.buffered.borrow().clone(),
-        ))
+        // Step 4.2. Once the media source has ended a track that stops before the
+        // others is taken to go on to where the longest one ends.
+        let buffered = if media_source.is_ended() {
+            self.buffered_when_ended.borrow().clone()
+        } else {
+            self.buffered.borrow().clone()
+        };
+        Ok(TimeRanges::new(cx, self.global().as_window(), buffered))
     }
 
     /// <https://w3c.github.io/media-source/#dom-sourcebuffer-timestampoffset>
@@ -503,7 +554,12 @@ impl SourceBufferMethods<crate::DomTypeHolder> for SourceBuffer {
         // The media player does it.
         media_source
             .with_player(|player| player.change_source_buffer_type(self.id(), &media_type))
-            .map_err(|_| Error::NotSupported(None))
+            .map_err(|_| Error::NotSupported(None))?;
+
+        // Steps 8-9. Update the generate timestamps flag, and set the mode to "sequence"
+        // if it is true.
+        self.set_generates_timestamps(MediaSource::generates_timestamps(&media_type));
+        Ok(())
     }
 
     /// <https://w3c.github.io/media-source/#dom-sourcebuffer-remove>

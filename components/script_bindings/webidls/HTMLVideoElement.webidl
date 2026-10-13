@@ -18,3 +18,8 @@ partial interface HTMLVideoElement {
   [Pref="media_testing_enabled"]
   attribute EventHandler onpostershown;
 };
+
+// https://w3c.github.io/media-playback-quality/#extension-of-the-htmlvideoelement-interface
+partial interface HTMLVideoElement {
+  VideoPlaybackQuality getVideoPlaybackQuality();
+};

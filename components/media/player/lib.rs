@@ -86,6 +86,15 @@ pub struct SourceBufferState {
     pub tracks: Vec<SourceBufferTrack>,
     /// The time ranges in seconds held by every track of the source buffer.
     pub buffered: Vec<Range<f64>>,
+    /// The same once no more data is to be appended: a track that stops before
+    /// the others is then taken to go on to where the longest one ends.
+    pub buffered_when_ended: Vec<Range<f64>>,
+    /// When the last of the coded frames is presented, in seconds, or zero if
+    /// there are none.
+    pub highest_presentation_timestamp: f64,
+    /// The seconds added to the timestamps of the coded frames, which appending
+    /// changes in the "sequence" mode.
+    pub timestamp_offset: f64,
 }
 
 pub type SeekLockMsg = (bool, GenericSender<()>);
@@ -127,6 +136,15 @@ pub enum PlayerEvent {
     /// The player has performed a seek to the given time offset in seconds.
     SeekDone(f64),
     StateChanged(PlaybackState),
+}
+
+/// How many video frames a player has shown and dropped since it was created.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct VideoPlaybackQuality {
+    /// The frames shown plus the frames dropped.
+    pub total_frames: u64,
+    /// The frames that were not shown because they came too late.
+    pub dropped_frames: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -172,6 +190,10 @@ pub trait Player: Send + MediaInstance {
     fn set_stream(&self, stream: &MediaStreamId, only_stream: bool) -> Result<(), PlayerError>;
     /// If player's rendering draws using GL textures
     fn render_use_gl(&self) -> bool;
+    /// The counts of video frames shown and dropped so far.
+    fn video_playback_quality(&self) -> VideoPlaybackQuality {
+        VideoPlaybackQuality::default()
+    }
     fn set_audio_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
     fn set_video_track(&self, stream_index: i32, enabled: bool) -> Result<(), PlayerError>;
 
@@ -220,6 +242,15 @@ pub trait Player: Send + MediaInstance {
         &self,
         _id: SourceBufferId,
         _offset: f64,
+    ) -> Result<(), PlayerError> {
+        Err(PlayerError::MediaSourceUnsupported)
+    }
+    /// In the "sequence" mode the coded frames of a segment are placed right
+    /// after those of the segment appended before it, whatever their timestamps.
+    fn set_source_buffer_sequence_mode(
+        &self,
+        _id: SourceBufferId,
+        _sequence: bool,
     ) -> Result<(), PlayerError> {
         Err(PlayerError::MediaSourceUnsupported)
     }

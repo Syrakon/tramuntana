@@ -134,7 +134,6 @@ struct TrackBuffer {
     /// The last frame added by the append in progress.
     last_appended: Option<i64>,
     last_duration: u64,
-    longest_duration: u64,
     /// Frames are being dropped until a keyframe arrives.
     need_keyframe: bool,
     info: SourceBufferTrack,
@@ -158,7 +157,6 @@ impl TrackBuffer {
             ranges: None,
             last_appended: None,
             last_duration: 0,
-            longest_duration: 0,
             need_keyframe: true,
             info: SourceBufferTrack {
                 kind,
@@ -214,7 +212,6 @@ impl TrackBuffer {
             previous.end = frame.pts;
             previous.guessed_end = false;
             self.last_duration = previous.end - previous.pts;
-            self.longest_duration = self.longest_duration.max(self.last_duration);
         }
 
         // Step 14. Remove the frames the new one overlaps.
@@ -240,7 +237,6 @@ impl TrackBuffer {
 
         if !frame.guessed_end {
             self.last_duration = duration;
-            self.longest_duration = self.longest_duration.max(duration);
         }
         self.bytes += frame.size();
         self.ranges = None;
@@ -298,13 +294,26 @@ impl TrackBuffer {
     }
 
     fn ranges(&mut self) -> &[Range<u64>] {
-        let (frames, longest) = (&self.frames, self.longest_duration);
+        let frames = &self.frames;
         self.ranges.get_or_insert_with(|| {
             let mut spans: Vec<(u64, u64)> = frames
                 .values()
                 .map(|frame| (frame.pts, frame.end))
                 .collect();
             spans.sort_unstable();
+
+            // A frame is shown until the one after it is, however long the
+            // container says it lasts: there are files where the durations are
+            // those of the decoding order, twice as long as the frames are shown.
+            let longest = spans
+                .iter()
+                .zip(spans.iter().skip(1).map(Some).chain([None]))
+                .map(|((start, end), next)| match next {
+                    Some((next, _)) if next > start => (end - start).min(next - start),
+                    _ => end - start,
+                })
+                .max()
+                .unwrap_or(0);
 
             // Frames of one segment touch each other, give or take the rounding of
             // their timestamps; allow for more than that, as other engines do.
@@ -352,6 +361,41 @@ impl TrackBuffer {
     }
 }
 
+/// What takes the timestamps of a frame from the segment of the demuxer to the
+/// media timeline, in nanoseconds.
+fn segment_offset(sample: &gstreamer::Sample, container: Container) -> i64 {
+    match container {
+        Container::Mp4 => sample
+            .segment()
+            .and_then(|segment| segment.downcast_ref::<gstreamer::ClockTime>())
+            .and_then(|segment| Some((segment.time()?, segment.start()?)))
+            .map_or(0, |(time, start)| {
+                time.nseconds() as i64 - start.nseconds() as i64
+            }),
+        // matroskademux takes the first cluster it is given as the start of
+        // the stream and makes its segment map that cluster to time zero.
+        // The first cluster appended is anywhere in the media when playback
+        // starts in the middle of it, and the timestamps of the frames are
+        // those of the media timeline as they come.
+        Container::WebM => 0,
+        // The frames have no timestamps of their own.
+        Container::Mpeg | Container::Aac => 0,
+    }
+}
+
+fn in_seconds(ranges: Vec<Range<u64>>) -> Vec<Range<f64>> {
+    ranges
+        .into_iter()
+        .map(|range| seconds(range.start)..seconds(range.end))
+        .collect()
+}
+
+/// When a frame is presented in the media timeline, in nanoseconds.
+fn media_pts(sample: &gstreamer::Sample, container: Container) -> Option<i64> {
+    let pts = sample.buffer()?.pts()?;
+    Some((pts.nseconds() as i64).saturating_add(segment_offset(sample, container)))
+}
+
 struct Track {
     pad_name: String,
     buffer: Mutex<TrackBuffer>,
@@ -370,39 +414,50 @@ impl Track {
         }
     }
 
+    /// Whether a frame does not follow the one this track was given last: it is
+    /// to be decoded before it, or more than two frames after it.
+    /// <https://w3c.github.io/media-source/#sourcebuffer-coded-frame-processing>
+    fn breaks_sequence(
+        &self,
+        sample: &gstreamer::Sample,
+        container: Container,
+        settings: &AppendSettings,
+    ) -> bool {
+        let Some(dts) = sample
+            .buffer()
+            .and_then(|buffer| buffer.dts().or(buffer.pts()))
+        else {
+            return false;
+        };
+        let dts = (dts.nseconds() as i64)
+            .saturating_add(segment_offset(sample, container))
+            .saturating_add(settings.timestamp_offset.load(Ordering::Relaxed));
+        let track = lock(&self.buffer);
+        let Some(last) = track.last_appended else {
+            return false;
+        };
+        let longest_step = i64::try_from(track.last_duration.saturating_mul(2)).unwrap_or(i64::MAX);
+        dts < last || (longest_step > 0 && dts.saturating_sub(last) > longest_step)
+    }
+
     /// Take a frame out of the demuxer.
     fn ingest(
         &self,
         sample: &gstreamer::Sample,
         container: Container,
-        timestamp_offset: i64,
-        window: &Range<u64>,
+        settings: &AppendSettings,
     ) {
         let (Some(mut buffer), Some(caps)) = (sample.buffer_owned(), sample.caps_owned()) else {
             return;
         };
-        let Some(pts) = buffer.pts() else {
+        let Some(pts) = media_pts(sample, container) else {
             return;
         };
+        let window = lock(&settings.window).clone();
 
-        // Move the timestamps from the segment of the demuxer to the media timeline.
-        let segment_offset = match container {
-            Container::Mp4 => sample
-                .segment()
-                .and_then(|segment| segment.downcast_ref::<gstreamer::ClockTime>())
-                .and_then(|segment| Some((segment.time()?, segment.start()?)))
-                .map_or(0, |(time, start)| {
-                    time.nseconds() as i64 - start.nseconds() as i64
-                }),
-            // matroskademux takes the first cluster it is given as the start of
-            // the stream and makes its segment map that cluster to time zero.
-            // The first cluster appended is anywhere in the media when playback
-            // starts in the middle of it, and the timestamps of the frames are
-            // those of the media timeline as they come.
-            Container::WebM => 0,
-        };
-        let offset = segment_offset.saturating_add(timestamp_offset);
-        let pts = (pts.nseconds() as i64).saturating_add(offset);
+        let timestamp_offset = settings.timestamp_offset.load(Ordering::Relaxed);
+        let offset = segment_offset(sample, container).saturating_add(timestamp_offset);
+        let pts = pts.saturating_add(timestamp_offset);
         let dts = buffer
             .dts()
             .map(|dts| (dts.nseconds() as i64).saturating_add(offset));
@@ -451,6 +506,67 @@ impl Track {
                 buffer,
             },
         );
+        // Steps 18 and 19.
+        settings.group_end.fetch_max(end, Ordering::Relaxed);
+    }
+
+    /// Take a frame of a format that has no timestamps of its own out of the
+    /// parser: it goes where the frame before it ends.
+    /// <https://w3c.github.io/media-source/#sourcebuffer-coded-frame-processing>
+    fn ingest_generated(&self, sample: &gstreamer::Sample, settings: &AppendSettings) {
+        let (Some(mut buffer), Some(caps)) = (sample.buffer_owned(), sample.caps_owned()) else {
+            return;
+        };
+        // Step 1.3. The frame that starts a group goes where the group starts.
+        if let Some(start) = lock(&settings.group_start).take() {
+            settings
+                .timestamp_offset
+                .store(i64::try_from(start).unwrap_or(i64::MAX), Ordering::Relaxed);
+            settings.group_end.store(start, Ordering::Relaxed);
+        }
+        // Step 1.1. The presentation and decode timestamps are zero, and the
+        // offset is added to them.
+        let Ok(pts) = u64::try_from(settings.timestamp_offset.load(Ordering::Relaxed)) else {
+            return;
+        };
+
+        let mut track = lock(&self.buffer);
+        track.set_caps(&caps);
+        let duration = buffer
+            .duration()
+            .map_or(track.last_duration, |duration| duration.nseconds());
+        if duration == 0 {
+            return;
+        }
+        let end = pts.saturating_add(duration);
+
+        // Step 8 and 9. Frames outside of the append window are dropped.
+        let window = lock(&settings.window).clone();
+        if pts < window.start || end > window.end {
+            return;
+        }
+
+        {
+            let buffer = buffer.make_mut();
+            buffer.set_pts(gstreamer::ClockTime::from_nseconds(pts));
+            buffer.set_dts(gstreamer::ClockTime::from_nseconds(pts));
+        }
+        track.insert(
+            i64::try_from(pts).unwrap_or(i64::MAX),
+            Frame {
+                pts,
+                end,
+                keyframe: true,
+                guessed_end: false,
+                caps,
+                buffer,
+            },
+        );
+        // Steps 18 to 20. The next frame goes where this one ends.
+        settings.group_end.fetch_max(end, Ordering::Relaxed);
+        settings
+            .timestamp_offset
+            .store(i64::try_from(end).unwrap_or(i64::MAX), Ordering::Relaxed);
     }
 
     /// Push frames to the playback appsrc until it has enough or there are no
@@ -554,6 +670,10 @@ impl TrackBuffer {
 enum Container {
     Mp4,
     WebM,
+    /// MPEG audio frames with no container around them.
+    Mpeg,
+    /// AAC frames in ADTS, with no container around them.
+    Aac,
 }
 
 impl Container {
@@ -565,15 +685,28 @@ impl Container {
         match mime.subtype().as_str() {
             "mp4" => Some(Container::Mp4),
             "webm" => Some(Container::WebM),
+            "mpeg" if mime.type_() == mime::AUDIO => Some(Container::Mpeg),
+            "aac" if mime.type_() == mime::AUDIO => Some(Container::Aac),
             _ => None,
         }
     }
 
+    /// The element that takes the coded frames out of the bytes appended: a
+    /// demuxer, or a parser for the formats that are not in a container.
     fn demuxer(&self) -> &'static str {
         match self {
             Container::Mp4 => "qtdemux",
             Container::WebM => "matroskademux",
+            Container::Mpeg => "mpegaudioparse",
+            Container::Aac => "aacparse",
         }
+    }
+
+    /// Whether the frames carry no timestamps, so they are given the ones that
+    /// put each frame after the one before it.
+    /// <https://w3c.github.io/media-source/#sourcebuffer-generate-timestamps-flag>
+    fn generates_timestamps(&self) -> bool {
+        matches!(self, Container::Mpeg | Container::Aac)
     }
 }
 
@@ -588,6 +721,68 @@ struct AppendSettings {
     timestamp_offset: AtomicI64,
     /// Frames outside of this range of nanoseconds are dropped.
     window: Mutex<Range<u64>>,
+    /// The "sequence" mode: the first frame of a group goes where the group is
+    /// to start, and `timestamp_offset` becomes what takes it there.
+    sequence: AtomicBool,
+    /// Where the next frame is to go, in nanoseconds, if it starts a group.
+    group_start: Mutex<Option<u64>>,
+    /// Where the frames appended so far end.
+    group_end: AtomicU64,
+    /// The frames of an append that starts a group, kept until all of them are
+    /// here: the group starts at the earliest of the first frames of the tracks,
+    /// and the demuxer gives the tracks in the order they have in the file.
+    held: Mutex<Vec<(Arc<Track>, gstreamer::Sample)>>,
+}
+
+impl AppendSettings {
+    /// What comes next starts a group where the frames appended so far end.
+    fn start_group_at_the_end(&self) {
+        *lock(&self.group_start) = Some(self.group_end.load(Ordering::Relaxed));
+    }
+
+    /// Whether the frames that come are to be held for the group they start.
+    fn holds(&self) -> bool {
+        self.sequence.load(Ordering::Relaxed) && lock(&self.group_start).is_some()
+    }
+
+    /// Take in the frames that were held, once the append they are from is
+    /// all out of the demuxer.
+    /// <https://w3c.github.io/media-source/#sourcebuffer-coded-frame-processing>
+    fn release_held(&self, container: Container, tracks: &[Arc<Track>]) {
+        let held = std::mem::take(&mut *lock(&self.held));
+        let mut seen: Vec<&Arc<Track>> = Vec::new();
+        let mut first = None;
+        for (track, sample) in &held {
+            if seen.iter().any(|seen| Arc::ptr_eq(seen, track)) {
+                continue;
+            }
+            seen.push(track);
+            if let Some(pts) = media_pts(sample, container) {
+                first = Some(first.map_or(pts, |first: i64| first.min(pts)));
+            }
+        }
+        // Step 1.3. In the "sequence" mode the frame that starts a group goes
+        // where the group starts, and the frames after it keep their distance.
+        if let Some(first) = first &&
+            self.sequence.load(Ordering::Relaxed) &&
+            let Some(start) = lock(&self.group_start).take()
+        {
+            let timestamp_offset = i64::try_from(start)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(first);
+            self.timestamp_offset
+                .store(timestamp_offset, Ordering::Relaxed);
+            self.group_end.store(start, Ordering::Relaxed);
+            for track in tracks {
+                let mut track = lock(&track.buffer);
+                track.last_appended = None;
+                track.need_keyframe = true;
+            }
+        }
+        for (track, sample) in &held {
+            track.ingest(sample, container, self);
+        }
+    }
 }
 
 struct SourceBuffer {
@@ -605,6 +800,10 @@ impl SourceBuffer {
         let settings = Arc::new(AppendSettings {
             timestamp_offset: AtomicI64::new(0),
             window: Mutex::new(0..u64::MAX),
+            sequence: AtomicBool::new(container.generates_timestamps()),
+            group_start: Mutex::new(None),
+            group_end: AtomicU64::new(0),
+            held: Mutex::new(Vec::new()),
         });
         let (pipeline, appsrc, outcome) =
             Self::build_pipeline(container, shared, tracks.clone(), settings.clone())
@@ -651,6 +850,7 @@ impl SourceBuffer {
         // of the appsrc, so once the marker gets here the frames of the bytes
         // pushed before it are all in their tracks.
         let marker_sender = Mutex::new(sender.clone());
+        let (marker_settings, marker_tracks) = (settings.clone(), tracks.clone());
         appsrc
             .static_pad("src")
             .ok_or_else(|| glib::bool_error!("appsrc has no src pad"))?
@@ -663,6 +863,8 @@ impl SourceBuffer {
                 if !is_marker {
                     return gstreamer::PadProbeReturn::Ok;
                 }
+                let tracks = lock(&marker_tracks).clone();
+                marker_settings.release_held(container, &tracks);
                 // Nobody is waiting if the source buffer is gone.
                 let _ = lock(&marker_sender).send(AppendOutcome::Done);
                 gstreamer::PadProbeReturn::Drop
@@ -685,9 +887,11 @@ impl SourceBuffer {
             });
 
         let appsinks: Mutex<HashMap<String, gstreamer::Element>> = Mutex::new(HashMap::new());
-        demuxer.connect_pad_added(move |demuxer, pad| {
+        let take_pad = move |demuxer: &gstreamer::Element, pad: &gstreamer::Pad| {
             let name = pad.name();
-            let kind = if name.starts_with("video") {
+            let kind = if container.generates_timestamps() {
+                SourceBufferTrackKind::Audio
+            } else if name.starts_with("video") {
                 SourceBufferTrackKind::Video
             } else if name.starts_with("audio") {
                 SourceBufferTrackKind::Audio
@@ -722,6 +926,40 @@ impl SourceBuffer {
                 lock(&track.buffer).set_caps(&caps);
             }
 
+            // A sink drops the buffers that come before the start of the segment
+            // they are in, and the demuxer keeps the segment of the first media
+            // segment it was given when a later one is from earlier in the media:
+            // the frames of an append that goes back would be lost. The segment
+            // is made to start as early as it can, keeping the distance from its
+            // start to its time, which is all that is read of it.
+            pad.add_probe(gstreamer::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+                let open = match &info.data {
+                    Some(gstreamer::PadProbeData::Event(event)) => match event.view() {
+                        gstreamer::EventView::Segment(segment) => segment
+                            .segment()
+                            .downcast_ref::<gstreamer::ClockTime>()
+                            .and_then(|segment| {
+                                let (start, time) = (segment.start()?, segment.time()?);
+                                let shift = start.min(time);
+                                let mut open = segment.clone();
+                                open.set_start(start.checked_sub(shift)?);
+                                open.set_time(time.checked_sub(shift)?);
+                                Some(
+                                    gstreamer::event::Segment::builder(&open)
+                                        .seqnum(event.seqnum())
+                                        .build(),
+                                )
+                            }),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(open) = open {
+                    info.data = Some(gstreamer::PadProbeData::Event(open));
+                }
+                gstreamer::PadProbeReturn::Ok
+            });
+
             let link = || -> Result<gstreamer::Element, glib::BoolError> {
                 let appsink = gstreamer::ElementFactory::make("appsink")
                     .property("sync", false)
@@ -731,19 +969,30 @@ impl SourceBuffer {
                     .downcast::<gstreamer_app::AppSink>()
                     .map_err(|_| glib::bool_error!("appsink is not an AppSink"))?;
                 let settings = settings.clone();
+                let track = track.clone();
                 appsink.set_callbacks(
                     gstreamer_app::AppSinkCallbacks::builder()
                         .new_sample(move |appsink| {
                             let sample = appsink
                                 .pull_sample()
                                 .map_err(|_| gstreamer::FlowError::Eos)?;
-                            let window = lock(&settings.window).clone();
-                            track.ingest(
-                                &sample,
-                                container,
-                                settings.timestamp_offset.load(Ordering::Relaxed),
-                                &window,
-                            );
+                            if container.generates_timestamps() {
+                                track.ingest_generated(&sample, &settings);
+                                return Ok(gstreamer::FlowSuccess::Ok);
+                            }
+                            // Step 1.6. In the "sequence" mode a frame that does not
+                            // follow the one before it starts a group.
+                            if settings.sequence.load(Ordering::Relaxed) &&
+                                !settings.holds() &&
+                                track.breaks_sequence(&sample, container, &settings)
+                            {
+                                settings.start_group_at_the_end();
+                            }
+                            if settings.holds() {
+                                lock(&settings.held).push((track.clone(), sample));
+                            } else {
+                                track.ingest(&sample, container, &settings);
+                            }
                             Ok(gstreamer::FlowSuccess::Ok)
                         })
                         .build(),
@@ -782,7 +1031,15 @@ impl SourceBuffer {
                 },
                 Err(error) => log::error!("Could not take the frames of {name}: {error}"),
             }
-        });
+        };
+        // A parser has its pad from the start, and a demuxer adds one for each
+        // track it finds.
+        match demuxer.static_pad("src") {
+            Some(pad) => take_pad(&demuxer, &pad),
+            None => {
+                demuxer.connect_pad_added(take_pad);
+            },
+        }
 
         pipeline
             .set_state(gstreamer::State::Playing)
@@ -817,6 +1074,7 @@ impl SourceBuffer {
     fn append(&self, data: Vec<u8>) -> Result<(), PlayerError> {
         // Whatever an earlier append left behind is not about this one.
         while self.outcome.try_recv().is_ok() {}
+        lock(&self.settings.held).clear();
 
         let failed = |error: gstreamer::FlowError| PlayerError::AppendFailed(error.to_string());
         self.appsrc
@@ -849,6 +1107,11 @@ impl SourceBuffer {
         {
             log::warn!("Could not flush the append pipeline");
         }
+        // Step 6. If the mode attribute equals "sequence", then set the group
+        // start timestamp to the group end timestamp.
+        if self.settings.sequence.load(Ordering::Relaxed) {
+            self.settings.start_group_at_the_end();
+        }
         self.forget_last_append();
     }
 
@@ -878,18 +1141,41 @@ impl SourceBuffer {
         self.appsrc = appsrc;
         self.outcome = outcome;
         self.container = container;
+        // <https://w3c.github.io/media-source/#dom-sourcebuffer-changetype>
+        // Step 9. If the generate timestamps flag equals true, then set the mode
+        // attribute to "sequence".
+        if container.generates_timestamps() {
+            self.settings.sequence.store(true, Ordering::Relaxed);
+        }
         self.forget_last_append();
         Ok(())
     }
 
-    fn buffered(&self) -> Vec<Range<u64>> {
+    /// <https://w3c.github.io/media-source/#dom-sourcebuffer-buffered>
+    fn buffered(&self, ended: bool) -> Vec<Range<u64>> {
+        let tracks: Vec<Vec<Range<u64>>> = self
+            .tracks()
+            .iter()
+            .map(|track| lock(&track.buffer).ranges().to_vec())
+            .collect();
+        // Step 2.
+        let highest_end = tracks
+            .iter()
+            .filter_map(|ranges| ranges.last())
+            .map(|last| last.end)
+            .max();
         let mut buffered: Option<Vec<Range<u64>>> = None;
-        for track in self.tracks() {
-            let mut track = lock(&track.buffer);
-            let ranges = track.ranges();
+        for mut ranges in tracks {
+            // Step 4.2. Once the stream has ended a track that stops before the
+            // others is taken to go on to where the longest one ends.
+            if ended &&
+                let (Some(last), Some(highest_end)) = (ranges.last_mut(), highest_end)
+            {
+                last.end = highest_end;
+            }
             buffered = Some(match buffered {
-                Some(buffered) => intersect(&buffered, ranges),
-                None => ranges.to_vec(),
+                Some(buffered) => intersect(&buffered, &ranges),
+                None => ranges,
             });
         }
         buffered.unwrap_or_default()
@@ -900,13 +1186,24 @@ impl SourceBuffer {
             tracks: self
                 .tracks()
                 .iter()
-                .map(|track| lock(&track.buffer).info.clone())
+                .map(|track| lock(&track.buffer))
+                // The track of a parser is there before any frame tells what it is.
+                .filter(|track| !self.container.generates_timestamps() || track.caps.is_some())
+                .map(|track| track.info.clone())
                 .collect(),
-            buffered: self
-                .buffered()
-                .into_iter()
-                .map(|range| seconds(range.start)..seconds(range.end))
-                .collect(),
+            buffered: in_seconds(self.buffered(false)),
+            buffered_when_ended: in_seconds(self.buffered(true)),
+            highest_presentation_timestamp: self
+                .tracks()
+                .iter()
+                .filter_map(|track| {
+                    let track = lock(&track.buffer);
+                    track.frames.values().map(|frame| frame.pts).max()
+                })
+                .max()
+                .map_or(0., seconds),
+            timestamp_offset: self.settings.timestamp_offset.load(Ordering::Relaxed) as f64 /
+                NANOSECONDS,
         }
     }
 }
@@ -1025,10 +1322,32 @@ impl MediaSource {
         offset: f64,
     ) -> Result<(), PlayerError> {
         let offset = (offset * NANOSECONDS).round() as i64;
-        self.source_buffer(id)?
-            .settings
-            .timestamp_offset
-            .store(offset, Ordering::Relaxed);
+        let settings = &self.source_buffer(id)?.settings;
+        settings.timestamp_offset.store(offset, Ordering::Relaxed);
+        // <https://w3c.github.io/media-source/#dom-sourcebuffer-timestampoffset>
+        // Step 6. If the mode attribute equals "sequence", then set the group
+        // start timestamp to new timestampOffset.
+        if settings.sequence.load(Ordering::Relaxed) {
+            *lock(&settings.group_start) = Some(u64::try_from(offset).unwrap_or(0));
+        }
+        Ok(())
+    }
+
+    /// <https://w3c.github.io/media-source/#dom-sourcebuffer-mode>
+    pub(crate) fn set_sequence_mode(
+        &self,
+        id: SourceBufferId,
+        sequence: bool,
+    ) -> Result<(), PlayerError> {
+        let settings = &self.source_buffer(id)?.settings;
+        settings.sequence.store(sequence, Ordering::Relaxed);
+        // Step 7. If the new mode equals "sequence", then set the group start
+        // timestamp to the group end timestamp.
+        if sequence {
+            settings.start_group_at_the_end();
+        } else {
+            *lock(&settings.group_start) = None;
+        }
         Ok(())
     }
 
@@ -1044,19 +1363,33 @@ impl MediaSource {
 
     /// The ranges in seconds that every source buffer has.
     pub(crate) fn buffered(&self) -> Vec<Range<f64>> {
+        // <https://w3c.github.io/media-source/#htmlmediaelement-extensions-buffered>
+        let ended = self.shared.ended.load(Ordering::Relaxed);
+        let source_buffers: Vec<Vec<Range<u64>>> = self
+            .source_buffers
+            .iter()
+            .map(|(_, source_buffer)| source_buffer.buffered(ended))
+            .collect();
+        let highest_end = source_buffers
+            .iter()
+            .filter_map(|ranges| ranges.last())
+            .map(|last| last.end)
+            .max();
         let mut buffered: Option<Vec<Range<u64>>> = None;
-        for (_, source_buffer) in &self.source_buffers {
-            let ranges = source_buffer.buffered();
+        for mut ranges in source_buffers {
+            // Step 5.2. Once the stream has ended a source buffer that stops
+            // before the others is taken to go on to where the longest one ends.
+            if ended &&
+                let (Some(last), Some(highest_end)) = (ranges.last_mut(), highest_end)
+            {
+                last.end = highest_end;
+            }
             buffered = Some(match buffered {
                 Some(buffered) => intersect(&buffered, &ranges),
                 None => ranges,
             });
         }
-        buffered
-            .unwrap_or_default()
-            .into_iter()
-            .map(|range| seconds(range.start)..seconds(range.end))
-            .collect()
+        in_seconds(buffered.unwrap_or_default())
     }
 
     pub(crate) fn duration(&self) -> Option<f64> {

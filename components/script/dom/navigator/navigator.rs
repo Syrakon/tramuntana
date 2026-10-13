@@ -49,6 +49,7 @@ use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::gamepad::Gamepad;
 use crate::dom::geolocation::Geolocation;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::mediacapabilities::MediaCapabilities;
 use crate::dom::mediadevices::MediaDevices;
 use crate::dom::mediasession::MediaSession;
 use crate::dom::mimetypearray::MimeTypeArray;
@@ -125,6 +126,7 @@ pub(crate) struct Navigator {
     service_worker: MutNullableDom<ServiceWorkerContainer>,
     #[cfg(feature = "webxr")]
     xr: MutNullableDom<XRSystem>,
+    mediacapabilities: MutNullableDom<MediaCapabilities>,
     mediadevices: MutNullableDom<MediaDevices>,
     /// <https://www.w3.org/TR/gamepad/#dfn-gamepads>
     #[cfg(feature = "gamepad")]
@@ -155,6 +157,7 @@ impl Navigator {
             service_worker: Default::default(),
             #[cfg(feature = "webxr")]
             xr: Default::default(),
+            mediacapabilities: Default::default(),
             mediadevices: Default::default(),
             #[cfg(feature = "gamepad")]
             gamepads: Default::default(),
@@ -477,6 +480,12 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     fn Xr(&self, cx: &mut JSContext) -> DomRoot<XRSystem> {
         self.xr
             .or_init(|| XRSystem::new(cx, self.global().as_window()))
+    }
+
+    /// <https://w3c.github.io/media-capabilities/#dom-navigator-mediacapabilities>
+    fn MediaCapabilities(&self, cx: &mut JSContext) -> DomRoot<MediaCapabilities> {
+        self.mediacapabilities
+            .or_init(|| MediaCapabilities::new(cx, &self.global()))
     }
 
     /// <https://w3c.github.io/mediacapture-main/#dom-navigator-mediadevices>
