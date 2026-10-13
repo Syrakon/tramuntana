@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, MutexGuard, Once, Weak};
 use std::time;
 
 use byte_slice_cast::AsSliceOf;
@@ -34,6 +34,7 @@ use crate::media_source::MediaSource;
 use crate::media_source_src::{ServoMediaSourceSrc, register_servo_media_source_src};
 use crate::media_stream::GStreamerMediaStream;
 use crate::media_stream_source::{ServoMediaStreamSrc, register_servo_media_stream_src};
+use crate::reaper;
 use crate::render::GStreamerRender;
 use crate::source::{ServoSrc, register_servo_src};
 
@@ -150,7 +151,6 @@ impl ShownFrames {
 
 struct PlayerInner {
     player: gstreamer_play::Play,
-    signal_adapter: gstreamer_play::PlaySignalAdapter,
     source: Option<PlayerSource>,
     video_sink: gstreamer_app::AppSink,
     shown_frames: Arc<ShownFrames>,
@@ -592,6 +592,203 @@ macro_rules! notify(
     };
 );
 
+/// A strong reference to the inner player for the length of a callback of its pipeline.
+///
+/// Such a callback runs on a thread of the player. If its reference were the last one, the
+/// player would be destroyed on that thread, which must not happen: see `reaper`. So the
+/// reference is let go of on the reaper thread.
+struct Lease(Option<Arc<Mutex<PlayerInner>>>);
+
+impl Lease {
+    fn take(inner: &Weak<Mutex<PlayerInner>>) -> Option<Self> {
+        inner.upgrade().map(|inner| Lease(Some(inner)))
+    }
+
+    fn lock(&self) -> Option<MutexGuard<'_, PlayerInner>> {
+        self.0.as_ref()?.lock().ok()
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take() {
+            reaper::let_go(Box::new(inner));
+        }
+    }
+}
+
+/// The player while `setup` is at work on it. If `setup` gives up, the player goes to the
+/// reaper thread together with the messages it has posted by then.
+struct Unfinished(Option<gstreamer_play::Play>);
+
+impl Unfinished {
+    fn player(&self) -> Result<&gstreamer_play::Play, PlayerError> {
+        self.0
+            .as_ref()
+            .ok_or_else(|| PlayerError::Backend("The player is already set up".to_owned()))
+    }
+
+    fn finish(mut self) -> Result<gstreamer_play::Play, PlayerError> {
+        self.0
+            .take()
+            .ok_or_else(|| PlayerError::Backend("The player is already set up".to_owned()))
+    }
+}
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if let Some(player) = self.0.take() {
+            let bus = player.message_bus();
+            let weak_player = player.downgrade();
+            reaper::let_go_of_player(Box::new(player), bus, weak_player);
+        }
+    }
+}
+
+/// Where an error of the pipeline goes while `setup` waits for the source to ask for data.
+type SetupError = Mutex<Option<Sender<Result<(), PlayerError>>>>;
+
+/// Handles a message of the player. It runs on the thread that posts the message.
+fn handle_message(
+    message: &gstreamer::Message,
+    weak_inner: &Weak<Mutex<PlayerInner>>,
+    observer: &Arc<Mutex<GenericCallback<PlayerEvent>>>,
+    setup_error: &SetupError,
+) {
+    let Ok(play_message) = gstreamer_play::PlayMessage::parse(message) else {
+        return;
+    };
+    match play_message {
+        gstreamer_play::PlayMessage::EndOfStream(_) => {
+            let _ = notify!(observer, PlayerEvent::EndOfStream);
+        },
+        gstreamer_play::PlayMessage::Error(error) => {
+            let error = error.error().to_string();
+            let _ = notify!(observer, PlayerEvent::Error(error.clone()));
+
+            let waiting = setup_error.lock().ok().and_then(|sender| sender.clone());
+            if let Some(sender) = waiting {
+                let _ = sender.send(Err(PlayerError::Backend(error)));
+                let player = message
+                    .src()
+                    .and_then(|src| src.downcast_ref::<gstreamer_play::Play>());
+                if let Some(player) = player {
+                    player.stop();
+                }
+            }
+        },
+        gstreamer_play::PlayMessage::StateChanged(state_changed) => {
+            let play_state = state_changed.state();
+            let Some(lease) = Lease::take(weak_inner) else {
+                return;
+            };
+            if let Some(mut inner) = lease.lock() {
+                inner.play_state = play_state;
+            }
+
+            let state = match play_state {
+                gstreamer_play::PlayState::Buffering => Some(PlaybackState::Buffering),
+                gstreamer_play::PlayState::Stopped => Some(PlaybackState::Stopped),
+                gstreamer_play::PlayState::Paused => Some(PlaybackState::Paused),
+                gstreamer_play::PlayState::Playing => Some(PlaybackState::Playing),
+                _ => None,
+            };
+            if let Some(v) = state {
+                let _ = notify!(observer, PlayerEvent::StateChanged(v));
+            }
+        },
+        gstreamer_play::PlayMessage::PositionUpdated(position_updated) => {
+            if let Some(seconds) = position_updated.position().map(|p| p.seconds_f64()) {
+                let Some(lease) = Lease::take(weak_inner) else {
+                    return;
+                };
+                if let Some(inner) = lease.lock() {
+                    inner.media_source.set_position(seconds);
+                }
+                let _ = notify!(observer, PlayerEvent::PositionChanged(seconds));
+            }
+        },
+        gstreamer_play::PlayMessage::SeekDone(seek_done) => {
+            if let Some(position) = seek_done.position() {
+                let _ = notify!(observer, PlayerEvent::SeekDone(position.seconds_f64()));
+            }
+        },
+        gstreamer_play::PlayMessage::MediaInfoUpdated(media_info_updated) => {
+            let Ok(metadata) = metadata_from_media_info(media_info_updated.media_info()) else {
+                return;
+            };
+
+            let Some(lease) = Lease::take(weak_inner) else {
+                return;
+            };
+            let Some(mut inner) = lease.lock() else {
+                return;
+            };
+
+            if inner.last_metadata.as_ref() == Some(&metadata) {
+                return;
+            }
+
+            // TODO: Workaround to generate expected `paused` state change event.
+            // <https://github.com/servo/servo/issues/40740>
+            let mut send_pause_event = false;
+
+            if inner.last_metadata.is_none() {
+                if metadata.is_seekable && inner.playback_rate.get() != DEFAULT_PLAYBACK_RATE {
+                    // The `paused` state change event will be fired after the
+                    // seek initiated by the playback rate change has
+                    // completed.
+                    inner.player.set_rate(inner.playback_rate.get());
+                } else if inner.play_state == gstreamer_play::PlayState::Paused {
+                    // We need to send the paused event for non seekable push streams.
+                    send_pause_event = true;
+                }
+            }
+
+            inner.last_metadata = Some(metadata.clone());
+            gstreamer::info!(
+                inner.cat,
+                obj = &inner.player,
+                "Metadata updated: {:?}",
+                metadata
+            );
+            let _ = notify!(observer, PlayerEvent::MetadataUpdated(metadata));
+
+            if send_pause_event {
+                let _ = notify!(observer, PlayerEvent::StateChanged(PlaybackState::Paused));
+            }
+        },
+        gstreamer_play::PlayMessage::DurationChanged(duration_changed) => {
+            let duration = duration_changed.duration().map(|duration| {
+                time::Duration::new(
+                    duration.seconds(),
+                    (duration.nseconds() % 1_000_000_000) as u32,
+                )
+            });
+
+            let Some(lease) = Lease::take(weak_inner) else {
+                return;
+            };
+            let Some(mut inner) = lease.lock() else {
+                return;
+            };
+            if let Some(ref mut metadata) = inner.last_metadata &&
+                metadata.duration != duration
+            {
+                metadata.duration = duration;
+                gstreamer::info!(
+                    inner.cat,
+                    obj = &inner.player,
+                    "Duration changed: {:?}",
+                    duration
+                );
+                let _ = notify!(observer, PlayerEvent::DurationChanged(duration));
+            }
+        },
+        _ => {},
+    }
+}
+
 struct SeekChannel {
     sender: SeekLock,
     recv: GenericReceiver<SeekLockMsg>,
@@ -686,8 +883,8 @@ impl GStreamerPlayer {
             }
         }
 
-        let player = gstreamer_play::Play::default();
-        let signal_adapter = gstreamer_play::PlaySignalAdapter::new_sync_emit(&player);
+        let unfinished = Unfinished(Some(gstreamer_play::Play::default()));
+        let player = unfinished.player()?;
         let pipeline = player.pipeline();
 
         // The progressive downloading of playbin is not used: its download buffer cannot give
@@ -820,9 +1017,10 @@ impl GStreamerPlayer {
             player.set_video_track_enabled(false);
         }
 
+        let player = unfinished.finish()?;
+        let bus = player.message_bus();
         *self.inner.borrow_mut() = Some(Arc::new(Mutex::new(PlayerInner {
             player,
-            signal_adapter: signal_adapter.clone(),
             source: None,
             video_sink,
             shown_frames: shown_frames.clone(),
@@ -845,137 +1043,20 @@ impl GStreamerPlayer {
 
         let inner = self.inner.borrow();
         let inner = inner.as_ref().unwrap();
-        // The signal handlers below belong to the signal adapter and to the pipeline,
-        // which the inner player owns. They hold it weakly: a strong reference would
-        // keep the player, its pipeline and its source buffers alive for ever.
+        // The handlers below belong to the bus and to the pipeline, which the inner player
+        // owns. They hold it weakly: a strong reference would keep the player, its
+        // pipeline and its source buffers alive for ever.
         let weak_inner = Arc::downgrade(inner);
-        let observer = self.observer.clone();
-        // Handle `end-of-stream` signal.
-        signal_adapter.connect_end_of_stream(move |_| {
-            let _ = notify!(observer, PlayerEvent::EndOfStream);
-        });
-
-        let observer = self.observer.clone();
-        // Handle `error` signal
-        signal_adapter.connect_error(move |_self, error, _details| {
-            let _ = notify!(observer, PlayerEvent::Error(error.to_string()));
-        });
-
-        let inner_clone = weak_inner.clone();
-        let observer = self.observer.clone();
-        // Handle `state-changed` signal.
-        signal_adapter.connect_state_changed(move |_, play_state| {
-            let Some(inner) = inner_clone.upgrade() else {
-                return;
-            };
-            inner.lock().unwrap().play_state = play_state;
-
-            let state = match play_state {
-                gstreamer_play::PlayState::Buffering => Some(PlaybackState::Buffering),
-                gstreamer_play::PlayState::Stopped => Some(PlaybackState::Stopped),
-                gstreamer_play::PlayState::Paused => Some(PlaybackState::Paused),
-                gstreamer_play::PlayState::Playing => Some(PlaybackState::Playing),
-                _ => None,
-            };
-            if let Some(v) = state {
-                let _ = notify!(observer, PlayerEvent::StateChanged(v));
-            }
-        });
-
-        let inner_clone = weak_inner.clone();
-        let observer = self.observer.clone();
-        // Handle `position-update` signal.
-        signal_adapter.connect_position_updated(move |_, position| {
-            if let Some(seconds) = position.map(|p| p.seconds_f64()) {
-                let Some(inner) = inner_clone.upgrade() else {
-                    return;
-                };
-                if let Ok(inner) = inner.lock() {
-                    inner.media_source.set_position(seconds);
-                }
-                let _ = notify!(observer, PlayerEvent::PositionChanged(seconds));
-            }
-        });
-
-        let observer = self.observer.clone();
-        // Handle `seek-done` signal.
-        signal_adapter.connect_seek_done(move |_, position| {
-            let _ = notify!(observer, PlayerEvent::SeekDone(position.seconds_f64()));
-        });
-
-        // Handle `media-info-updated` signal.
-        let inner_clone = weak_inner.clone();
-        let observer = self.observer.clone();
-        signal_adapter.connect_media_info_updated(move |_, info| {
-            let Ok(metadata) = metadata_from_media_info(info) else {
-                return;
-            };
-
-            let Some(inner) = inner_clone.upgrade() else {
-                return;
-            };
-            let mut inner = inner.lock().unwrap();
-
-            if inner.last_metadata.as_ref() == Some(&metadata) {
-                return;
-            }
-
-            // TODO: Workaround to generate expected `paused` state change event.
-            // <https://github.com/servo/servo/issues/40740>
-            let mut send_pause_event = false;
-
-            if inner.last_metadata.is_none() {
-                if metadata.is_seekable && inner.playback_rate.get() != DEFAULT_PLAYBACK_RATE {
-                    // The `paused` state change event will be fired after the
-                    // seek initiated by the playback rate change has
-                    // completed.
-                    inner.player.set_rate(inner.playback_rate.get());
-                } else if inner.play_state == gstreamer_play::PlayState::Paused {
-                    // We need to send the paused event for non seekable push streams.
-                    send_pause_event = true;
-                }
-            }
-
-            inner.last_metadata = Some(metadata.clone());
-            gstreamer::info!(
-                inner.cat,
-                obj = &inner.player,
-                "Metadata updated: {:?}",
-                metadata
-            );
-            let _ = notify!(observer, PlayerEvent::MetadataUpdated(metadata));
-
-            if send_pause_event {
-                let _ = notify!(observer, PlayerEvent::StateChanged(PlaybackState::Paused));
-            }
-        });
-
-        // Handle `duration-changed` signal.
-        let inner_clone = weak_inner.clone();
-        let observer = self.observer.clone();
-        signal_adapter.connect_duration_changed(move |_, duration| {
-            let duration = duration.map(|duration| {
-                time::Duration::new(
-                    duration.seconds(),
-                    (duration.nseconds() % 1_000_000_000) as u32,
-                )
-            });
-
-            let Some(inner) = inner_clone.upgrade() else {
-                return;
-            };
-            let mut inner = inner.lock().unwrap();
-            if let Some(ref mut metadata) = inner.last_metadata &&
-                metadata.duration != duration
-            {
-                metadata.duration = duration;
-                gstreamer::info!(
-                    inner.cat,
-                    obj = &inner.player,
-                    "Duration changed: {:?}",
-                    duration
-                );
-                let _ = notify!(observer, PlayerEvent::DurationChanged(duration));
+        let setup_error = Arc::new(SetupError::default());
+        // The messages are handled where they are posted, and stay on the bus for the
+        // reaper thread. The ones posted before this were for nobody.
+        bus.set_sync_handler({
+            let weak_inner = weak_inner.clone();
+            let observer = self.observer.clone();
+            let setup_error = setup_error.clone();
+            move |bus, message| {
+                handle_message(message, &weak_inner, &observer, &setup_error);
+                reaper::keep_message(bus)
             }
         });
 
@@ -1032,22 +1113,22 @@ impl GStreamerPlayer {
             );
         };
 
-        let (receiver, error_handler_id) = {
+        let receiver = {
             let inner_clone = weak_inner.clone();
             let inner = inner.lock().unwrap();
             let pipeline = inner.player.pipeline();
 
             let (sender, receiver) = mpsc::channel();
 
+            let error_sender = sender.clone();
             let sender = Arc::new(Mutex::new(sender));
-            let sender_clone = sender.clone();
             let is_ready_clone = self.is_ready.clone();
             let observer = self.observer.clone();
             pipeline.connect("source-setup", false, move |args| {
                 let source = args[1].get::<gstreamer::Element>().unwrap();
 
-                let inner = inner_clone.upgrade()?;
-                let mut inner = inner.lock().unwrap();
+                let lease = Lease::take(&inner_clone)?;
+                let mut inner = lease.lock()?;
                 let source = match inner.stream_type {
                     StreamType::Seekable => {
                         let servosrc = source
@@ -1161,29 +1242,26 @@ impl GStreamerPlayer {
                 None
             });
 
-            let error_handler_id =
-                signal_adapter.connect_error(move |signal_adapter, error, _details| {
-                    let _ = notify!(sender_clone, Err(PlayerError::Backend(error.to_string())));
-                    signal_adapter.play().stop();
-                });
-
             if inner.stream_type == StreamType::MediaSource {
                 // The pipeline is started once the source buffers have their
                 // tracks, and its errors are for the observer from the beginning.
-                signal_adapter.disconnect(error_handler_id);
                 return Ok(());
+            }
+
+            // Until the source asks for data, an error of the pipeline ends the wait.
+            if let Ok(mut setup_error) = setup_error.lock() {
+                *setup_error = Some(error_sender);
             }
 
             inner.player.pause();
 
-            (receiver, error_handler_id)
+            receiver
         };
 
         let result = receiver.recv().unwrap();
-        glib::signal::signal_handler_disconnect(
-            &inner.lock().unwrap().signal_adapter,
-            error_handler_id,
-        );
+        if let Ok(mut setup_error) = setup_error.lock() {
+            *setup_error = None;
+        }
         result
     }
 }
@@ -1366,7 +1444,10 @@ impl MediaInstance for GStreamerPlayer {
 
 impl Drop for GStreamerPlayer {
     fn drop(&mut self) {
-        let _ = self.stop();
+        // A player that was never set up has nothing to stop, and `stop` would set it up.
+        if self.inner.borrow().is_some() {
+            let _ = self.stop();
+        }
         let (tx_ack, rx_ack) = mpsc::channel();
         let _ = self
             .backend_chan
@@ -1378,5 +1459,20 @@ impl Drop for GStreamerPlayer {
                 tx_ack,
             });
         let _ = rx_ack.recv();
+
+        // The player is given up on the reaper thread: the last reference to it must not
+        // be dropped on one of its own threads, and its pipeline takes a while to stop.
+        if let Some(inner) = self.inner.borrow_mut().take() {
+            let player = inner
+                .lock()
+                .ok()
+                .map(|inner| (inner.player.message_bus(), inner.player.downgrade()));
+            match player {
+                Some((bus, weak_player)) => {
+                    reaper::let_go_of_player(Box::new(inner), bus, weak_player)
+                },
+                None => reaper::let_go(Box::new(inner)),
+            }
+        }
     }
 }

@@ -13,6 +13,7 @@ mod media_source_src;
 pub mod media_stream;
 mod media_stream_source;
 pub mod player;
+mod reaper;
 mod registry_scanner;
 mod render;
 mod source;
