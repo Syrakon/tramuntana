@@ -211,6 +211,9 @@ pub(crate) struct MediaFrameRenderer {
     current_frame_holder: Option<FrameHolder>,
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
     poster_frame: Option<MediaFrame>,
+    /// Whether the frame on show has an image key the display list does not have yet,
+    /// so that the media element has to be laid out again to show it.
+    needs_display_list: bool,
 }
 
 impl MediaFrameRenderer {
@@ -230,7 +233,14 @@ impl MediaFrameRenderer {
             very_old_frame: None,
             current_frame_holder: None,
             poster_frame: None,
+            needs_display_list: false,
         }
+    }
+
+    /// Whether the media element has to be laid out again for the frame on show. Says
+    /// so once for a frame.
+    fn take_needs_display_list(&mut self) -> bool {
+        mem::take(&mut self.needs_display_list)
     }
 
     fn setup(
@@ -346,6 +356,10 @@ impl VideoFrameRenderer for MediaFrameRenderer {
         }
 
         let mut updates = smallvec::smallvec![];
+        // A frame of the size of the one before it goes into the same image, which the
+        // display list already shows: the renderer only has to draw again. Any other
+        // frame has a new image, which the media element has to be laid out for.
+        let mut same_image = false;
 
         if let Some(old_image_key) = mem::replace(&mut self.very_old_frame, self.old_frame.take()) {
             updates.push(ImageUpdate::DeleteImage(old_image_key));
@@ -381,6 +395,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 if let Some(old_image_key) = self.old_frame.take() {
                     updates.push(ImageUpdate::DeleteImage(old_image_key));
                 }
+                same_image = true;
             },
             Some(current_frame) => {
                 self.old_frame = Some(current_frame.image_key);
@@ -479,6 +494,13 @@ impl VideoFrameRenderer for MediaFrameRenderer {
         }
         self.paint_api
             .update_images(self.webview_id.into(), updates);
+        if same_image {
+            // Not through the script thread: a page that keeps it busy would hold the
+            // video still for as long.
+            self.paint_api.generate_frame(vec![self.webview_id.into()]);
+        } else {
+            self.needs_display_list = true;
+        }
     }
 }
 
@@ -3302,16 +3324,25 @@ impl HTMLMediaElement {
             return;
         }
 
-        if let Some(frame) = self.video_renderer.lock().unwrap().current_frame {
+        let (frame, needs_display_list) = {
+            let mut video_renderer = self.video_renderer.lock().unwrap();
+            (
+                video_renderer.current_frame,
+                video_renderer.take_needs_display_list(),
+            )
+        };
+        if let Some(frame) = frame {
             if video_element.set_natural_dimensions(
                 no_gc,
                 Some(frame.width as u32),
                 Some(frame.height as u32),
             ) {
                 self.queue_media_element_task_to_fire_event(atom!("resize"));
-            } else {
-                // If the natural dimensions have not been changed, the node should be marked as
-                // damaged to force a repaint with the new frame contents.
+            } else if needs_display_list {
+                // The natural dimensions have not changed but the image has: the node is
+                // marked as damaged so that the display list is made again with it. A frame
+                // that went into the image already on show needs nothing from here, the
+                // renderer was asked to draw again when it came.
                 self.upcast::<Node>().dirty(no_gc, NodeDamage::Other);
             }
         }
