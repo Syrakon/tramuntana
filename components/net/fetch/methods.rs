@@ -59,7 +59,7 @@ use crate::fetch::fetch_params::{
 use crate::filemanager_thread::FileManager;
 use crate::http_loader::{HttpState, determine_requests_referrer, http_fetch, set_default_accept};
 use crate::protocols::{ProtocolRegistry, is_url_potentially_trustworthy};
-use crate::request_filter::{FilterVerdict, FilteredRequest, SharedRequestFilter};
+use crate::request_filter::{FilterVerdict, FilteredRequest, SharedRequestFilter, Substitute};
 use crate::request_interceptor::RequestInterceptor;
 use crate::subresource_integrity::is_response_integrity_valid;
 
@@ -561,13 +561,24 @@ pub async fn main_fetch(
     let current_scheme = current_url.scheme();
 
     // Ask the embedder's request filter, if it installed one, whether this request may
-    // go out at all. A blocked request fails here, before the network is touched.
+    // go out at all. A blocked or substituted request ends here, before the network is
+    // touched.
     if response.is_none() &&
-        let Some(request_filter) = context.request_filter.as_ref() &&
-        request_filter.filter(&FilteredRequest::new(request, &current_url)) ==
-            FilterVerdict::Block
+        let Some(request_filter) = context.request_filter.as_ref()
     {
-        response = Some(Response::network_error(NetworkError::Blocked));
+        match request_filter.filter(&FilteredRequest::new(request, &current_url)) {
+            FilterVerdict::Allow => {},
+            FilterVerdict::Block => {
+                response = Some(Response::network_error(NetworkError::Blocked));
+            },
+            FilterVerdict::Substitute(substitute) => {
+                response = Some(create_substitute_reply(
+                    current_url.clone(),
+                    request.timing_type(),
+                    substitute,
+                ));
+            },
+        }
     }
 
     // Intercept the request and maybe override the response.
@@ -1029,6 +1040,27 @@ fn create_blank_reply(url: ServoUrl, timing_type: ResourceTimingType) -> Respons
         .headers
         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
     *response.body.lock() = ResponseBody::Done(vec![]);
+    response.status = HttpStatus::default();
+    response
+}
+
+/// The `200 OK` a request filter answers a request with in place of the network.
+fn create_substitute_reply(
+    url: ServoUrl,
+    timing_type: ResourceTimingType,
+    substitute: Substitute,
+) -> Response {
+    let mut response = Response::new(url, ResourceFetchTiming::new(timing_type));
+    match HeaderValue::from_str(&substitute.content_type) {
+        Ok(value) => {
+            response.headers.insert(header::CONTENT_TYPE, value);
+        },
+        Err(error) => warn!(
+            "Request filter gave an invalid content type {:?}: {error}",
+            substitute.content_type
+        ),
+    }
+    *response.body.lock() = ResponseBody::Done(substitute.body);
     response.status = HttpStatus::default();
     response
 }

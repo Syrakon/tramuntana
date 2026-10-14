@@ -7,8 +7,8 @@
 //!
 //! Unlike [`crate::request_interceptor::RequestInterceptor`], which asks the embedder
 //! over a channel and can substitute a whole response, a filter answers synchronously
-//! and can only allow or block. That keeps the cost per subresource low enough to run
-//! on every request.
+//! and can only allow, block, or answer with a body it already holds. That keeps the
+//! cost per subresource low enough to run on every request.
 
 use std::sync::Arc;
 
@@ -19,12 +19,25 @@ use servo_base::id::WebViewId;
 use servo_url::{ImmutableOrigin, ServoUrl};
 
 /// What a [`RequestFilter`] decided about a request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FilterVerdict {
     /// Let the fetch continue.
     Allow,
     /// Fail the fetch with [`net_traits::NetworkError::Blocked`].
     Block,
+    /// Do not touch the network, and answer the request with this body instead. A
+    /// content blocker uses it where a page notices a failed load: a stand-in script
+    /// that does nothing still runs, so the page sees it succeed.
+    Substitute(Substitute),
+}
+
+/// The response a [`FilterVerdict::Substitute`] answers a request with: a `200 OK`
+/// from the request's own URL, with this type and body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Substitute {
+    /// The value of the `Content-Type` header, such as `application/javascript`.
+    pub content_type: String,
+    pub body: Vec<u8>,
 }
 
 /// Everything a [`RequestFilter`] is told about a request.

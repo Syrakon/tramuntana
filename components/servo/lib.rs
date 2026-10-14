@@ -137,7 +137,7 @@ pub mod webxr {
 /// The embedder's hook for blocking requests before they reach the network, installed
 /// with [`ServoBuilder::request_filter`].
 pub mod request_filter {
-    pub use net::request_filter::{FilterVerdict, FilteredRequest, RequestFilter};
+    pub use net::request_filter::{FilterVerdict, FilteredRequest, RequestFilter, Substitute};
     pub use net_traits::request::Destination;
 }
 
