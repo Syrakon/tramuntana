@@ -912,6 +912,15 @@ impl GStreamerPlayer {
             })?;
         pipeline.set_property_from_value("flags", &flags);
 
+        // The flag alone does not keep the audio server out of it: measured with
+        // PipeWire, a page that mutes its video still mutes the stream, the server
+        // remembers that, and the next stream of the application is born muted and
+        // at the remembered volume while its page says neither. Stating both here
+        // makes the sink open its stream with them instead of with what the server
+        // remembers. They are the values `PlayerInner` starts from.
+        player.set_mute(DEFAULT_MUTED);
+        player.set_volume(DEFAULT_VOLUME);
+
         // Set player position interval update to 0.5 seconds. With source buffers
         // the position is also what tells that playback is about to run out of
         // data, which has to be noticed sooner.
