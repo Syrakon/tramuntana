@@ -17,6 +17,13 @@ mod embedder;
 mod event_loop;
 mod logging;
 mod pipeline;
+#[cfg(all(
+    feature = "multiprocess",
+    target_os = "linux",
+    not(target_env = "ohos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod linux_sandbox;
 #[cfg(feature = "multiprocess")]
 mod process_manager;
 #[cfg(feature = "multiprocess")]
@@ -33,5 +40,12 @@ pub use crate::event_loop::EventLoop;
 #[cfg(feature = "multiprocess")]
 pub use crate::event_loop::NewScriptEventLoopProcessInfo;
 pub use crate::logging::{FromEmbedderLogger, FromScriptLogger};
+#[cfg(all(
+    feature = "multiprocess",
+    target_os = "linux",
+    not(target_env = "ohos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use crate::linux_sandbox::{SandboxError, enter_content_process_sandbox};
 #[cfg(feature = "multiprocess")]
 pub use crate::sandboxing::{UnprivilegedContent, content_process_sandbox_profile};

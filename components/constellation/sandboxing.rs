@@ -5,19 +5,7 @@
 use std::ffi::OsStr;
 use std::{env, process};
 
-#[cfg(any(
-    target_os = "macos",
-    all(
-        not(target_os = "windows"),
-        not(target_os = "ios"),
-        not(target_os = "android"),
-        not(target_env = "ohos"),
-        not(target_arch = "arm"),
-        not(target_arch = "aarch64"),
-        not(target_arch = "riscv32"),
-        not(target_arch = "riscv64")
-    )
-))]
+#[cfg(target_os = "macos")]
 use gaol::profile::{Operation, PathPattern, Profile};
 use serde::{Deserialize, Serialize};
 use servo_config::opts::Opts;
@@ -91,67 +79,20 @@ pub fn content_process_sandbox_profile() -> Profile {
     Profile::new(operations).expect("Failed to create sandbox profile!")
 }
 
-/// Our content process sandbox profile on Linux. As restrictive as possible.
-#[cfg(all(
-    not(target_os = "macos"),
-    not(target_os = "windows"),
-    not(target_os = "ios"),
-    not(target_os = "android"),
-    not(target_env = "ohos"),
-    not(target_arch = "arm"),
-    not(target_arch = "aarch64"),
-    not(target_arch = "riscv32"),
-    not(target_arch = "riscv64")
-))]
-pub fn content_process_sandbox_profile() -> Profile {
-    use std::path::PathBuf;
-
-    use embedder_traits::resources;
-
-    let mut operations = vec![Operation::FileReadAll(PathPattern::Literal(PathBuf::from(
-        "/dev/urandom",
-    )))];
-
-    operations.extend(
-        resources::sandbox_access_files()
-            .into_iter()
-            .map(|p| Operation::FileReadAll(PathPattern::Literal(p))),
-    );
-    operations.extend(
-        resources::sandbox_access_files_dirs()
-            .into_iter()
-            .map(|p| Operation::FileReadAll(PathPattern::Subpath(p))),
-    );
-
-    Profile::new(operations).expect("Failed to create sandbox profile!")
-}
-
-#[cfg(any(
-    target_os = "windows",
-    target_os = "ios",
-    target_os = "android",
-    target_env = "ohos",
-    target_arch = "arm",
-    target_arch = "riscv32",
-    target_arch = "riscv64",
-
-    // exclude apple arm devices
-    all(target_arch = "aarch64", not(target_os = "macos"))
-))]
+/// Other platforms have no gaol profile. On Linux the content process sandboxes itself, see
+/// `linux_sandbox`.
+#[cfg(not(target_os = "macos"))]
 pub fn content_process_sandbox_profile() {
     log::error!("Sandboxed multiprocess is not supported on this platform.");
     process::exit(1);
 }
 
-#[cfg(any(
-    target_os = "windows",
-    target_os = "android",
-    target_env = "ohos",
-    target_arch = "arm",
-    target_arch = "aarch64",
-    target_arch = "riscv32",
-    target_arch = "riscv64"
-))]
+// On Linux the child is spawned as is, and enters its sandbox itself once it knows its
+// options: see `linux_sandbox`.
+#[cfg(not(any(
+    target_os = "ios",
+    all(target_os = "macos", not(target_arch = "aarch64"))
+)))]
 pub fn spawn_multiprocess(
     content: UnprivilegedContent,
 ) -> Result<crate::process_manager::Process, ipc_channel::IpcError> {
@@ -177,16 +118,7 @@ pub fn spawn_multiprocess(
     Ok(crate::process_manager::Process::Unsandboxed(child))
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    not(target_os = "ios"),
-    not(target_os = "android"),
-    not(target_env = "ohos"),
-    not(target_arch = "arm"),
-    not(target_arch = "aarch64"),
-    not(target_arch = "riscv32"),
-    not(target_arch = "riscv64")
-))]
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
 pub fn spawn_multiprocess(
     content: UnprivilegedContent,
 ) -> Result<crate::process_manager::Process, ipc_channel::IpcError> {

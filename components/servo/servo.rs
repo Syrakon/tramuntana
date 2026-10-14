@@ -15,14 +15,8 @@ use env_logger::Builder as EnvLoggerBuilder;
 use fonts::SystemFontService;
 #[cfg(all(
     feature = "multiprocess",
-    not(target_os = "windows"),
-    not(target_os = "ios"),
-    not(target_os = "android"),
-    not(target_arch = "arm"),
-    not(target_arch = "aarch64"),
-    not(target_arch = "riscv32"),
-    not(target_arch = "riscv64"),
-    not(target_env = "ohos"),
+    target_os = "macos",
+    not(target_arch = "aarch64")
 ))]
 use gaol::sandbox::{ChildSandbox, ChildSandboxMethods};
 #[cfg(feature = "multiprocess")]
@@ -69,14 +63,8 @@ use servo_config::{opts, pref, prefs};
 use servo_constellation::UnprivilegedContent;
 #[cfg(all(
     feature = "multiprocess",
-    not(target_os = "windows"),
-    not(target_os = "ios"),
-    not(target_os = "android"),
-    not(target_arch = "arm"),
-    not(target_arch = "aarch64"),
-    not(target_arch = "riscv32"),
-    not(target_arch = "riscv64"),
-    not(target_env = "ohos"),
+    target_os = "macos",
+    not(target_arch = "aarch64")
 ))]
 use servo_constellation::content_process_sandbox_profile;
 use servo_constellation::{
@@ -1390,6 +1378,17 @@ pub fn run_content_process(token: String) {
     opts::initialize_options(unprivileged_content.opts());
     prefs::set(unprivileged_content.prefs().clone());
 
+    // The logger comes first, so that what the sandbox reports, its failure included, is
+    // seen.
+    if let UnprivilegedContent::ScriptEventLoop(new_event_loop_info) = &unprivileged_content {
+        set_logger(
+            new_event_loop_info
+                .initial_script_state
+                .script_to_constellation_sender
+                .clone(),
+        );
+    }
+
     // Enter the sandbox if necessary.
     if opts::get().sandbox {
         create_sandbox();
@@ -1400,13 +1399,6 @@ pub fn run_content_process(token: String) {
     match unprivileged_content {
         UnprivilegedContent::ScriptEventLoop(new_event_loop_info) => {
             media_platform::init();
-
-            set_logger(
-                new_event_loop_info
-                    .initial_script_state
-                    .script_to_constellation_sender
-                    .clone(),
-            );
 
             register_system_memory_reporter_for_event_loop(&new_event_loop_info);
 
@@ -1447,14 +1439,8 @@ pub fn run_content_process(token: String) {
 
 #[cfg(all(
     feature = "multiprocess",
-    not(target_os = "windows"),
-    not(target_os = "ios"),
-    not(target_os = "android"),
-    not(target_arch = "arm"),
-    not(target_arch = "aarch64"),
-    not(target_arch = "riscv32"),
-    not(target_arch = "riscv64"),
-    not(target_env = "ohos"),
+    target_os = "macos",
+    not(target_arch = "aarch64")
 ))]
 fn create_sandbox() {
     ChildSandbox::new(content_process_sandbox_profile())
@@ -1462,15 +1448,28 @@ fn create_sandbox() {
         .expect("Failed to activate sandbox!");
 }
 
-#[cfg(any(
-    target_os = "windows",
-    target_os = "ios",
-    target_os = "android",
-    target_arch = "arm",
-    target_arch = "aarch64",
-    target_arch = "riscv32",
-    target_arch = "riscv64",
-    target_env = "ohos",
+/// A content process that cannot enter its sandbox must not run content.
+#[cfg(all(
+    feature = "multiprocess",
+    target_os = "linux",
+    not(target_env = "ohos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn create_sandbox() {
+    if let Err(error) = servo_constellation::enter_content_process_sandbox() {
+        log::error!("Content process cannot enter its sandbox, exiting: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(all(
+    feature = "multiprocess",
+    not(all(target_os = "macos", not(target_arch = "aarch64"))),
+    not(all(
+        target_os = "linux",
+        not(target_env = "ohos"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
 ))]
 fn create_sandbox() {
     panic!("Sandboxing is not supported on Windows, iOS, ARM, RISC-V targets and android.");
