@@ -445,6 +445,23 @@ impl Painter {
         self.send_pending_paint_metrics_messages_after_composite();
     }
 
+    /// Take the frames WebRender has published into the renderer without painting them.
+    ///
+    /// Published frames wait in the renderer's result channel until `Renderer::update`
+    /// reads them, and only `render` calls it. An embedder that does not paint a hidden
+    /// WebView would let every frame it builds pile up there with all of its memory.
+    /// Updating keeps only the latest frame per document, so painting later still shows
+    /// the current content.
+    pub(crate) fn take_published_frames(&mut self) {
+        if let Err(error) = self.rendering_context.make_current() {
+            error!("Failed to make the rendering context current: {error:?}");
+            return;
+        }
+        if let Some(renderer) = self.webrender_renderer.as_mut() {
+            renderer.update();
+        }
+    }
+
     fn clear_background(&self) {
         self.assert_gl_framebuffer_complete();
 

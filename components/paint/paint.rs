@@ -809,6 +809,9 @@ impl Paint {
         }
 
         for (painter_id, repaint_needed) in saw_webrender_frame_ready_for_painter.iter() {
+            if let Some(mut painter) = self.maybe_painter_mut(*painter_id) {
+                painter.take_published_frames();
+            }
             if let Some(painter) = self.maybe_painter(*painter_id) {
                 painter.handle_new_webrender_frame_ready(*repaint_needed);
             }
