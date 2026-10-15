@@ -127,6 +127,11 @@ pub(crate) struct HTMLImageElement {
     line_number: u64,
     image_request: Cell<ImageRequestPhase>,
     generation: Cell<u32>,
+    /// <https://html.spec.whatwg.org/multipage/#lazy-load-resumption-steps>
+    /// The rest of update the image data, from "fetch the image" on, only needs the URL to
+    /// fetch, so the steps are kept as that URL. `None` when no steps are waiting.
+    #[no_trace]
+    lazy_load_resumption_url: DomRefCell<Option<ServoUrl>>,
 }
 
 impl HTMLImageElement {
@@ -730,11 +735,76 @@ impl HTMLImageElement {
             },
         }
 
+        // > If the will lazy load element steps given the img return true, then:
+        if self.will_lazy_load_element_steps() {
+            // > Set the img's lazy load resumption steps to the rest of this algorithm starting
+            // > with the step labeled fetch the image.
+            // > Start intersection-observing a lazy loading element for the img element.
+            // > Return.
+            if self.defer_fetch_until_visible(cx, image_url) {
+                return;
+            }
+        }
+
+        // > Fetch the image.
         self.fetch_image(cx, image_url);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#will-lazy-load-element-steps>
+    fn will_lazy_load_element_steps(&self) -> bool {
+        // Step 1. If scripting is disabled for element, then return false.
+        if !self.owner_document().scripting_enabled() {
+            return false;
+        }
+        // Step 2. If element's lazy loading attribute is in the Lazy state, then return true.
+        // Step 3. Return false.
+        self.Loading() == "lazy"
+    }
+
+    /// Keep `image_url` as the lazy load resumption steps and start intersection-observing the
+    /// element. Returns false, and keeps nothing, when the document has no lazy load observer;
+    /// the image is then fetched right away.
+    fn defer_fetch_until_visible(&self, cx: &mut JSContext, image_url: &ServoUrl) -> bool {
+        let Some(observer) = self.owner_document().lazy_load_intersection_observer(cx) else {
+            return false;
+        };
+        *self.lazy_load_resumption_url.borrow_mut() = Some(image_url.clone());
+
+        // An image that is not yet fetched must not hold back the document's load event:
+        // it may never come into view. Drop the blocker the new image request took.
+        match self.image_request.get() {
+            ImageRequestPhase::Current => {
+                LoadBlocker::terminate(&self.current_request.borrow().blocker, cx);
+            },
+            ImageRequestPhase::Pending => {
+                if let Some(request) = self.pending_request.borrow().as_ref() {
+                    LoadBlocker::terminate(&request.blocker, cx);
+                }
+            },
+        }
+
+        observer.start_observing_lazy_loading_element(self.upcast(), cx.no_gc());
+        true
+    }
+
+    /// Whether the fetch of this image waits for the element to come near the viewport.
+    pub(crate) fn has_lazy_load_resumption_steps(&self) -> bool {
+        self.lazy_load_resumption_url.borrow().is_some()
+    }
+
+    /// Run the lazy load resumption steps: fetch the image whose fetch was put off.
+    pub(crate) fn resume_lazy_load(&self, cx: &mut JSContext) {
+        let Some(image_url) = self.lazy_load_resumption_url.borrow_mut().take() else {
+            return;
+        };
+        self.fetch_image(cx, &image_url);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#update-the-image-data>
     fn update_the_image_data_sync_steps(&self, cx: &mut JSContext) {
+        // A new run of the algorithm replaces the steps an earlier run left waiting.
+        self.lazy_load_resumption_url.borrow_mut().take();
+
         // Step 10. Let selected source and selected pixel density be the URL and pixel density that
         // results from selecting an image source, respectively.
         let Some((selected_source, selected_pixel_density)) = self
@@ -1270,6 +1340,7 @@ impl HTMLImageElement {
             last_selected_source: DomRefCell::new(None),
             image_decode_promises: DomRefCell::new(vec![]),
             line_number: creator.return_line_number(),
+            lazy_load_resumption_url: DomRefCell::new(None),
         }
     }
 
@@ -1534,6 +1605,20 @@ impl HTMLImageElementMethods<crate::DomTypeHolder> for HTMLImageElement {
     // <https://html.spec.whatwg.org/multipage/#dom-img-sizes>
     make_setter!(SetSizes, "sizes");
 
+    // <https://html.spec.whatwg.org/multipage/#dom-img-loading>
+    make_enumerated_getter!(
+        Loading,
+        "loading",
+        "lazy" | "eager",
+        // <https://html.spec.whatwg.org/multipage/#lazy-loading-attribute>
+        // > The attribute's missing value default and invalid value default are both the Eager state.
+        missing => "eager",
+        invalid => "eager"
+    );
+
+    // <https://html.spec.whatwg.org/multipage/#dom-img-loading>
+    make_setter!(SetLoading, "loading");
+
     /// <https://html.spec.whatwg.org/multipage/#dom-img-crossOrigin>
     fn GetCrossOrigin(&self) -> Option<DOMString> {
         reflect_cross_origin_attribute(self.upcast::<Element>())
@@ -1750,6 +1835,22 @@ impl VirtualMethods for HTMLImageElement {
             //   <https://github.com/whatwg/html/pull/5900>
             &local_name!("src") | &local_name!("srcset") | &local_name!("sizes") => {
                 self.update_the_image_data(cx);
+            },
+            &local_name!("loading") => {
+                // <https://html.spec.whatwg.org/multipage/#lazy-loading-attribute>
+                // > When the loading attribute's state is changed to the Eager state, the user
+                // > agent must run these steps:
+                // > 1. Let resumptionSteps be the element's lazy load resumption steps.
+                // > 2. If resumptionSteps is null, then return.
+                // > 3. Set the element's lazy load resumption steps to null.
+                // > 4. Invoke resumptionSteps.
+                if !self.will_lazy_load_element_steps() && self.has_lazy_load_resumption_steps() {
+                    if let Some(observer) = self.owner_document().lazy_load_intersection_observer(cx)
+                    {
+                        observer.stop_observing_lazy_loading_element(self.upcast(), cx.no_gc());
+                    }
+                    self.resume_lazy_load(cx);
+                }
             },
             &local_name!("crossorigin") => {
                 // <https://html.spec.whatwg.org/multipage/#reacting-to-dom-mutations>

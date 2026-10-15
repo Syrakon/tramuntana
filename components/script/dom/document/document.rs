@@ -680,6 +680,9 @@ pub(crate) struct Document {
     /// The lifetime of an intersection observer is specified at
     /// <https://github.com/w3c/IntersectionObserver/issues/525>.
     intersection_observers: DomRefCell<Vec<Dom<IntersectionObserver>>>,
+    /// <https://html.spec.whatwg.org/multipage/#lazy-load-intersection-observer>
+    /// Created the first time an element of this document is lazy loaded.
+    lazy_load_intersection_observer: MutNullableDom<IntersectionObserver>,
     /// The node that is currently highlighted by the devtools
     highlighted_dom_node: MutNullableDom<Node>,
     /// Resolved LCP candidate elements, keyed by their [LCPCandidateID].
@@ -3565,6 +3568,22 @@ impl Document {
         true
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#lazy-load-intersection-observer>
+    ///
+    /// `None` only if the observer could not be created; the caller then loads the element
+    /// right away instead of lazily.
+    pub(crate) fn lazy_load_intersection_observer(
+        &self,
+        cx: &mut JSContext,
+    ) -> Option<DomRoot<IntersectionObserver>> {
+        if let Some(observer) = self.lazy_load_intersection_observer.get() {
+            return Some(observer);
+        }
+        let observer = IntersectionObserver::new_lazy_load(cx, self.window())?;
+        self.lazy_load_intersection_observer.set(Some(&observer));
+        Some(observer)
+    }
+
     /// Add an [`IntersectionObserver`] to the [`Document`], to be processed in the [`Document`]'s event loop.
     /// <https://github.com/w3c/IntersectionObserver/issues/525>
     pub(crate) fn add_intersection_observer(&self, intersection_observer: &IntersectionObserver) {
@@ -4295,6 +4314,7 @@ impl Document {
             has_trustworthy_ancestor_origin: Cell::new(has_trustworthy_ancestor_origin),
             intersection_observer_task_queued: Cell::new(false),
             intersection_observers: Default::default(),
+            lazy_load_intersection_observer: Default::default(),
             highlighted_dom_node: Default::default(),
             lcp_candidates: DomRefCell::new(Default::default()),
             paint_timing_info: Cell::new(PaintTimingInfo::now()),
