@@ -91,7 +91,9 @@ use crate::dom::promiserejectionevent::PromiseRejectionEvent;
 use crate::dom::response::Response;
 use crate::dom::trustedtypes::trustedscript::TrustedScript;
 use crate::dom::window::Window;
-use crate::engine::handle::current_js_engine_handle;
+use crate::engine::handle::{
+    ChildRuntimeToken, current_js_engine_handle, new_child_of_parent_runtime,
+};
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopSender};
 use crate::modules::script_module::EnsureModuleHooksInitialized;
 use crate::realms::enter_auto_realm;
@@ -545,6 +547,11 @@ struct RuntimeCallbackData {
 pub(crate) struct Runtime {
     #[ignore_malloc_size_of = "Type from mozjs"]
     rt: RustRuntime,
+    /// Keeps the process's parent runtime alive when `rt` is its child. Declared after `rt`
+    /// so that it is dropped after it.
+    #[no_trace]
+    #[ignore_malloc_size_of = "Zero-sized"]
+    parent_runtime_token: Option<ChildRuntimeToken>,
     job_queue: JobQueue,
     /// The data that is set on the SpiderMonkey runtime callbacks as a pointer.
     runtime_callback_data: Box<RuntimeCallbackData>,
@@ -562,7 +569,14 @@ impl Runtime {
     /// This, like many calls to SpiderMoney API, is unsafe.
     #[expect(unsafe_code)]
     pub(crate) fn new(main_thread_sender: Option<ScriptEventLoopSender>) -> Runtime {
-        unsafe { Self::new_with_parent(None, main_thread_sender) }
+        let Some((parent, parent_runtime_token)) = new_child_of_parent_runtime() else {
+            return unsafe { Self::new_with_parent(None, main_thread_sender) };
+        };
+        // SAFETY: The parent runtime is owned by its own thread, which does not destroy it
+        // while a `ChildRuntimeToken` is alive, and the token is dropped after `rt`.
+        let mut runtime = unsafe { Self::new_with_parent(Some(parent), main_thread_sender) };
+        runtime.parent_runtime_token = Some(parent_runtime_token);
+        runtime
     }
 
     #[allow(unsafe_code)]
@@ -848,6 +862,7 @@ impl Runtime {
         }
         Runtime {
             rt: runtime,
+            parent_runtime_token: None,
             job_queue,
             runtime_callback_data: unsafe { Box::from_raw(runtime_callback_data) },
         }

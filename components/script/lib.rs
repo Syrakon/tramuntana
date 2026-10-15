@@ -61,5 +61,5 @@ pub(crate) use crate::dom::bindings::codegen::DomTypeHolder::DomTypeHolder;
 pub(crate) use crate::dom::bindings::inheritance::HasParent;
 pub(crate) use crate::dom::bindings::trace::{CustomTraceable, JSTraceable};
 pub use crate::dom::serviceworker::serviceworker_manager::ServiceWorkerManager;
-pub use crate::engine::handle::JSEngineSetup;
+pub use crate::engine::handle::{JSEngineSetup, register_parent_runtime_memory_reporter};
 pub use crate::engine::init::init;

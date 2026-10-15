@@ -964,6 +964,7 @@ impl Servo {
         // Important that this call is done in a single-threaded fashion, we
         // can't defer it after `create_constellation` has started.
         let js_engine_setup = if !opts.multiprocess {
+            script::register_parent_runtime_memory_reporter(&mem_profiler_chan);
             Some(script::init())
         } else {
             None
@@ -1401,6 +1402,11 @@ pub fn run_content_process(token: String) {
             media_platform::init();
 
             register_system_memory_reporter_for_event_loop(&new_event_loop_info);
+            script::register_parent_runtime_memory_reporter(
+                &new_event_loop_info
+                    .initial_script_state
+                    .memory_profiler_sender,
+            );
 
             let (background_hang_monitor_register, background_hang_monitor_join_handle) =
                 HangMonitorRegister::init(
