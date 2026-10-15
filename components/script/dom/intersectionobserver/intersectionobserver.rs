@@ -39,6 +39,7 @@ use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::document::{Document, RenderingUpdateReason};
 use crate::dom::domrectreadonly::DOMRectReadOnly;
 use crate::dom::element::Element;
+use crate::dom::html::htmliframeelement::HTMLIFrameElement;
 use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::intersectionobserverentry::IntersectionObserverEntry;
 use crate::dom::node::{Node, NodeTraits};
@@ -282,17 +283,18 @@ impl IntersectionObserver {
                 continue;
             }
             let target = entry.Target();
-            let Some(image) = target.downcast::<HTMLImageElement>() else {
-                continue;
-            };
-            if !image.has_lazy_load_resumption_steps() {
-                continue;
-            }
             // > 4. Stop intersection-observing a lazy loading element for entry.target.
-            self.stop_observing_lazy_loading_element(&target, cx.no_gc());
             // > 5. Set entry.target's lazy load resumption steps to null.
             // > 6. Invoke resumptionSteps.
-            image.resume_lazy_load(cx);
+            if let Some(image) = target.downcast::<HTMLImageElement>() {
+                if image.has_lazy_load_resumption_steps() {
+                    self.stop_observing_lazy_loading_element(&target, cx.no_gc());
+                    image.resume_lazy_load(cx);
+                }
+            } else if let Some(iframe) = target.downcast::<HTMLIFrameElement>() {
+                // Resuming the iframe stops observing it too.
+                iframe.resume_lazy_load(cx);
+            }
         }
     }
 
