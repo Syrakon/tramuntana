@@ -10,7 +10,7 @@ use std::fmt::{Debug, Error, Formatter};
 use crossbeam_channel::Sender;
 use embedder_traits::{AnimationState, EventLoopWaker};
 use euclid::{Rect, Scale, Size2D};
-use log::warn;
+use log::{error, warn};
 use malloc_size_of_derive::MallocSizeOf;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
@@ -26,6 +26,8 @@ pub mod display_list;
 pub mod rendering_context;
 pub mod viewport_description;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use bitflags::bitflags;
@@ -561,6 +563,29 @@ pub enum WebRenderImageHandlerType {
     WebGl,
     Media,
     WebGpu,
+    /// An image whose pixels another process put in shared memory, served from the mapping
+    /// instead of from a copy. See [`SharedMemoryImages`].
+    SharedMemory,
+}
+
+/// The pixels of the images that WebRender reads from shared memory instead of from a copy
+/// of its own, by [`ExternalImageId`]. The painter that owns the WebRender instance adds and
+/// removes them; its [`WebRenderExternalImageHandlers`] serves them when WebRender uploads them.
+#[derive(Clone, Default)]
+pub struct SharedMemoryImages(Rc<RefCell<FxHashMap<ExternalImageId, Arc<GenericSharedMemory>>>>);
+
+impl SharedMemoryImages {
+    pub fn insert(&self, id: ExternalImageId, data: Arc<GenericSharedMemory>) {
+        self.0.borrow_mut().insert(id, data);
+    }
+
+    pub fn remove(&self, id: &ExternalImageId) {
+        self.0.borrow_mut().remove(id);
+    }
+
+    fn get(&self, id: &ExternalImageId) -> Option<Arc<GenericSharedMemory>> {
+        self.0.borrow().get(id).cloned()
+    }
 }
 
 /// List of WebRender external images to be shared among all external image
@@ -607,6 +632,11 @@ pub struct WebRenderExternalImageHandlers {
     /// This is shared with the WebGL, WebGPU, and hardware-accelerated media threads and
     /// all other instances of [`WebRenderExternalImageHandlers`] -- one per WebRender instance.
     id_manager: WebRenderExternalImageIdManager,
+    /// The images in shared memory of this WebRender instance.
+    shared_memory_images: SharedMemoryImages,
+    /// The images in shared memory that WebRender has locked and not yet unlocked. Holding them
+    /// here lets [`ExternalImageHandler::lock`] lend out their pixels.
+    locked_shared_memory_images: FxHashMap<ExternalImageId, Arc<GenericSharedMemory>>,
 }
 
 impl WebRenderExternalImageHandlers {
@@ -616,11 +646,18 @@ impl WebRenderExternalImageHandlers {
             media_handler: Default::default(),
             webgpu_handler: Default::default(),
             id_manager,
+            shared_memory_images: Default::default(),
+            locked_shared_memory_images: Default::default(),
         }
     }
 
     pub fn id_manager(&self) -> WebRenderExternalImageIdManager {
         self.id_manager.clone()
+    }
+
+    /// The images in shared memory that these handlers serve to WebRender.
+    pub fn shared_memory_images(&self) -> SharedMemoryImages {
+        self.shared_memory_images.clone()
     }
 
     pub fn set_handler(
@@ -632,6 +669,9 @@ impl WebRenderExternalImageHandlers {
             WebRenderImageHandlerType::WebGl => self.webgl_handler = Some(handler),
             WebRenderImageHandlerType::Media => self.media_handler = Some(handler),
             WebRenderImageHandlerType::WebGpu => self.webgpu_handler = Some(handler),
+            WebRenderImageHandlerType::SharedMemory => {
+                error!("Images in shared memory are served by the handlers themselves");
+            },
         }
     }
 }
@@ -647,10 +687,16 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
         _channel_index: u8,
         _is_composited: bool,
     ) -> ExternalImage<'_> {
-        let handler_type = self
-            .id_manager()
-            .get(&key)
-            .expect("Tried to get unknown external image");
+        let invalid = ExternalImage {
+            uv: TexelRect::invalid(),
+            source: ExternalImageSource::Invalid,
+        };
+        // An image in shared memory goes away when its image key is deleted, which WebRender
+        // may learn of only after it has scheduled an upload of the image.
+        let Some(handler_type) = self.id_manager().get(&key) else {
+            warn!("Tried to lock unknown external image {key:?}");
+            return invalid;
+        };
         match handler_type {
             WebRenderImageHandlerType::WebGl => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
@@ -681,21 +727,36 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
                     source,
                 }
             },
+            WebRenderImageHandlerType::SharedMemory => {
+                let Some(data) = self.shared_memory_images.get(&key) else {
+                    warn!("Tried to lock removed image in shared memory {key:?}");
+                    return invalid;
+                };
+                let data = self.locked_shared_memory_images.entry(key).or_insert(data);
+                ExternalImage {
+                    // Only textures have texel coordinates; WebRender copies a buffer into one.
+                    uv: TexelRect::invalid(),
+                    source: ExternalImageSource::RawData(data),
+                }
+            },
         }
     }
 
     /// Unlock the external image. The WR should not read the image
     /// content after this call.
     fn unlock(&mut self, key: ExternalImageId, _channel_index: u8) {
-        let handler_type = self
-            .id_manager()
-            .get(&key)
-            .expect("Tried to get unknown external image");
+        let Some(handler_type) = self.id_manager().get(&key) else {
+            self.locked_shared_memory_images.remove(&key);
+            return;
+        };
         match handler_type {
             WebRenderImageHandlerType::WebGl => self.webgl_handler.as_mut().unwrap().unlock(key.0),
             WebRenderImageHandlerType::Media => self.media_handler.as_mut().unwrap().unlock(key.0),
             WebRenderImageHandlerType::WebGpu => {
                 self.webgpu_handler.as_mut().unwrap().unlock(key.0)
+            },
+            WebRenderImageHandlerType::SharedMemory => {
+                self.locked_shared_memory_images.remove(&key);
             },
         };
     }

@@ -198,6 +198,21 @@ impl Snapshot {
         }
     }
 
+    pub fn from_shared_memory(
+        size: Size2D<u32>,
+        format: SnapshotPixelFormat,
+        alpha_mode: SnapshotAlphaMode,
+        data: Arc<GenericSharedMemory>,
+        byte_range: Range<usize>,
+    ) -> Self {
+        Self {
+            size,
+            data: SnapshotData::SharedMemory(data, byte_range),
+            format,
+            alpha_mode,
+        }
+    }
+
     pub fn from_arc_vec(
         size: Size2D<u32>,
         format: SnapshotPixelFormat,
@@ -290,7 +305,9 @@ impl Snapshot {
 
     pub fn to_shared(&self) -> SharedSnapshot {
         let (data, byte_range) = match &self.data {
-            SnapshotData::SharedMemory(data, byte_range) => (data.clone(), byte_range.clone()),
+            SnapshotData::SharedMemory(data, byte_range) => {
+                (GenericSharedMemory::sendable(data), byte_range.clone())
+            },
             SnapshotData::SharedVec(data, byte_range) => (
                 Arc::new(GenericSharedMemory::from_arc_vec(data.clone())),
                 byte_range.clone(),

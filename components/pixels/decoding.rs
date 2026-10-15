@@ -14,9 +14,10 @@ use image::{
     AnimationDecoder, DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageResult, Limits,
 };
 use log::debug;
+use servo_base::generic_channel::GenericSharedMemory;
 
 use crate::{
-    CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, Repeat,
+    CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, Repeat, raster_image_bytes,
     rgba8_premultiply_inplace,
 };
 
@@ -288,7 +289,7 @@ pub(crate) fn decode_static_image(
         },
         format: PixelFormat::RGBA8,
         frames: vec![frame],
-        bytes: Arc::new(rgba.into_vec()),
+        bytes: raster_image_bytes(rgba.into_vec()),
         id: None,
         cors_status,
         is_opaque,
@@ -371,7 +372,9 @@ where
         frames,
         id: None,
         format: PixelFormat::RGBA8,
-        bytes: Arc::new(bytes),
+        // The painter keeps its own copy of the frames of an animated image, so sharing the
+        // memory would save nothing.
+        bytes: Arc::new(GenericSharedMemory::from_vec_in_process(bytes)),
         is_opaque,
         loop_count: Some(loop_count),
     })

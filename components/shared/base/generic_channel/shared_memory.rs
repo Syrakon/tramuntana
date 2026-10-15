@@ -90,6 +90,41 @@ impl GenericSharedMemory {
         }
     }
 
+    /// Build a `GenericSharedMemory` that stays in this process's heap, even in multiprocess
+    /// mode. It cannot be sent to another process as is: send [`Self::sendable`] instead.
+    ///
+    /// For data that is kept around and only sometimes sent, where shared memory would cost
+    /// more than it saves: a file descriptor and a page-aligned mapping for every value.
+    pub fn from_vec_in_process(bytes: Vec<u8>) -> Self {
+        GenericSharedMemory(GenericSharedMemoryVariant::InProcess(Arc::new(bytes)))
+    }
+
+    /// Whether this value lives in memory that another process can map, so that sending it
+    /// shares the memory instead of copying it.
+    pub fn is_cross_process(&self) -> bool {
+        matches!(self.0, GenericSharedMemoryVariant::Ipc(_))
+    }
+
+    /// A value that can be sent to another process: a clone of this one when it can already be
+    /// sent, which shares the memory, otherwise a copy in shared memory.
+    pub fn to_sendable(&self) -> Self {
+        match &self.0 {
+            GenericSharedMemoryVariant::InProcess(bytes) if use_ipc() => Self::from_bytes(bytes),
+            _ => self.clone(),
+        }
+    }
+
+    /// A value that can be sent to another process: `this` itself when it can already be sent,
+    /// otherwise a copy in shared memory.
+    pub fn sendable(this: &Arc<Self>) -> Arc<Self> {
+        match &this.0 {
+            GenericSharedMemoryVariant::InProcess(bytes) if use_ipc() => {
+                Arc::new(Self::from_bytes(bytes))
+            },
+            _ => Arc::clone(this),
+        }
+    }
+
     /// Build a `GenericSharedMemory` from an `Arc<Vec<u8>>`.
     ///
     /// In single-process mode this allows creating shared memory without copying.

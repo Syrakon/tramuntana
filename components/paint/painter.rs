@@ -26,7 +26,8 @@ use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
     ImageUpdate, PipelineExitSource, SendableFrameTree, SerializableDisplayListPayload,
-    SerializableImageData, WebRenderExternalImageHandlers, WebRenderImageHandlerType, WebViewTrait,
+    SerializableImageData, SharedMemoryImages, WebRenderExternalImageHandlers,
+    WebRenderExternalImageIdManager, WebRenderImageHandlerType, WebViewTrait,
 };
 use profile_traits::time::{ProfilerCategory, ProfilerChan};
 use profile_traits::time_profile;
@@ -51,7 +52,8 @@ use webrender_api::units::{
 };
 use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
-    DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId, FontInstanceFlags,
+    DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalImageData, ExternalImageId,
+    ExternalImageType, ExternalScrollId, FontInstanceFlags,
     FontInstanceKey, FontInstanceOptions, FontInstancePlatformOptions, FontKey, FontVariation,
     ImageData, ImageKey, NativeFontHandle, PipelineId as WebRenderPipelineId, PropertyBinding,
     ReferenceFrameKind, RenderReasons, SampledScrollOffset, SpaceAndClipInfo, SpatialId,
@@ -131,6 +133,16 @@ pub(crate) struct Painter {
     /// for animated images, which only need to update their offset in the data.
     animation_image_cache: FxHashMap<ImageKey, Arc<Vec<u8>>>,
 
+    /// The images whose pixels WebRender reads from the shared memory a content process filled,
+    /// instead of from a copy of its own.
+    shared_memory_images: SharedMemoryImages,
+
+    /// The external image that holds the pixels of each image in [`Self::shared_memory_images`].
+    shared_memory_image_ids: FxHashMap<ImageKey, ExternalImageId>,
+
+    /// Creates the ids of the images in [`Self::shared_memory_images`].
+    external_image_id_manager: WebRenderExternalImageIdManager,
+
     /// A [`WebContentAnimator`] used to manage web content-derived animations. Currently this only
     /// manages blinking caret animations.
     web_content_animator: WebContentAnimator,
@@ -148,6 +160,10 @@ impl Drop for Painter {
         if let Some(renderer) = self.webrender_renderer.take() {
             renderer.deinit();
         }
+
+        for (_, id) in self.shared_memory_image_ids.drain() {
+            self.external_image_id_manager.remove(&id);
+        }
     }
 }
 
@@ -161,8 +177,11 @@ impl Painter {
         }
         debug_assert_eq!(webrender_gl.get_error(), gleam::gl::NO_ERROR,);
 
-        let id_manager = paint.webrender_external_image_id_manager();
-        let mut external_image_handlers = Box::new(WebRenderExternalImageHandlers::new(id_manager));
+        let external_image_id_manager = paint.webrender_external_image_id_manager();
+        let mut external_image_handlers = Box::new(WebRenderExternalImageHandlers::new(
+            external_image_id_manager.clone(),
+        ));
+        let shared_memory_images = external_image_handlers.shared_memory_images();
 
         // Set WebRender external image handler for WebGL textures.
         #[cfg(feature = "webgl")]
@@ -292,6 +311,9 @@ impl Painter {
             last_mouse_move_position: None,
             frame_delayer: Default::default(),
             animation_image_cache: FxHashMap::default(),
+            shared_memory_images,
+            shared_memory_image_ids: FxHashMap::default(),
+            external_image_id_manager,
             web_content_animator: WebContentAnimator::new(
                 paint.event_loop_waker.clone_box(),
                 (*timer_refresh_driver).clone(),
@@ -1140,6 +1162,23 @@ impl Painter {
         is_animated_image: bool,
     ) -> ImageData {
         match data {
+            // The painter keeps its own copy of the frames of an animated image.
+            SerializableImageData::Raw(shared_memory)
+                if !is_animated_image && shared_memory.is_cross_process() =>
+            {
+                let id = self
+                    .external_image_id_manager
+                    .next_id(WebRenderImageHandlerType::SharedMemory);
+                self.shared_memory_images.insert(id, Arc::new(shared_memory));
+                self.release_shared_memory_image(key);
+                self.shared_memory_image_ids.insert(key, id);
+                ImageData::External(ExternalImageData {
+                    id,
+                    channel_index: 0,
+                    image_type: ExternalImageType::Buffer,
+                    normalized_uvs: false,
+                })
+            },
             SerializableImageData::Raw(shared_memory) => {
                 let data = shared_memory.into_arc_vec();
                 if is_animated_image {
@@ -1148,6 +1187,14 @@ impl Painter {
                 ImageData::Raw(data)
             },
             SerializableImageData::External(image) => ImageData::External(image),
+        }
+    }
+
+    /// Stop serving the pixels of `key` from shared memory, if they were.
+    fn release_shared_memory_image(&mut self, key: ImageKey) {
+        if let Some(id) = self.shared_memory_image_ids.remove(&key) {
+            self.shared_memory_images.remove(&id);
+            self.external_image_id_manager.remove(&id);
         }
     }
 
@@ -1171,11 +1218,14 @@ impl Painter {
                     txn.delete_image(key);
                     self.frame_delayer.delete_image(key);
                     self.animation_image_cache.remove(&key);
+                    self.release_shared_memory_image(key);
                 },
                 ImageUpdate::UpdateImage(key, desc, data, epoch) => {
                     if let Some(epoch) = epoch {
                         self.frame_delayer.update_image(key, epoch);
                     }
+                    // The new pixels are a copy of their own, which replaces the shared ones.
+                    self.release_shared_memory_image(key);
                     txn.update_image(key, desc, data.into(), &DirtyRect::All)
                 },
                 ImageUpdate::UpdateImageForAnimation(image_key, desc) => {

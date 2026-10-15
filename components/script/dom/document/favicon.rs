@@ -196,9 +196,7 @@ pub(crate) fn embedder_image_from_raster(raster_image: &RasterImage) -> Image {
     Image::new(
         frame.width,
         frame.height,
-        std::sync::Arc::new(GenericSharedMemory::from_arc_vec(
-            raster_image.bytes.clone(),
-        )),
+        GenericSharedMemory::sendable(&raster_image.bytes),
         raster_image.frames[0].byte_range.clone(),
         format,
     )

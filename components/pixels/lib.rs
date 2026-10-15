@@ -296,14 +296,31 @@ pub struct SharedRasterImage {
     pub is_opaque: bool,
 }
 
+/// Images at least this large keep their pixels in shared memory in multiprocess mode. Smaller
+/// ones are not worth a file descriptor and a page-aligned mapping each; they are copied when
+/// sent.
+const MIN_BYTES_FOR_SHARED_MEMORY: usize = 64 * 1024;
+
+/// Wrap the pixels of a decoded image: in shared memory when they are large enough to be worth
+/// sharing with the process that paints them.
+pub fn raster_image_bytes(bytes: Vec<u8>) -> Arc<GenericSharedMemory> {
+    Arc::new(if bytes.len() >= MIN_BYTES_FOR_SHARED_MEMORY {
+        GenericSharedMemory::from_vec(bytes)
+    } else {
+        GenericSharedMemory::from_vec_in_process(bytes)
+    })
+}
+
 #[derive(Clone, MallocSizeOf)]
 pub struct RasterImage {
     pub metadata: ImageMetadata,
     pub format: PixelFormat,
     pub id: Option<ImageKey>,
     pub cors_status: CorsStatus,
+    /// The pixels of every frame. In multiprocess mode, a large image lives in shared memory,
+    /// which the process that paints it maps instead of copying.
     #[conditional_malloc_size_of]
-    pub bytes: Arc<Vec<u8>>,
+    pub bytes: Arc<GenericSharedMemory>,
     pub frames: Vec<ImageFrame>,
     /// Whether or not all of the frames of this image are opaque.
     pub is_opaque: bool,
@@ -393,7 +410,7 @@ impl RasterImage {
             premultiplied: true,
         };
 
-        Snapshot::from_arc_vec(
+        Snapshot::from_shared_memory(
             size.cast(),
             format,
             alpha_mode,
@@ -422,12 +439,12 @@ impl RasterImage {
         let (format, data, should_animate) = match self.format {
             PixelFormat::BGRA8 => (
                 WebRenderImageFormat::BGRA8,
-                GenericSharedMemory::from_arc_vec(self.bytes.clone()),
+                self.bytes.to_sendable(),
                 self.should_animate(),
             ),
             PixelFormat::RGBA8 => (
                 WebRenderImageFormat::RGBA8,
-                GenericSharedMemory::from_arc_vec(self.bytes.clone()),
+                self.bytes.to_sendable(),
                 self.should_animate(),
             ),
             PixelFormat::RGB8 => {
@@ -501,7 +518,7 @@ impl RasterImage {
             format: self.format,
             id: self.id,
             cors_status: self.cors_status,
-            bytes: Arc::new(GenericSharedMemory::from_arc_vec(self.bytes.clone())),
+            bytes: GenericSharedMemory::sendable(&self.bytes),
             frames: self.frames.clone(),
             is_opaque: self.is_opaque,
         })

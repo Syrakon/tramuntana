@@ -24,7 +24,10 @@ use net_traits::request::CorsSettings;
 use net_traits::{FetchResponseMsg, Metadata, NetworkError};
 use paint_api::{CrossProcessPaintApi, ImageUpdate, SerializableImageData};
 use parking_lot::Mutex;
-use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, load_from_memory};
+use pixels::{
+    CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, load_from_memory,
+    raster_image_bytes,
+};
 use profile_traits::mem::{Report, ReportKind};
 use profile_traits::path;
 use resvg::tiny_skia;
@@ -1174,7 +1177,7 @@ impl ImageCache for ImageCacheImpl {
                     },
                     format: PixelFormat::RGBA8,
                     frames: vec![frame],
-                    bytes: Arc::new(bytes),
+                    bytes: raster_image_bytes(bytes),
                     id: None,
                     cors_status: vector_image.cors_status,
                     is_opaque: false,
