@@ -1061,9 +1061,10 @@ impl SourceBuffer {
                 SourceBufferTrackKind::Video => VIDEO_QUOTA,
                 SourceBufferTrackKind::Audio => AUDIO_QUOTA,
             };
-            if track.bytes > quota {
-                track.evict(position);
-            }
+            // Frames playback has left behind are dropped on every append, not only
+            // once the quota is reached: a tab playing a long video would otherwise
+            // keep everything it has played, up to the quota, for as long as it plays.
+            track.evict(position);
             if track.bytes > quota {
                 return Err(PlayerError::QuotaExceeded);
             }
