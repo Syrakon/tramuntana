@@ -70,6 +70,30 @@ pub struct GStreamerBackend {
 #[allow(dead_code)]
 pub struct ErrorLoadingPlugins<'a>(Vec<&'a str>);
 
+/// Puts the software AV1 decoder ahead of every other AV1 decoder, hardware ones included.
+///
+/// Measured on an NVIDIA card playing a YouTube video in a content process: NVDEC opens a
+/// CUDA context in every process that decodes, which made the process about 110 MB bigger
+/// than dav1d with the settings in player.rs, and it took more CPU, not less.
+/// The change only lives in this process's copy of the registry.
+fn prefer_dav1d() {
+    let Some(dav1d) = gstreamer::ElementFactory::find("dav1ddec") else {
+        return;
+    };
+    let av1 = gstreamer::Caps::new_empty_simple("video/x-av1");
+    let best_other = gstreamer::ElementFactory::factories_with_type(
+        gstreamer::ElementFactoryType::DECODER | gstreamer::ElementFactoryType::MEDIA_VIDEO,
+        gstreamer::Rank::NONE,
+    )
+    .iter()
+    .filter(|factory| factory.name() != "dav1ddec" && factory.can_sink_any_caps(&av1))
+    .map(|factory| factory.rank())
+    .max();
+    if let Some(rank) = best_other.filter(|rank| *rank >= dav1d.rank()) {
+        dav1d.set_rank(rank + 1);
+    }
+}
+
 impl GStreamerBackend {
     pub fn init_with_plugins<'a, T: AsRef<str>>(
         plugin_dir: PathBuf,
@@ -105,6 +129,8 @@ impl GStreamerBackend {
                 registry.remove_plugin(&plugin);
             }
         }
+
+        prefer_dav1d();
 
         // This is a workaround for a race condition in GStreamer. Real fix is
         // in
