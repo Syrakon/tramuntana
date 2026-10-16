@@ -160,7 +160,7 @@ impl HTMLVideoElement {
                         size.cast(),
                         SnapshotPixelFormat::BGRA,
                         alpha_mode,
-                        frame.get_data().to_vec(),
+                        frame.get_bytes().to_vec(),
                     ))
                 } else {
                     // XXX(victor): here we only have the GL texture ID.

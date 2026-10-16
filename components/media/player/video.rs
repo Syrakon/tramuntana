@@ -9,12 +9,19 @@ use malloc_size_of_derive::MallocSizeOf;
 #[derive(Clone, MallocSizeOf)]
 pub enum VideoFrameData {
     Raw(#[conditional_malloc_size_of] Arc<Vec<u8>>),
+    /// Raw pixels that stay in the decoder's buffer: read them with `VideoFrame::get_bytes`.
+    Mapped,
     Texture(u32),
     OESTexture(u32),
 }
 
 pub trait Buffer: Send + Sync {
     fn to_vec(&self) -> Option<VideoFrameData>;
+
+    /// The pixels of a `VideoFrameData::Mapped` frame, read in place.
+    fn bytes(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 #[derive(Clone, MallocSizeOf)]
@@ -48,6 +55,16 @@ impl VideoFrame {
     pub fn get_data(&self) -> Arc<Vec<u8>> {
         match self.data {
             VideoFrameData::Raw(ref data) => data.clone(),
+            VideoFrameData::Mapped => Arc::new(self.get_bytes().to_vec()),
+            _ => unreachable!("invalid raw data request for texture frame"),
+        }
+    }
+
+    /// The pixels of a raw frame, without copying them.
+    pub fn get_bytes(&self) -> &[u8] {
+        match self.data {
+            VideoFrameData::Raw(ref data) => data,
+            VideoFrameData::Mapped => self._buffer.bytes().unwrap_or_default(),
             _ => unreachable!("invalid raw data request for texture frame"),
         }
     }
