@@ -472,7 +472,12 @@ impl Actor for ConsoleActor {
                 // for an async event with the resultID
                 let mut stream = request.reply(&early_reply)?;
 
-                let reply = self.evaluate_js(registry, msg).unwrap();
+                // The script side drops the reply channel when it cannot send the result
+                // back (for instance, an exception value that fails to serialize). Report
+                // that to the client instead of taking the whole connection down.
+                let reply = self
+                    .evaluate_js(registry, msg)
+                    .map_err(|()| ActorError::Internal)?;
                 let msg = EvaluateJSEvent {
                     from: self.name().into(),
                     type_: "evaluationResult".to_owned(),
