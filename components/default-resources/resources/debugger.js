@@ -81,7 +81,8 @@ addEventListener("addDebuggee", event => {
     const {global, pipelineId, workerId} = event;
     const debuggerObject = dbg.addDebuggee(global);
     debuggeesToPipelineIds.set(debuggerObject, pipelineId);
-    if (workerId !== undefined) {
+    // `workerId` is a nullable attribute: null, not undefined, for a window.
+    if (workerId !== null) {
         debuggeesToWorkerIds.set(debuggerObject, workerId);
     }
 });
@@ -401,7 +402,7 @@ addEventListener("eval", event => {
     if (frameActorId) {
         frame = frameActorsToFrames.get(frameActorId);
     }
-    let global = workerId !== undefined ?
+    let global = workerId !== null ?
         findKeyByValue(debuggeesToWorkerIds, workerId) :
         findDebuggeeByPipelineId(pipelineId);
 
