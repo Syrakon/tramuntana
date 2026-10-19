@@ -554,6 +554,7 @@ impl DevtoolsInstance {
             Root::DedicatedWorker(worker_actor.name().into())
         } else {
             self.pipelines.insert(pipeline_id, browsing_context_id);
+            let has_client = self.has_client();
             let browsing_context_name = self
                 .browsing_contexts
                 .entry(browsing_context_id)
@@ -575,6 +576,12 @@ impl DevtoolsInstance {
                 .registry
                 .find::<BrowsingContextActor>(browsing_context_name);
             browsing_context_actor.handle_new_global(pipeline_id, script_sender);
+            // Pages made while a client is connected get its updates, and the debugger, as
+            // the ones it found when it connected did. The new pipeline is not the active one
+            // until its navigation arrives, so it is named here rather than taken from the actor.
+            if has_client {
+                browsing_context_actor.instruct_pipeline_to_send_live_updates(pipeline_id, true);
+            }
             Root::BrowsingContext(browsing_context_name.clone())
         };
 
@@ -740,6 +747,21 @@ impl DevtoolsInstance {
         pipeline_id: PipelineId,
         source_info: SourceInfo,
     ) {
+        // Script threads report the sources a page already has every time a client connects,
+        // see `DevtoolScriptControlMsg::WantsLiveNotifications`, and the actors made for an
+        // earlier client are still here.
+        let already_known = self
+            .registry
+            .source_actor_names_for_pipeline(pipeline_id)
+            .iter()
+            .any(|name| {
+                self.registry.find::<SourceActor>(name).spidermonkey_id ==
+                    source_info.spidermonkey_id
+            });
+        if already_known {
+            return;
+        }
+
         // The text of a source lives as long as the server does, and every inline
         // script holds its own copy of the whole document. Without a client the
         // actor is still made, so that the source is listed, but it holds no text.

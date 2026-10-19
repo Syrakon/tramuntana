@@ -324,12 +324,23 @@ impl BrowsingContextActor {
     }
 
     pub(crate) fn instruct_script_to_send_live_updates(&self, should_send_updates: bool) {
-        let result = self
-            .script_chan()
-            .send(DevtoolScriptControlMsg::WantsLiveNotifications(
-                self.pipeline_id(),
-                should_send_updates,
-            ));
+        self.instruct_pipeline_to_send_live_updates(self.pipeline_id(), should_send_updates);
+    }
+
+    /// Like `instruct_script_to_send_live_updates`, for a pipeline that may not be the active
+    /// one yet: a new global is announced before the navigation that makes it active.
+    pub(crate) fn instruct_pipeline_to_send_live_updates(
+        &self,
+        pipeline_id: PipelineId,
+        should_send_updates: bool,
+    ) {
+        let Some(script_chan) = self.script_chans.borrow().get(&pipeline_id).cloned() else {
+            return;
+        };
+        let result = script_chan.send(DevtoolScriptControlMsg::WantsLiveNotifications(
+            pipeline_id,
+            should_send_updates,
+        ));
 
         // Notifying the script thread may fail with a "Disconnected" error if servo
         // as a whole is being shut down.

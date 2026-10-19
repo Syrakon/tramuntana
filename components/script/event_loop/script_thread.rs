@@ -2201,7 +2201,17 @@ impl ScriptThread {
             DevtoolScriptControlMsg::WantsLiveNotifications(id, to_send) => {
                 match documents.find_window(id) {
                     Some(window) => {
+                        let was_sending = window.live_devtools_updates();
                         window.set_devtools_wants_updates(to_send);
+                        // A client connecting or leaving is also what attaches the debugger to
+                        // the window, or detaches it.
+                        if to_send && !was_sending {
+                            self.debugger_global
+                                .fire_add_debuggee(cx, window.upcast(), id, None);
+                        } else if !to_send && was_sending {
+                            self.debugger_global
+                                .fire_remove_debuggee(cx, window.upcast());
+                        }
                     },
                     None => warn!("Message sent to closed pipeline {}.", id),
                 }
@@ -3585,14 +3595,9 @@ impl ScriptThread {
                 )
             },
         };
-        if self.senders.devtools_server_sender.is_some() {
-            self.debugger_global.fire_add_debuggee(
-                cx,
-                window.upcast(),
-                incomplete.pipeline_id,
-                None,
-            );
-        }
+        // The window becomes a debuggee only while a devtools client is connected, see
+        // `DevtoolScriptControlMsg::WantsLiveNotifications`: a debugger watching a page costs
+        // it memory whether anyone looks or not.
 
         let mut realm = enter_auto_realm(cx, &*window);
         let cx = &mut realm;

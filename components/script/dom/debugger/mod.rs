@@ -12,6 +12,7 @@ pub(crate) mod debuggergetpossiblebreakpointsevent;
 pub(crate) mod debuggergetsourcetextevent;
 pub(crate) mod debuggerglobalscope;
 pub(crate) mod debuggerinterruptevent;
+pub(crate) mod debuggerremovedebuggeeevent;
 pub(crate) mod debuggerresumeevent;
 pub(crate) mod debuggersetbreakpointevent;
 pub(crate) mod debuggerunblackboxevent;

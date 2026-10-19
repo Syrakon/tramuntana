@@ -50,7 +50,7 @@ use crate::dom::debugger::debuggerunblackboxevent::DebuggerUnblackboxEvent;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::types::{
     DebuggerAddDebuggeeEvent, DebuggerEvalEvent, DebuggerGetPossibleBreakpointsEvent,
-    DebuggerGetSourceTextEvent, Event,
+    DebuggerGetSourceTextEvent, DebuggerRemoveDebuggeeEvent, Event,
 };
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
@@ -188,6 +188,19 @@ impl DebuggerGlobalScope {
             event.fire(cx, self.upcast()),
             "Guaranteed by DebuggerAddDebuggeeEvent::new"
         );
+    }
+
+    pub(crate) fn fire_remove_debuggee(&self, cx: &mut JSContext, debuggee_global: &GlobalScope) {
+        let mut realm = enter_auto_realm(cx, self);
+        let cx = &mut realm;
+        let event = DomRoot::upcast::<Event>(DebuggerRemoveDebuggeeEvent::new(
+            cx,
+            self.upcast(),
+            debuggee_global,
+        ));
+        if !event.fire(cx, self.upcast()) {
+            warn!("removeDebuggee event was cancelled");
+        }
     }
 
     #[expect(clippy::too_many_arguments)]

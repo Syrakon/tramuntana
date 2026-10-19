@@ -85,6 +85,34 @@ addEventListener("addDebuggee", event => {
     if (workerId !== null) {
         debuggeesToWorkerIds.set(debuggerObject, workerId);
     }
+
+    // A window is only attached once a client connects, so it may have run scripts already.
+    // Report each of their sources once, through the script that starts earliest in it: its
+    // top-level script while that is still alive, else its outermost function still alive.
+    const earliestScripts = new Map;
+    for (const script of dbg.findScripts({global: debuggerObject})) {
+        const earliest = earliestScripts.get(script.source.id);
+        if (earliest === undefined || script.sourceStart < earliest.sourceStart) {
+            earliestScripts.set(script.source.id, script);
+        }
+    }
+    for (const script of earliestScripts.values()) {
+        dbg.onNewScript(script);
+    }
+});
+
+// Stop watching a global once no client is connected, forgetting its scripts so they can be
+// collected.
+addEventListener("removeDebuggee", event => {
+    const debuggerObject = dbg.makeGlobalObjectReference(event.global);
+    for (const [sourceId, script] of sourceIdsToScripts) {
+        if (script.global === debuggerObject) {
+            sourceIdsToScripts.delete(sourceId);
+        }
+    }
+    debuggeesToPipelineIds.delete(debuggerObject);
+    debuggeesToWorkerIds.delete(debuggerObject);
+    dbg.removeDebuggee(debuggerObject);
 });
 
 
