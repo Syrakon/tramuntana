@@ -49,7 +49,8 @@ use crate::dom::debugger::debuggersetbreakpointevent::DebuggerSetBreakpointEvent
 use crate::dom::debugger::debuggerunblackboxevent::DebuggerUnblackboxEvent;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::types::{
-    DebuggerAddDebuggeeEvent, DebuggerEvalEvent, DebuggerGetPossibleBreakpointsEvent, Event,
+    DebuggerAddDebuggeeEvent, DebuggerEvalEvent, DebuggerGetPossibleBreakpointsEvent,
+    DebuggerGetSourceTextEvent, Event,
 };
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
@@ -68,6 +69,8 @@ pub(crate) struct DebuggerGlobalScope {
     #[no_trace]
     get_possible_breakpoints_result_sender:
         RefCell<Option<GenericSender<Vec<devtools_traits::RecommendedBreakpointLocation>>>>,
+    #[no_trace]
+    get_source_text_result_sender: RefCell<Option<GenericSender<Option<String>>>>,
     #[no_trace]
     eval_result_sender: RefCell<Option<GenericSender<EvaluateJSReply>>>,
     #[no_trace]
@@ -121,6 +124,7 @@ impl DebuggerGlobalScope {
             ),
             devtools_to_script_sender,
             get_possible_breakpoints_result_sender: RefCell::new(None),
+            get_source_text_result_sender: RefCell::new(None),
             get_list_frame_result_sender: RefCell::new(None),
             get_environment_result_sender: RefCell::new(None),
             eval_result_sender: RefCell::new(None),
@@ -243,6 +247,29 @@ impl DebuggerGlobalScope {
             event.fire(cx, self.upcast()),
             "Guaranteed by DebuggerGetPossibleBreakpointsEvent::new"
         );
+    }
+
+    /// Asks debugger.js for the text of a source. The devtools server only asks when a client
+    /// wants to show it, instead of every source sending its text when it is created.
+    pub(crate) fn fire_get_source_text(
+        &self,
+        cx: &mut JSContext,
+        spidermonkey_id: u32,
+        result_sender: GenericSender<Option<String>>,
+    ) {
+        // A request still waiting for its answer has lost its client; dropping its sender
+        // tells the server so.
+        *self.get_source_text_result_sender.borrow_mut() = Some(result_sender);
+        let mut realm = enter_auto_realm(cx, self);
+        let cx = &mut realm.current_realm();
+        let event = DomRoot::upcast::<Event>(DebuggerGetSourceTextEvent::new(
+            cx,
+            self.upcast(),
+            spidermonkey_id,
+        ));
+        if !event.fire(cx, self.upcast()) {
+            warn!("getSourceText event was cancelled");
+        }
     }
 
     pub(crate) fn fire_set_breakpoint(
@@ -482,7 +509,9 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
                 introduction_type: introduction_type.str().to_owned(),
                 inline,
                 worker_id,
-                content: (!inline).then(|| args.text.to_string()),
+                // Fetched from debugger.js when a client asks for it, see
+                // `fire_get_source_text`.
+                content: None,
                 content_type: None, // TODO
                 spidermonkey_id: args.spidermonkeyId,
             };
@@ -495,6 +524,16 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
             }
         } else {
             debug!("Not creating debuggee for script with no `introductionType`");
+        }
+    }
+
+    fn GetSourceTextResult(&self, _event: &DebuggerGetSourceTextEvent, text: Option<DOMString>) {
+        let Some(sender) = self.get_source_text_result_sender.take() else {
+            warn!("getSourceTextResult() called with no request waiting");
+            return;
+        };
+        if let Err(error) = sender.send(text.map(|text| text.to_string())) {
+            warn!("Failed to send source text to devtools server: {error:?}");
         }
     }
 

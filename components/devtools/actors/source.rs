@@ -98,6 +98,9 @@ pub(crate) struct SourceActor {
 
     pub content: AtomicRefCell<Option<String>>,
     content_type: Option<String>,
+    /// Whether the source is part of the page markup, whose text the script thread does not
+    /// have on its own.
+    inline: bool,
 
     pub spidermonkey_id: u32,
     /// `introductionType` in SpiderMonkey `CompileOptionsWrapper`.
@@ -151,6 +154,7 @@ impl SourceActor {
         url: ServoUrl,
         content: Option<String>,
         content_type: Option<String>,
+        inline: bool,
         spidermonkey_id: u32,
         introduction_type: String,
         script_sender: GenericSender<DevtoolScriptControlMsg>,
@@ -161,6 +165,7 @@ impl SourceActor {
             url,
             content: AtomicRefCell::new(content),
             content_type,
+            inline,
             is_black_boxed: false,
             spidermonkey_id,
             introduction_type,
@@ -196,6 +201,21 @@ impl Actor for SourceActor {
         match msg_type {
             // Client has requested contents of the source.
             "source" => {
+                // Script threads keep the text of their sources and only send it when a client
+                // asks, so pages do not pay for a copy of every script in the devtools server.
+                // Inline sources get the page markup instead, through `UpdateSourceContent`: the
+                // script alone would put every line of it in the wrong place.
+                if !self.inline && self.content.borrow().is_none() {
+                    let (tx, rx) = channel().ok_or(ActorError::Internal)?;
+                    self.script_sender
+                        .send(DevtoolScriptControlMsg::GetSourceText(
+                            self.spidermonkey_id,
+                            tx,
+                        ))
+                        .map_err(|_| ActorError::Internal)?;
+                    let text = rx.recv().map_err(|_| ActorError::Internal)?;
+                    *self.content.borrow_mut() = text;
+                }
                 let reply = SourceContentReply {
                     from: self.name().into(),
                     content_type: self.content_type.clone(),

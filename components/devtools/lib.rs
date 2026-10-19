@@ -754,6 +754,7 @@ impl DevtoolsInstance {
             source_info.url,
             source_content,
             source_info.content_type,
+            source_info.inline,
             source_info.spidermonkey_id,
             source_info.introduction_type,
             script_sender,

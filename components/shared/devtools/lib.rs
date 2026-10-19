@@ -481,6 +481,8 @@ pub enum DevtoolScriptControlMsg {
         GenericSender<EvaluateJSReply>,
     ),
     GetPossibleBreakpoints(u32, GenericSender<Vec<RecommendedBreakpointLocation>>),
+    /// The text of the source with this SpiderMonkey id, if the script thread still has it.
+    GetSourceText(u32, GenericSender<Option<String>>),
     SetBreakpoint(u32, u32, u32),
     ClearBreakpoint(u32, u32, u32),
     Interrupt,

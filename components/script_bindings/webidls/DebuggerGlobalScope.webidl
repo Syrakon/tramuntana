@@ -16,7 +16,6 @@ dictionary NotifyNewSource {
     required unsigned long spidermonkeyId;
     required DOMString url;
     required DOMString? urlOverride;
-    required DOMString text;
     required DOMString? introductionType;
 };
 

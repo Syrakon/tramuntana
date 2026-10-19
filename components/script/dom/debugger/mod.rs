@@ -9,6 +9,7 @@ pub(crate) mod debuggerevalevent;
 pub(crate) mod debuggerframeevent;
 pub(crate) mod debuggergetenvironmentevent;
 pub(crate) mod debuggergetpossiblebreakpointsevent;
+pub(crate) mod debuggergetsourcetextevent;
 pub(crate) mod debuggerglobalscope;
 pub(crate) mod debuggerinterruptevent;
 pub(crate) mod debuggerresumeevent;

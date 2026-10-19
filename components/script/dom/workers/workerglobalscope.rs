@@ -1204,6 +1204,13 @@ impl WorkerGlobalScope {
                     reply,
                 );
             },
+            DevtoolScriptControlMsg::GetSourceText(spidermonkey_id, result_sender) => {
+                let debugger_global_handle = rooted_heap_handle(self, |this| &this.debugger_global);
+                let debugger_global =
+                    root_from_handlevalue::<DebuggerGlobalScope>(cx, debugger_global_handle)
+                        .expect("must be a debugger global scope");
+                debugger_global.fire_get_source_text(cx, spidermonkey_id, result_sender);
+            },
             _ => debug!("got an unusable devtools control message inside the worker!"),
         }
     }

@@ -781,6 +781,10 @@ impl SharedWorkerGlobalScope {
                         reply,
                     );
                 },
+                DevtoolScriptControlMsg::GetSourceText(spidermonkey_id, result_sender) => {
+                    self.debugger_global
+                        .fire_get_source_text(cx, spidermonkey_id, result_sender);
+                },
                 _ => debug!("got an unusable devtools control message inside the worker!"),
             },
             MixedMessage::SharedWorker(msg) => {

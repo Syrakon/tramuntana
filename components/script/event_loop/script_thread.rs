@@ -2263,6 +2263,10 @@ impl ScriptThread {
                     result_sender,
                 );
             },
+            DevtoolScriptControlMsg::GetSourceText(spidermonkey_id, result_sender) => {
+                self.debugger_global
+                    .fire_get_source_text(cx, spidermonkey_id, result_sender);
+            },
             DevtoolScriptControlMsg::SetBreakpoint(spidermonkey_id, script_id, offset) => {
                 self.debugger_global
                     .fire_set_breakpoint(cx, spidermonkey_id, script_id, offset);

@@ -72,7 +72,6 @@ dbg.onNewScript = function(script) {
         spidermonkeyId: script.source.id,
         url: script.source.url,
         urlOverride: script.source.displayURL,
-        text: script.source.text,
         introductionType: script.source.introductionType ?? null,
     });
 };
@@ -539,6 +538,11 @@ function createSideEffectFreeDebugger(debuggee) {
 
     return eagerDbg;
 }
+
+addEventListener("getSourceText", event => {
+    const script = sourceIdsToScripts.get(event.spidermonkeyId);
+    getSourceTextResult(event, script?.source.text ?? null);
+});
 
 addEventListener("getPossibleBreakpoints", event => {
     const {spidermonkeyId} = event;
