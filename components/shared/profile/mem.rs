@@ -17,7 +17,7 @@ use log::warn;
 use malloc_size_of::MallocSizeOfOps;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
-use servo_base::generic_channel::{GenericCallback, GenericSender};
+use servo_base::generic_channel::{GenericCallback, GenericSender, SendResult};
 
 /// A trait to abstract away the various kinds of message senders we use.
 pub trait OpaqueSender<T> {
@@ -241,9 +241,10 @@ pub struct ReporterRequest {
 pub struct Reporter(pub GenericCallback<ReporterRequest>);
 
 impl Reporter {
-    /// Collect one or more memory reports. Returns true on success, and false on failure.
-    pub fn collect_reports(&self, reports_channel: ReportsChan) {
-        self.0.send(ReporterRequest { reports_channel }).unwrap()
+    /// Ask for one or more memory reports. Fails when the reporter is gone, for
+    /// instance with the content process that registered it.
+    pub fn collect_reports(&self, reports_channel: ReportsChan) -> SendResult {
+        self.0.send(ReporterRequest { reports_channel })
     }
 }
 

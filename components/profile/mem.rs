@@ -134,19 +134,27 @@ impl Profiler {
     }
 
     /// Returns a map of pid -> reports
-    fn collect_reports(&self) -> HashMap<u32, Vec<Report>> {
+    fn collect_reports(&mut self) -> HashMap<u32, Vec<Report>> {
         let mut result = HashMap::new();
 
-        for reporter in self.reporters.values() {
-            let (chan, port) = generic_channel::channel().unwrap();
-            reporter.collect_reports(ReportsChan(chan));
+        // A process that ends never unregisters its reporters: forget them
+        // rather than letting the first report after that take this thread down.
+        self.reporters.retain(|name, reporter| {
+            let Some((chan, port)) = generic_channel::channel() else {
+                return true;
+            };
+            if let Err(error) = reporter.collect_reports(ReportsChan(chan)) {
+                debug!("Dropping memory reporter {name}, which is gone: {error:?}");
+                return false;
+            }
             if let Ok(mut reports) = port.recv() {
                 result
                     .entry(reports.pid)
                     .or_insert(vec![])
                     .append(&mut reports.reports);
             }
-        }
+            true
+        });
         result
     }
 }
