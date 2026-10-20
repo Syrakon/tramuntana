@@ -238,7 +238,9 @@ pub enum DebuggerValue {
         class: String,
         own_property_length: Option<u32>,
         preview: Option<Box<ObjectPreview>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        // `default` lets debugger.js leave the field out. Skipping it on the way
+        // out would break IPC, whose format reads fields by position.
+        #[serde(default)]
         prototype: Option<Box<DebuggerValue>>,
     },
 }
@@ -333,8 +335,9 @@ pub struct NodeStyle {
     pub priority: String,
 }
 
+/// Sent over IPC, so it cannot be internally tagged: the devtools crate gives
+/// the client its JSON shape.
 #[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf, PartialEq, Eq, Hash)]
-#[serde(tag = "type", rename_all = "camelCase")]
 pub enum AncestorData {
     Layer {
         actor_id: Option<String>,
@@ -750,4 +753,41 @@ pub struct FrameOffset {
     pub actor: String,
     pub column: u32,
     pub line: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AncestorData, DebuggerValue};
+
+    /// IPC encodes with postcard, which has no field names: every field must be
+    /// written, or the reader runs past the end of the value.
+    #[test]
+    fn object_value_without_prototype_survives_ipc_encoding() -> Result<(), postcard::Error> {
+        let value = DebuggerValue::ObjectValue {
+            actor: None,
+            class: "Object".into(),
+            own_property_length: Some(1),
+            preview: None,
+            prototype: None,
+        };
+        let bytes = postcard::to_stdvec(&value)?;
+        let decoded: DebuggerValue = postcard::from_bytes(&bytes)?;
+        assert!(matches!(
+            decoded,
+            DebuggerValue::ObjectValue { prototype: None, ref class, .. } if class == "Object"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn ancestor_data_survives_ipc_encoding() -> Result<(), postcard::Error> {
+        let value = vec![AncestorData::Layer {
+            actor_id: None,
+            value: Some("base".into()),
+        }];
+        let bytes = postcard::to_stdvec(&value)?;
+        let decoded: Vec<AncestorData> = postcard::from_bytes(&bytes)?;
+        assert_eq!(decoded, value);
+        Ok(())
+    }
 }

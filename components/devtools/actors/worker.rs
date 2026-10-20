@@ -136,9 +136,13 @@ impl Actor for WorkerTargetActor {
     fn cleanup(&self, stream_id: StreamId) {
         self.streams.borrow_mut().remove(&stream_id);
         if self.streams.borrow().is_empty() {
-            self.script_sender
+            // The worker may have ended first; then there is nothing left to stop.
+            if let Err(error) = self
+                .script_sender
                 .send(WantsLiveNotifications(TEST_PIPELINE_ID, false))
-                .unwrap();
+            {
+                log::debug!("Worker gone before its devtools client left: {error:?}");
+            }
         }
     }
 }

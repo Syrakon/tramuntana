@@ -26,11 +26,29 @@ use crate::protocol::ClientRequest;
 
 const ELEMENT_STYLE_TYPE: u32 = 100;
 
+/// [`AncestorData`] as the client reads it, tagged with its `type`.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum AncestorDataJson {
+    Layer {
+        actor_id: Option<String>,
+        value: Option<String>,
+    },
+}
+
+impl From<AncestorData> for AncestorDataJson {
+    fn from(data: AncestorData) -> Self {
+        match data {
+            AncestorData::Layer { actor_id, value } => Self::Layer { actor_id, value },
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AppliedRule {
     actor: String,
-    ancestor_data: Vec<AncestorData>,
+    ancestor_data: Vec<AncestorDataJson>,
     authored_text: String,
     css_text: String,
     pub declarations: Vec<AppliedDeclaration>,
@@ -197,7 +215,7 @@ impl StyleRuleActor {
             ancestor_data: self
                 .selector
                 .as_ref()
-                .map(|r| r.ancestor_data.clone())
+                .map(|r| r.ancestor_data.iter().cloned().map(Into::into).collect())
                 .unwrap_or_default(),
             authored_text: String::new(),
             css_text: String::new(), // TODO: Specify the css text

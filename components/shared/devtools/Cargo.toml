@@ -28,3 +28,6 @@ uuid = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+postcard = { workspace = true }

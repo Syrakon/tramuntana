@@ -8522,6 +8522,7 @@ dependencies = [
  "bytes",
  "http",
  "malloc_size_of_derive",
+ "postcard",
  "serde",
  "servo-base",
  "servo-embedder-traits",
