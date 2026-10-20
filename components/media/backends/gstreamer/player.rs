@@ -50,6 +50,8 @@ const MAX_BUFFER_SIZE: i32 = 500 * 1024 * 1024;
 const DAV1D_THREADS: u32 = 2;
 /// Frames the software AV1 decoder keeps in flight.
 const DAV1D_FRAME_DELAY: i64 = 1;
+/// Worker threads of the libav video decoders (`avdec_h264` and its siblings).
+const AVDEC_THREADS: i32 = 2;
 
 fn metadata_from_media_info(media_info: &gstreamer_play::PlayMediaInfo) -> Result<Metadata, ()> {
     let dur = media_info.duration();
@@ -943,14 +945,16 @@ impl GStreamerPlayer {
         // threads and one frame in flight make the process about 60 MB smaller than the
         // defaults and take less CPU, and playback keeps up. Both properties only take
         // effect before the decoder leaves the READY state, which holds when it is added.
+        //
+        // The libav decoders, which lib.rs puts ahead of NVDEC, do the same with frame
+        // threading: one thread per logical core plus one, each holding the frames it decodes.
+        // On a Twitch 1080p H.264 stream with sixteen cores that was twelve more threads in
+        // the content process than with NVDEC.
         if let Some(bin) = pipeline.downcast_ref::<gstreamer::Bin>() {
             bin.connect_deep_element_added(|_, _, element| {
-                if !element
-                    .factory()
-                    .is_some_and(|factory| factory.name() == "dav1ddec")
-                {
+                let Some(factory) = element.factory() else {
                     return;
-                }
+                };
                 // set_property panics on a missing property or a value of another type, so
                 // each one is checked against the decoder that is actually installed.
                 let takes = |name: &str, value_type: glib::Type| {
@@ -958,11 +962,21 @@ impl GStreamerPlayer {
                         .find_property(name)
                         .is_some_and(|spec| spec.value_type() == value_type)
                 };
-                if takes("n-threads", glib::Type::U32) {
-                    element.set_property("n-threads", DAV1D_THREADS);
-                }
-                if takes("max-frame-delay", glib::Type::I64) {
-                    element.set_property("max-frame-delay", DAV1D_FRAME_DELAY);
+                if factory.name() == "dav1ddec" {
+                    if takes("n-threads", glib::Type::U32) {
+                        element.set_property("n-threads", DAV1D_THREADS);
+                    }
+                    if takes("max-frame-delay", glib::Type::I64) {
+                        element.set_property("max-frame-delay", DAV1D_FRAME_DELAY);
+                    }
+                } else if factory.name().starts_with("avdec_") &&
+                    factory.has_type(
+                        gstreamer::ElementFactoryType::DECODER |
+                            gstreamer::ElementFactoryType::MEDIA_VIDEO,
+                    ) &&
+                    takes("max-threads", glib::Type::I32)
+                {
+                    element.set_property("max-threads", AVDEC_THREADS);
                 }
             });
         }
