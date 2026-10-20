@@ -8399,6 +8399,7 @@ dependencies = [
  "ipc-channel",
  "keyboard-types",
  "landlock",
+ "libc",
  "log",
  "parking_lot",
  "rand 0.10.3",
