@@ -94,6 +94,41 @@ fn prefer_dav1d() {
     }
 }
 
+/// Puts every NVDEC decoder behind the best software decoder for the same input, so that NVDEC
+/// only decodes what nothing else can.
+///
+/// The CUDA context NVDEC opens costs the decoding process far more than its frames save. A
+/// Twitch 1080p H.264 stream, where `nvh264dec` outranks `avdec_h264` by one, held 68 MB of
+/// `/dev/nvidiactl` mappings plus 11 MB of libcuda in the content process. With `avdec_h264`
+/// the process was 60 to 80 MB smaller and the browser used the same CPU.
+/// The change only lives in this process's copy of the registry.
+fn prefer_software_over_nvdec() {
+    let decoders = gstreamer::ElementFactory::factories_with_type(
+        gstreamer::ElementFactoryType::DECODER | gstreamer::ElementFactoryType::MEDIA_VIDEO,
+        gstreamer::Rank::MARGINAL,
+    );
+    let is_nvdec = |factory: &gstreamer::ElementFactory| {
+        factory.plugin_name().as_deref() == Some("nvcodec")
+    };
+    for nvdec in decoders.iter().filter(|factory| is_nvdec(factory)) {
+        let inputs: Vec<gstreamer::Caps> = nvdec
+            .static_pad_templates()
+            .iter()
+            .filter(|template| template.direction() == gstreamer::PadDirection::Sink)
+            .map(|template| template.caps())
+            .collect();
+        let best_software = decoders
+            .iter()
+            .filter(|factory| !is_nvdec(factory))
+            .filter(|factory| inputs.iter().any(|caps| factory.can_sink_any_caps(caps)))
+            .map(|factory| factory.rank())
+            .max();
+        if let Some(rank) = best_software.filter(|rank| *rank <= nvdec.rank()) {
+            nvdec.set_rank(rank - 1);
+        }
+    }
+}
+
 impl GStreamerBackend {
     pub fn init_with_plugins<'a, T: AsRef<str>>(
         plugin_dir: PathBuf,
@@ -131,6 +166,7 @@ impl GStreamerBackend {
         }
 
         prefer_dav1d();
+        prefer_software_over_nvdec();
 
         // This is a workaround for a race condition in GStreamer. Real fix is
         // in
