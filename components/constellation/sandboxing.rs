@@ -198,6 +198,24 @@ fn setup_common<C: CommandMethods>(command: &mut C, token: String) {
     if let Ok(value) = env::var("RUST_LOG") {
         C::env(command, "RUST_LOG", value);
     }
+
+    C::env(command, "GLIBC_TUNABLES", content_process_glibc_tunables());
+}
+
+/// glibc gives each thread that contends on malloc an arena of its own, up to
+/// eight per core, and memory freed into one arena is never handed to another.
+/// A content process runs some forty threads, so a Twitch page held 195 MB of
+/// system heap for 121 MB allocated. Two arenas brought that child from 600 MB
+/// to 560 MB of PSS at the same CPU; one arena saved nothing more. glibc reads
+/// tunables only at startup, so they go in the child's environment. A value the
+/// user set is kept, and wins if it already names `arena_max`.
+fn content_process_glibc_tunables() -> String {
+    const ARENA_MAX: &str = "glibc.malloc.arena_max=2";
+    match env::var("GLIBC_TUNABLES") {
+        Ok(user) if user.contains("glibc.malloc.arena_max") => user,
+        Ok(user) if !user.is_empty() => format!("{user}:{ARENA_MAX}"),
+        _ => ARENA_MAX.to_owned(),
+    }
 }
 
 /// A trait to unify commands launched as multiprocess with or without a sandbox.
