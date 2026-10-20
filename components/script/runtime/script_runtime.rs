@@ -31,8 +31,9 @@ use js::glue::{
 use js::jsapi::{
     AsmJSOption, BuildIdCharVector, CompilationType, Dispatchable_MaybeShuttingDown, GCDescription,
     GCOptions, GCProgress, GCReason, Handle as RawHandle, HandleObject, HandleString,
+    JS_GetFunctionObject,
     HandleValue as RawHandleValue, Heap, JSContext as RawJSContext, JSGCParamKey, JSGCStatus,
-    JSJitCompilerOption, JSObject, JSSecurityCallbacks, JSString, JSTracer, MimeType,
+    JSFunction, JSJitCompilerOption, JSObject, JSSecurityCallbacks, JSString, JSTracer, MimeType,
     MutableHandleString, PromiseRejectionHandlingState, RuntimeCode,
     ScriptEnvironmentPreparer_Closure, SetProcessBuildIdOp, StreamConsumer as JSStreamConsumer,
 };
@@ -46,7 +47,8 @@ use js::rust::wrappers2::{
     JS_InitReadPrincipalsCallback, JS_NewStringCopyUTF8N, JS_SetGCCallback, JS_SetGCParameter,
     JS_SetGlobalJitCompilerOption, JS_SetOffthreadIonCompilationEnabled, JS_SetSecurityCallbacks,
     SetDOMCallbacks, SetGCSliceCallback, SetPreserveWrapperCallbacks,
-    SetPromiseRejectionTrackerCallback, SetUpEventLoopDispatch,
+    SetHostCleanupFinalizationRegistryCallback, SetPromiseRejectionTrackerCallback,
+    SetUpEventLoopDispatch,
 };
 use js::rust::{
     Handle, HandleObject as RustHandleObject, HandleValue, IntoHandle, ParentRuntime,
@@ -326,6 +328,28 @@ unsafe extern "C" fn promise_rejection_tracker(
                 );
             },
         };
+    })
+}
+
+/// <https://html.spec.whatwg.org/multipage/#hostenqueuefinalizationregistrycleanupjob>
+///
+/// Without this hook SpiderMonkey never runs `FinalizationRegistry` callbacks, and
+/// whatever a page frees in them (wasm-bindgen's Rust objects, for one) stays allocated.
+/// It is called while the GC sweeps; the job is queued on the global of the registry,
+/// which is the global of `do_cleanup`.
+#[expect(unsafe_code)]
+unsafe extern "C" fn enqueue_finalization_registry_cleanup(
+    do_cleanup: *mut JSFunction,
+    incumbent_global: *mut JSObject,
+    _data: *mut c_void,
+) {
+    wrap_panic(&mut || {
+        let function = unsafe { JS_GetFunctionObject(do_cleanup) };
+        if function.is_null() {
+            return;
+        }
+        let global = unsafe { GlobalScope::from_object(function) };
+        global.enqueue_finalization_registry_cleanup(function, incumbent_global);
     })
 }
 
@@ -712,6 +736,11 @@ impl Runtime {
             SetPromiseRejectionTrackerCallback(
                 cx,
                 Some(promise_rejection_tracker),
+                ptr::null_mut(),
+            );
+            SetHostCleanupFinalizationRegistryCallback(
+                cx,
+                Some(enqueue_finalization_registry_cleanup),
                 ptr::null_mut(),
             );
 

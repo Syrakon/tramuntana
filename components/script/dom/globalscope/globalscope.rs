@@ -27,11 +27,11 @@ use embedder_traits::{
 use fonts::FontContext;
 use indexmap::IndexSet;
 use js::context::{JSContext, NoGC};
-use js::jsapi::{GetNonCCWObjectGlobal, HandleObject, Heap, JSObject};
-use js::jsval::UndefinedValue;
+use js::jsapi::{GetNonCCWObjectGlobal, HandleObject, HandleValueArray, Heap, JSObject};
+use js::jsval::{ObjectValue, UndefinedValue};
 use js::panic::maybe_resume_unwind;
 use js::realm::CurrentRealm;
-use js::rust::wrappers2::{Compile1, CurrentGlobalOrNull, JS_ExecuteScript};
+use js::rust::wrappers2::{Call, Compile1, CurrentGlobalOrNull, JS_ExecuteScript};
 use js::rust::{
     HandleValue, MutableHandleValue, ParentRuntime, get_object_class, transform_str_to_source_text,
 };
@@ -55,7 +55,7 @@ use script_bindings::callback::{OwnerWindow, RootedCallback, TracedCallback};
 use script_bindings::cell::{DomRefCell, RefMut};
 use script_bindings::interfaces::GlobalScopeHelpers;
 use script_bindings::reflector::DomObject;
-use script_bindings::settings_stack::run_a_script;
+use script_bindings::settings_stack::{run_a_callback, run_a_script};
 use servo_base::generic_channel;
 use servo_base::generic_channel::{GenericCallback, GenericSend};
 use servo_base::id::{
@@ -165,6 +165,16 @@ use crate::runtime::script_runtime::ThreadSafeJSContext;
 use crate::tasks::task_manager::TaskManager;
 use crate::tasks::task_source::SendableTaskSource;
 use crate::unminify::unminified_path;
+
+/// A `FinalizationRegistry` cleanup job SpiderMonkey handed over, waiting for its task.
+#[derive(JSTraceable)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+struct FinalizationRegistryCleanup {
+    /// The function that runs the registry's cleanup callback for its collected targets.
+    function: Box<Heap<*mut JSObject>>,
+    /// The incumbent global when the registry was created, possibly null.
+    incumbent_global: Box<Heap<*mut JSObject>>,
+}
 
 #[dom_struct]
 pub(crate) struct GlobalScope {
@@ -281,6 +291,11 @@ pub(crate) struct GlobalScope {
     // (that is, they cannot be moved).
     #[allow(clippy::vec_box)]
     consumed_rejections: DomRefCell<Vec<Box<Heap<*mut JSObject>>>>,
+
+    /// Cleanup jobs of this global's `FinalizationRegistry` objects whose targets were
+    /// collected, waiting for the task that runs them.
+    #[ignore_malloc_size_of = "mozjs"]
+    finalization_registry_cleanups: DomRefCell<VecDeque<FinalizationRegistryCleanup>>,
 
     /// Identity Manager for WebGPU resources
     #[ignore_malloc_size_of = "defined in wgpu"]
@@ -424,6 +439,7 @@ impl GlobalScope {
             abort_signal_dependents: Default::default(),
             uncaught_rejections: Default::default(),
             consumed_rejections: Default::default(),
+            finalization_registry_cleanups: Default::default(),
             #[cfg(feature = "webgpu")]
             gpu_id_hub,
             #[cfg(feature = "webgpu")]
@@ -2031,6 +2047,85 @@ impl GlobalScope {
         self.consumed_rejections
             .borrow_mut()
             .push(Heap::boxed(rejection.get()));
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#hostenqueuefinalizationregistrycleanupjob>
+    ///
+    /// SpiderMonkey asks for this while the GC sweeps, when no script can run, so the
+    /// job is kept here and a task runs it.
+    pub(crate) fn enqueue_finalization_registry_cleanup(
+        &self,
+        function: *mut JSObject,
+        incumbent_global: *mut JSObject,
+    ) {
+        let task_queued = {
+            let mut cleanups = self.finalization_registry_cleanups.borrow_mut();
+            let task_queued = !cleanups.is_empty();
+            cleanups.push_back(FinalizationRegistryCleanup {
+                function: Heap::boxed(function),
+                incumbent_global: Heap::boxed(incumbent_global),
+            });
+            task_queued
+        };
+        if task_queued {
+            return;
+        }
+        // Servo has no JavaScript engine task source; promise rejection events use
+        // the DOM manipulation one as well.
+        let global = Trusted::new(self);
+        self.task_manager()
+            .dom_manipulation_task_source()
+            .queue(task!(finalization_registry_cleanup: move |cx| {
+                global.root().run_finalization_registry_cleanups(cx);
+            }));
+    }
+
+    /// Run the jobs queued by `enqueue_finalization_registry_cleanup`, each one as
+    /// <https://tc39.es/ecma262/#sec-cleanup-finalization-registry> through the
+    /// function SpiderMonkey handed over.
+    #[expect(unsafe_code)]
+    fn run_finalization_registry_cleanups(&self, cx: &mut JSContext) {
+        // A job leaves the queue, where it is traced, only once it is rooted here, and
+        // jobs queued while one runs are taken by this same loop.
+        loop {
+            let Some(cleanup) = self
+                .finalization_registry_cleanups
+                .borrow_mut()
+                .pop_front()
+            else {
+                break;
+            };
+            rooted!(&in(cx) let function = ObjectValue(cleanup.function.get()));
+            let incumbent_global = (!cleanup.incumbent_global.get().is_null())
+                .then(|| unsafe { GlobalScope::from_object(cleanup.incumbent_global.get()) });
+            drop(cleanup);
+
+            let mut realm = enter_auto_realm(cx, self);
+            let cx = &mut realm.current_realm();
+            run_a_script::<DomTypeHolder, _, _>(cx, self, |cx| {
+                let call = |cx: &mut CurrentRealm| {
+                    rooted!(&in(cx) let mut rval = UndefinedValue());
+                    let called = unsafe {
+                        Call(
+                            cx,
+                            HandleValue::undefined(),
+                            function.handle(),
+                            &HandleValueArray::empty(),
+                            rval.handle_mut(),
+                        )
+                    };
+                    if !called {
+                        report_pending_exception(cx);
+                    }
+                };
+                match incumbent_global {
+                    Some(incumbent_global) => {
+                        run_a_callback::<DomTypeHolder, _>(&incumbent_global, || call(cx))
+                    },
+                    None => call(cx),
+                }
+            });
+        }
     }
 
     pub(crate) fn remove_consumed_rejection(&self, rejection: HandleObject) {
