@@ -396,6 +396,13 @@ fn media_pts(sample: &gstreamer::Sample, container: Container) -> Option<i64> {
     Some((pts.nseconds() as i64).saturating_add(segment_offset(sample, container)))
 }
 
+/// A frame the demuxer hands out is a view into the whole appended segment, and
+/// keeping it buffered keeps that segment alive with it. The frame's bytes are
+/// copied out so that only they stay; if the copy fails the view is kept.
+fn own_bytes(buffer: gstreamer::Buffer) -> gstreamer::Buffer {
+    buffer.copy_deep().unwrap_or(buffer)
+}
+
 struct Track {
     pad_name: String,
     buffer: Mutex<TrackBuffer>,
@@ -447,7 +454,7 @@ impl Track {
         container: Container,
         settings: &AppendSettings,
     ) {
-        let (Some(mut buffer), Some(caps)) = (sample.buffer_owned(), sample.caps_owned()) else {
+        let (Some(buffer), Some(caps)) = (sample.buffer_owned(), sample.caps_owned()) else {
             return;
         };
         let Some(pts) = media_pts(sample, container) else {
@@ -486,6 +493,7 @@ impl Track {
         }
         let (pts, end) = (pts as u64, end as u64);
 
+        let mut buffer = own_bytes(buffer);
         {
             let buffer = buffer.make_mut();
             buffer.set_pts(gstreamer::ClockTime::from_nseconds(pts));
@@ -514,7 +522,7 @@ impl Track {
     /// parser: it goes where the frame before it ends.
     /// <https://w3c.github.io/media-source/#sourcebuffer-coded-frame-processing>
     fn ingest_generated(&self, sample: &gstreamer::Sample, settings: &AppendSettings) {
-        let (Some(mut buffer), Some(caps)) = (sample.buffer_owned(), sample.caps_owned()) else {
+        let (Some(buffer), Some(caps)) = (sample.buffer_owned(), sample.caps_owned()) else {
             return;
         };
         // Step 1.3. The frame that starts a group goes where the group starts.
@@ -546,6 +554,7 @@ impl Track {
             return;
         }
 
+        let mut buffer = own_bytes(buffer);
         {
             let buffer = buffer.make_mut();
             buffer.set_pts(gstreamer::ClockTime::from_nseconds(pts));
