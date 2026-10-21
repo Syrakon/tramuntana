@@ -25,7 +25,7 @@ use js::conversions::jsstr_to_string;
 use js::gc::StackGCVector;
 use js::glue::{
     DispatchablePointer, RUST_js_GetErrorMessage, RegisterScriptEnvironmentPreparer,
-    RunScriptEnvironmentPreparerClosure, SetBuildId, StreamConsumerConsumeChunk,
+    DumpRuntimeStats, RunScriptEnvironmentPreparerClosure, SetBuildId, StreamConsumerConsumeChunk,
     StreamConsumerNoteResponseURLs, StreamConsumerStreamEnd, StreamConsumerStreamError,
 };
 use js::jsapi::{
@@ -885,6 +885,9 @@ impl Runtime {
             if let Some(val) = in_range(pref!(js_mem_gc_malloc_threshold_base_mb), 0, 10_000) {
                 JS_SetGCParameter(cx, JSGCParamKey::JSGC_MALLOC_THRESHOLD_BASE, val as u32);
             }
+            if let Some(val) = in_range(pref!(js_mem_gc_nursery_max_kb), 256, 4_000_000) {
+                JS_SetGCParameter(cx, JSGCParamKey::JSGC_MAX_NURSERY_BYTES, (val * 1024) as u32);
+            }
             if let Some(val) = in_range(pref!(js_mem_gc_urgent_threshold_mb), 0, 10_000) {
                 JS_SetGCParameter(cx, JSGCParamKey::JSGC_URGENT_THRESHOLD_MB, val as u32);
             }
@@ -1151,6 +1154,28 @@ pub(crate) fn compute_size(
     }
 }
 
+/// With `RUMB_JS_STATS_DIR` set, writes SpiderMonkey's fine-grained breakdown of
+/// this runtime's memory to `js.<pid>.<unix secs>.txt` in that directory each
+/// time a memory report is made: what the GC heap holds by kind, class, string
+/// and script source, which the totals of a report do not tell apart.
+#[expect(unsafe_code)]
+fn dump_runtime_stats(cx: &mut JSContext) {
+    let Some(dir) = std::env::var_os("RUMB_JS_STATS_DIR") else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let path = std::path::Path::new(&dir).join(format!("js.{}.{secs}.txt", std::process::id()));
+    let Ok(path) = CString::new(path.to_string_lossy().into_owned()) else {
+        return;
+    };
+    if !unsafe { DumpRuntimeStats(cx.raw_cx(), path.as_ptr(), Some(get_size)) } {
+        warn!("could not write the JS runtime stats to {path:?}");
+    }
+}
+
 #[expect(unsafe_code)]
 pub(crate) fn get_reports(
     cx: &mut JSContext,
@@ -1170,6 +1195,7 @@ pub(crate) fn get_reports(
         }
         stats
     };
+    dump_runtime_stats(cx);
     MALLOC_SIZE_OF_OPS.with(|ops| ops.set(ptr::null_mut()));
     ALREADY_COMPUTED_OBJECTS.with(|objects| {
         let mut objects = objects.borrow_mut();

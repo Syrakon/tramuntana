@@ -283,6 +283,8 @@ pub struct Preferences {
     pub js_mem_gc_incremental_slice_ms: i64,
     pub js_mem_gc_low_frequency_heap_growth: i64,
     pub js_mem_gc_malloc_threshold_base_mb: i64,
+    /// Largest the nursery may grow to, in KB. Negative leaves SpiderMonkey's default (64 MB).
+    pub js_mem_gc_nursery_max_kb: i64,
     pub js_mem_gc_per_zone_enabled: bool,
     pub js_mem_gc_urgent_threshold_mb: i64,
     pub js_mem_gc_zeal_frequency: i64,
@@ -544,6 +546,7 @@ impl Preferences {
             js_mem_gc_incremental_slice_ms: 10,
             js_mem_gc_low_frequency_heap_growth: 150,
             js_mem_gc_malloc_threshold_base_mb: 38,
+            js_mem_gc_nursery_max_kb: -1,
             js_mem_gc_per_zone_enabled: false,
             js_mem_gc_urgent_threshold_mb: 16,
             js_mem_gc_zeal_frequency: 100,

@@ -5468,8 +5468,6 @@ dependencies = [
 [[package]]
 name = "mozjs_sys"
 version = "153.3.0-3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49e5750549a0670f222ad555d77d8000a41a827e25f0c2c2259c38a7b7779622"
 dependencies = [
  "bindgen",
  "cc",
