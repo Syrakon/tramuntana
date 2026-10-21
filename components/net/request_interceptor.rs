@@ -33,7 +33,9 @@ impl RequestInterceptor {
         let is_for_main_frame = matches!(request.destination, Destination::Document);
         let web_resource_request = WebResourceRequest {
             method: request.method.clone(),
-            url: request.url(),
+            // The URL about to be fetched: after a redirect that is the last of the
+            // chain, not the one the request started at.
+            url: request.current_url(),
             headers: request.headers.clone(),
             destination: request.destination,
             referrer_url: request.referrer.to_url().cloned(),
