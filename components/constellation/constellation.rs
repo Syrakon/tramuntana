@@ -2647,10 +2647,12 @@ where
                 #[cfg(feature = "multiprocess")]
                 if opts::get().multiprocess {
                     // The service workers of an origin get a process of their own, which may
-                    // only fetch and keep cookies for that origin's site.
+                    // only fetch and keep cookies for that origin's site. It has no history,
+                    // so it is given no namespace whose history states it could reach.
                     let mut sw_senders = sw_senders;
                     let Some(resource_threads) = crate::site_lock::lock_resource_threads(
                         std::sync::Arc::new(crate::site_lock::SiteLock::of_origin(&origin)),
+                        crate::site_lock::OwnedNamespaces::default(),
                         &sw_senders.resource_threads,
                     ) else {
                         return warn!("Failed to lock the SW manager process to its site.");

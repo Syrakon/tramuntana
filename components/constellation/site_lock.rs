@@ -23,6 +23,7 @@ use net_traits::{CookieSource, CoreResourceMsg, ResourceThreads};
 use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
 use servo_base::generic_channel::{self, GenericSender};
+use servo_base::id::{HistoryStateId, PipelineNamespaceId, PipelineNamespaceRequest};
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
 use storage_traits::cache_storage::CacheStorageThreadMessage;
@@ -159,10 +160,12 @@ impl SiteLock {
             CoreResourceMsg::DeleteCookieAsync(_, url, _) |
             CoreResourceMsg::NewCookieListener(_, _, url) => self.allows_url(url),
             CoreResourceMsg::RemoveCookieListener(_) => true,
-            // History state ids are random, as are the keep-alive and blob token ids.
+            // A history state id is a namespace and a counter: whose it is depends on the
+            // namespaces the process was given, see [`allows_resource_message`].
             CoreResourceMsg::GetHistoryState(..) |
             CoreResourceMsg::SetHistoryState(..) |
-            CoreResourceMsg::RemoveHistoryStates(_) |
+            CoreResourceMsg::RemoveHistoryStates(_) => false,
+            // The keep-alive and blob token ids are random.
             CoreResourceMsg::TotalSizeOfInFlightKeepAliveRecords(..) |
             CoreResourceMsg::RevokeTokenForFile(_) |
             CoreResourceMsg::RefreshTokenForFile(_) => true,
@@ -242,10 +245,70 @@ fn asks_for_what_only_the_network_sets(request: &RequestBuilder) -> bool {
 /// so the id alone cannot be what lets a process into one.
 type OwnedBottles = Arc<Mutex<FxHashSet<i64>>>;
 
-/// Senders to the resource and storage threads for a content process locked to `lock`.
-/// They are `None` if a channel could not be made.
+/// The pipeline namespaces a content process was given. Ids made in one, such as history
+/// state ids, are the namespace and a counter, so the id alone cannot be what lets a
+/// process use one.
+pub(crate) type OwnedNamespaces = Arc<Mutex<FxHashSet<PipelineNamespaceId>>>;
+
+/// A sender of namespace requests for a content process, whose namespaces are recorded in
+/// `owned_namespaces` before the process learns them. `None` if a channel could not be made.
+pub(crate) fn lock_namespace_requests(
+    owned_namespaces: OwnedNamespaces,
+    destination: GenericSender<PipelineNamespaceRequest>,
+) -> Option<GenericSender<PipelineNamespaceRequest>> {
+    let (sender, receiver) = generic_channel::channel::<PipelineNamespaceRequest>()?;
+    receiver.route_with(move |request| {
+        let PipelineNamespaceRequest(reply_sender) = match request {
+            Ok(request) => request,
+            Err(error) => {
+                return debug!("Site lock: namespace channel of a content process closed: {error:?}");
+            },
+        };
+        let Some((sender, receiver)) = generic_channel::channel::<PipelineNamespaceId>() else {
+            return warn!("Site lock: no channel for a namespace reply");
+        };
+        let owned_namespaces = owned_namespaces.clone();
+        receiver.route_with(move |namespace| {
+            let Ok(namespace) = namespace else {
+                return;
+            };
+            owned_namespaces.lock().insert(namespace);
+            reply_sender.send_or_warn(namespace);
+        });
+        destination.send_or_warn(PipelineNamespaceRequest(sender));
+    });
+    Some(sender)
+}
+
+fn owns_history_state(owned_namespaces: &OwnedNamespaces, id: &HistoryStateId) -> bool {
+    owned_namespaces.lock().contains(&id.namespace_id)
+}
+
+/// Whether a content process locked to `lock` and given `owned_namespaces` may send
+/// `message` to the resource thread. History states are kept by id alone, so a process
+/// reaches only those it made, in its own namespaces: the constellation hands a state id
+/// back only to the pipeline that made it, and a pipeline loaded anew starts without one.
+fn allows_resource_message(
+    lock: &SiteLock,
+    owned_namespaces: &OwnedNamespaces,
+    message: &CoreResourceMsg,
+) -> bool {
+    match message {
+        CoreResourceMsg::GetHistoryState(id, _) | CoreResourceMsg::SetHistoryState(id, _) => {
+            owns_history_state(owned_namespaces, id)
+        },
+        CoreResourceMsg::RemoveHistoryStates(ids) => ids
+            .iter()
+            .all(|id| owns_history_state(owned_namespaces, id)),
+        _ => lock.allows_core_resource_message(message),
+    }
+}
+
+/// Senders to the resource and storage threads for a content process locked to `lock` and
+/// given `owned_namespaces`. They are `None` if a channel could not be made.
 pub(crate) fn lock_threads(
     lock: SiteLock,
+    owned_namespaces: OwnedNamespaces,
     resource_threads: &ResourceThreads,
     storage_threads: &StorageThreads,
 ) -> Option<(ResourceThreads, StorageThreads)> {
@@ -274,21 +337,22 @@ pub(crate) fn lock_threads(
         })?
     };
     Some((
-        lock_resource_threads(lock, resource_threads)?,
+        lock_resource_threads(lock, owned_namespaces, resource_threads)?,
         StorageThreads::new(client_storage, indexed_db, web_storage, cache_storage),
     ))
 }
 
-/// Senders to the resource threads for a content process locked to `lock`, or `None` if a
-/// channel could not be made.
+/// Senders to the resource threads for a content process locked to `lock` and given
+/// `owned_namespaces`, or `None` if a channel could not be made.
 pub(crate) fn lock_resource_threads(
     lock: Arc<SiteLock>,
+    owned_namespaces: OwnedNamespaces,
     resource_threads: &ResourceThreads,
 ) -> Option<ResourceThreads> {
     let core = filter(
         resource_threads.core_thread.clone(),
         "resource",
-        move |message| lock.allows_core_resource_message(message),
+        move |message| allows_resource_message(&lock, &owned_namespaces, message),
     )?;
     Some(ResourceThreads::new(core))
 }
@@ -459,6 +523,7 @@ mod tests {
     use net_traits::request::Referrer;
     use net_traits::response::ResponseInit;
     use servo_base::generic_channel::GenericCallback;
+    use servo_base::id::Index;
     // Registers the reader of the public suffix list the site checks need.
     use servo_default_resources as _;
 
@@ -675,6 +740,55 @@ mod tests {
             callback,
         );
         assert!(!lock.allows_core_resource_message(&message));
+    }
+
+    #[test]
+    fn a_process_reaches_only_the_history_states_it_made() {
+        let lock = SiteLock::new(Some(Host::Domain("example.com".to_owned())), false);
+        let owned_namespaces = OwnedNamespaces::default();
+        owned_namespaces.lock().insert(PipelineNamespaceId(7));
+        let state = |namespace, index| HistoryStateId {
+            namespace_id: PipelineNamespaceId(namespace),
+            index: Index::new(index).expect("non-zero index"),
+        };
+        let (own, other) = (state(7, 3), state(8, 3));
+        let allows = |message| allows_resource_message(&lock, &owned_namespaces, &message);
+        let get = |id| {
+            let (sender, _) = generic_channel::channel().expect("channel");
+            CoreResourceMsg::GetHistoryState(id, sender)
+        };
+
+        assert!(allows(get(own)));
+        assert!(!allows(get(other)));
+        assert!(allows(CoreResourceMsg::SetHistoryState(own, vec![1])));
+        assert!(!allows(CoreResourceMsg::SetHistoryState(other, vec![1])));
+        assert!(allows(CoreResourceMsg::RemoveHistoryStates(vec![own])));
+        assert!(!allows(CoreResourceMsg::RemoveHistoryStates(vec![own, other])));
+        // Without its namespaces the site alone lets no history state through.
+        assert!(!lock.allows_core_resource_message(&get(own)));
+    }
+
+    #[test]
+    fn a_namespace_is_owned_before_the_process_learns_it() {
+        let owned_namespaces = OwnedNamespaces::default();
+        let (constellation_sender, constellation_receiver) =
+            generic_channel::channel::<PipelineNamespaceRequest>().expect("channel");
+        let process_sender =
+            lock_namespace_requests(owned_namespaces.clone(), constellation_sender)
+                .expect("locked channel");
+
+        let (reply_sender, reply_receiver) = generic_channel::channel().expect("channel");
+        process_sender
+            .send(PipelineNamespaceRequest(reply_sender))
+            .expect("request sent");
+        let PipelineNamespaceRequest(constellation_reply) =
+            constellation_receiver.recv().expect("request forwarded");
+        constellation_reply
+            .send(PipelineNamespaceId(9))
+            .expect("reply sent");
+
+        assert_eq!(reply_receiver.recv().expect("reply"), PipelineNamespaceId(9));
+        assert!(owned_namespaces.lock().contains(&PipelineNamespaceId(9)));
     }
 
     fn registered_domain(url: &ServoUrl) -> Option<Host> {

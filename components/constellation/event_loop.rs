@@ -198,8 +198,18 @@ impl EventLoop {
             ));
         });
         initial_script_state.script_to_constellation_sender = script_to_constellation_sender;
+        let owned_namespaces = crate::site_lock::OwnedNamespaces::default();
+        owned_namespaces
+            .lock()
+            .insert(initial_script_state.pipeline_namespace_id);
+        initial_script_state.namespace_request_sender = crate::site_lock::lock_namespace_requests(
+            owned_namespaces.clone(),
+            initial_script_state.namespace_request_sender.clone(),
+        )
+        .ok_or(SendError::Disconnected)?;
         let (resource_threads, storage_threads) = crate::site_lock::lock_threads(
             site_lock,
+            owned_namespaces,
             &initial_script_state.resource_threads,
             &initial_script_state.storage_threads,
         )
