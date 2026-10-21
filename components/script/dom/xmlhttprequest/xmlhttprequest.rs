@@ -29,7 +29,7 @@ use js::rust::wrappers2::{JS_ClearPendingException, JS_ParseJSON};
 use js::rust::{HandleObject, MutableHandleValue};
 use js::typedarray::{ArrayBufferU8, HeapArrayBuffer};
 use net_traits::blob_url_store::UrlWithBlobClaim;
-use net_traits::fetch::headers::extract_mime_type_as_dataurl_mime;
+use net_traits::fetch::headers::{extract_mime_type_as_dataurl_mime, is_forbidden_request_header};
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{CredentialsMode, Referrer, RequestBuilder, RequestId, RequestMode};
 use net_traits::{
@@ -65,7 +65,6 @@ use crate::dom::document::{Document, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::headers::is_forbidden_request_header;
 use crate::dom::node::Node;
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::progressevent::ProgressEvent;

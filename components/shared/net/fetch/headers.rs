@@ -32,6 +32,86 @@ pub fn is_forbidden_method(method: &[u8]) -> bool {
         method.eq_ignore_ascii_case(b"track")
 }
 
+/// This function will internally convert `name` to lowercase for matching, so explicitly converting
+/// before calling is not necessary
+///
+/// <https://fetch.spec.whatwg.org/#forbidden-request-header>
+pub fn is_forbidden_request_header(name: &str, value: &[u8]) -> bool {
+    let forbidden_header_names = [
+        "accept-charset",
+        "accept-encoding",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "connection",
+        "content-length",
+        "cookie",
+        "cookie2",
+        "date",
+        "dnt",
+        "expect",
+        "host",
+        "keep-alive",
+        "origin",
+        "referer",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "via",
+        // This list is defined in the fetch spec, however the draft spec for private-network-access
+        // proposes this additional forbidden name, which is currently included in WPT tests. See:
+        // https://wicg.github.io/private-network-access/#forbidden-header-names
+        "access-control-request-private-network",
+    ];
+
+    // Step 1: If name is a byte-case-insensitive match for one of (forbidden_header_names), return
+    // true
+    if forbidden_header_names
+        .into_iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+    {
+        return true;
+    }
+
+    let forbidden_header_prefixes = ["sec-", "proxy-"];
+
+    // Step 2: If name when byte-lowercased starts with `proxy-` or `sec-`, then return true.
+    if forbidden_header_prefixes
+        .into_iter()
+        .any(|prefix| {
+            name.get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        })
+    {
+        return true;
+    }
+
+    let potentially_forbidden_header_names = [
+        "x-http-method",
+        "x-http-method-override",
+        "x-method-override",
+    ];
+
+    // Step 3: If name is a byte-case-insensitive match for one of (potentially_forbidden_header_names)
+    if potentially_forbidden_header_names
+        .into_iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+    {
+        // Step 3.1: Let parsedValues be the result of getting, decoding, and splitting value.
+        let parsed_values = get_decode_and_split_header_value(value.to_vec());
+
+        // Step 3.2: For each method of parsedValues: if the isomorphic encoding of method is a
+        // forbidden method, then return true.
+        return parsed_values
+            .iter()
+            .any(|s| is_forbidden_method(s.as_bytes()));
+    }
+
+    // Step 4: Return false.
+    false
+}
+
 /// <https://fetch.spec.whatwg.org/#concept-header-list-get-decode-split>
 pub fn get_decode_and_split_header_name(name: &str, headers: &HeaderMap) -> Option<Vec<String>> {
     // Step 1: Let value be the result of getting name from list.

@@ -69,6 +69,7 @@ webgpu_traits = { workspace = true, optional = true }
 webxr-api = { workspace = true }
 
 [dev-dependencies]
+http = { workspace = true }
 servo-default-resources = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

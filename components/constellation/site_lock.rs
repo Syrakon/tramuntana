@@ -15,6 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use log::{debug, warn};
+use net_traits::fetch::headers::{is_forbidden_method, is_forbidden_request_header};
 use net_traits::filemanager_thread::FileManagerThreadMsg;
 use net_traits::pub_domains::reg_suffix;
 use net_traits::request::{Origin, RequestBuilder, RequestMode};
@@ -128,6 +129,11 @@ impl SiteLock {
 
     fn allows_core_resource_message(&self, message: &CoreResourceMsg) -> bool {
         match message {
+            CoreResourceMsg::Fetch(request, _) | CoreResourceMsg::FetchRedirect(request, ..)
+                if asks_for_what_only_the_network_sets(request) =>
+            {
+                false
+            },
             CoreResourceMsg::Fetch(request, _) => self.allows_fetch(request),
             // A redirected navigation fetches nothing but the location of the redirect.
             CoreResourceMsg::FetchRedirect(request, response, _)
@@ -215,6 +221,21 @@ impl SiteLock {
             WebStorageThreadMsg::CollectMemoryReport(_) => false,
         }
     }
+}
+
+/// Whether `request` carries a forbidden method or a forbidden request header
+/// (<https://fetch.spec.whatwg.org/#forbidden-request-header>), which only the network
+/// thread may set: with them a process could send cookies, a `Host`, an `Origin` or a
+/// `Sec-Fetch-Site` of its choosing. Script never asks for them, as `Headers` and
+/// `XMLHttpRequest` leave them out, so the request is refused rather than cleaned: the
+/// process sending it is not running script as it should. The one other source is the
+/// headers an embedder gives a load of its own, which then cannot carry such a header.
+fn asks_for_what_only_the_network_sets(request: &RequestBuilder) -> bool {
+    is_forbidden_method(request.method.as_str().as_bytes()) ||
+        request
+            .headers
+            .iter()
+            .any(|(name, value)| is_forbidden_request_header(name.as_str(), value.as_bytes()))
 }
 
 /// The storage bottles a content process was given, by id. A bottle id is a plain counter,
@@ -432,6 +453,8 @@ fn allows_cache_storage_message(
 
 #[cfg(test)]
 mod tests {
+    use http::{HeaderName, HeaderValue, Method};
+    use net_traits::FetchChannels;
     use net_traits::blob_url_store::UrlWithBlobClaim;
     use net_traits::request::Referrer;
     use net_traits::response::ResponseInit;
@@ -594,6 +617,64 @@ mod tests {
         assert!(lock.allows_fetch(&request));
         request.origin = Origin::Origin(url("https://example.com/").origin());
         assert!(!lock.allows_fetch(&request));
+    }
+
+    #[test]
+    fn a_fetch_never_sets_what_only_the_network_sets() {
+        let lock = SiteLock::new(Some(Host::Domain("example.com".to_owned())), false);
+        let request = || {
+            let mut request = RequestBuilder::new(
+                None,
+                UrlWithBlobClaim::from_url_without_having_claimed_blob(url(
+                    "https://example.com/data",
+                )),
+                Referrer::NoReferrer,
+            );
+            request.origin = Origin::Origin(url("https://example.com/").origin());
+            request
+        };
+        let fetch = |request| {
+            let callback = GenericCallback::new(|_| {}).expect("callback");
+            CoreResourceMsg::Fetch(request, FetchChannels::ResponseMsg(callback))
+        };
+        assert!(lock.allows_core_resource_message(&fetch(request())));
+
+        let mut allowed = request();
+        allowed
+            .headers
+            .insert("x-requested-with", HeaderValue::from_static("fetch"));
+        assert!(lock.allows_core_resource_message(&fetch(allowed)));
+
+        for (name, value) in [
+            ("cookie", "session=stolen"),
+            ("Sec-Fetch-Site", "same-origin"),
+            ("origin", "https://bank.example"),
+            ("proxy-authorization", "Basic abc"),
+            ("x-http-method-override", "TRACE"),
+        ] {
+            let mut forbidden = request();
+            forbidden.headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                HeaderValue::from_static(value),
+            );
+            assert!(!lock.allows_core_resource_message(&fetch(forbidden)), "{name}");
+        }
+
+        let mut traced = request();
+        traced.method = Method::TRACE;
+        assert!(!lock.allows_core_resource_message(&fetch(traced)));
+
+        let callback = GenericCallback::new(|_| {}).expect("callback");
+        let mut redirected = navigation(&["https://other.example/"]);
+        redirected
+            .headers
+            .insert("cookie", HeaderValue::from_static("session=stolen"));
+        let message = CoreResourceMsg::FetchRedirect(
+            redirected,
+            redirect_to("https://www.example.com/"),
+            callback,
+        );
+        assert!(!lock.allows_core_resource_message(&message));
     }
 
     fn registered_domain(url: &ServoUrl) -> Option<Host> {

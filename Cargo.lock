@@ -8394,6 +8394,7 @@ dependencies = [
  "crossbeam-channel",
  "euclid",
  "gaol",
+ "http",
  "ipc-channel",
  "keyboard-types",
  "landlock",
