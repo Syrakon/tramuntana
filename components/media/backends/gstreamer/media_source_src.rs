@@ -225,11 +225,23 @@ impl ServoMediaSourceSrc {
 // Registers the type for our element, and then registers in GStreamer
 // under the name "servomediasourcesrc" for being able to instantiate it via e.g.
 // gstreamer::ElementFactory::make().
+//
+// Only the first call registers. Every player calls this when it is set up, and
+// two players set up at once on their own threads race inside GStreamer: both
+// add a factory under the same name, the registry drops one of them, and the
+// element class can be left pointing at the dropped one, which crashes the next
+// element.factory().
 pub fn register_servo_media_source_src() -> Result<(), glib::BoolError> {
-    gstreamer::Element::register(
-        None,
-        "servomediasourcesrc",
-        gstreamer::Rank::NONE,
-        ServoMediaSourceSrc::static_type(),
-    )
+    static REGISTERED: std::sync::OnceLock<Result<(), glib::BoolError>> =
+        std::sync::OnceLock::new();
+    REGISTERED
+        .get_or_init(|| {
+            gstreamer::Element::register(
+                None,
+                "servomediasourcesrc",
+                gstreamer::Rank::NONE,
+                ServoMediaSourceSrc::static_type(),
+            )
+        })
+        .clone()
 }
