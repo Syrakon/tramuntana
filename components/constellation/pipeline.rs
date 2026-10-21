@@ -16,7 +16,7 @@ use script_traits::{
 };
 use servo_base::generic_channel::SendError;
 use servo_base::id::{BrowsingContextId, HistoryStateId, PipelineId, WebViewId};
-use servo_constellation_traits::{LoadData, ServiceWorkerManagerFactory};
+use servo_constellation_traits::{LoadData, ServiceWorkerManagerFactory, TargetSnapshotParams};
 use servo_url::ServoUrl;
 
 use crate::Constellation;
@@ -66,6 +66,13 @@ pub struct Pipeline {
     /// The Load Data used to create this pipeline.
     pub load_data: LoadData,
 
+    /// The target snapshot params this pipeline was spawned with, kept to spawn it again
+    /// elsewhere if its navigation is redirected to another site.
+    pub target_snapshot_params: TargetSnapshotParams,
+
+    /// The name of the frame this pipeline was spawned for, kept for the same reason.
+    pub frame_name: Option<String>,
+
     /// The active history state for this pipeline.
     pub history_state_id: Option<HistoryStateId>,
 
@@ -102,7 +109,7 @@ impl Pipeline {
             return Err(error);
         }
 
-        Ok(Self::new_already_spawned(
+        let mut pipeline = Self::new_already_spawned(
             new_pipeline_info.new_pipeline_id,
             new_pipeline_info.browsing_context_id,
             new_pipeline_info.webview_state.id,
@@ -111,7 +118,10 @@ impl Pipeline {
             constellation.paint_proxy.clone(),
             webview_hidden,
             new_pipeline_info.load_data,
-        ))
+        );
+        pipeline.target_snapshot_params = new_pipeline_info.target_snapshot_params;
+        pipeline.frame_name = new_pipeline_info.frame_name;
+        Ok(pipeline)
     }
 
     /// Creates a new `Pipeline`, after it has been spawned in its [`EventLoop`].
@@ -140,6 +150,8 @@ impl Pipeline {
             worker_callbacks_active: FxHashSet::default(),
             last_callbacks_active_sent_to_paint: false,
             load_data,
+            target_snapshot_params: TargetSnapshotParams::default(),
+            frame_name: None,
             history_state_id: None,
             history_states: HashSet::new(),
             completely_loaded: false,

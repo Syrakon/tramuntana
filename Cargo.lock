@@ -8414,6 +8414,7 @@ dependencies = [
  "servo-canvas-traits",
  "servo-config",
  "servo-constellation-traits",
+ "servo-default-resources",
  "servo-devtools-traits",
  "servo-embedder-traits",
  "servo-fonts",

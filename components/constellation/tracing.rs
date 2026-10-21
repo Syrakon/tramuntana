@@ -172,6 +172,9 @@ mod from_script {
                 Self::LoadComplete => target!("LoadComplete"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
                 Self::AbortLoadUrl => target!("AbortLoadUrl"),
+                Self::NavigationRedirectedToAnotherSite { .. } => {
+                    target!("NavigationRedirectedToAnotherSite")
+                },
                 Self::PostMessage { .. } => target!("PostMessage"),
                 Self::NavigatedToFragment(..) => target!("NavigatedToFragment"),
                 Self::TraverseHistory(..) => target!("TraverseHistory"),

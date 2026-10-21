@@ -502,6 +502,37 @@ where
             GenericReceiverVariants::Crossbeam(receiver) => receiver,
         }
     }
+
+    /// Hand every message, or the error receiving it, to `callback`.
+    ///
+    /// For `Ipc` receivers this creates a route on the router thread, so `callback` must
+    /// not block. `Crossbeam` receivers get a thread of their own.
+    pub fn route_with<F>(self, mut callback: F)
+    where
+        T: Send + 'static,
+        F: FnMut(Result<T, SendError>) + Send + 'static,
+    {
+        match self.0 {
+            GenericReceiverVariants::Ipc(ipc_receiver) => {
+                ROUTER.add_typed_route(
+                    ipc_receiver,
+                    Box::new(move |message| callback(message.map_err(|e| e.into()))),
+                );
+            },
+            GenericReceiverVariants::Crossbeam(receiver) => {
+                let spawned = std::thread::Builder::new()
+                    .name("RoutedReceiver".to_owned())
+                    .spawn(move || {
+                        while let Ok(message) = receiver.recv() {
+                            callback(message);
+                        }
+                    });
+                if let Err(error) = spawned {
+                    log::error!("Could not start the thread routing a channel: {error}");
+                }
+            },
+        }
+    }
 }
 
 impl<T> Serialize for GenericReceiver<T>

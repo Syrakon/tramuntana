@@ -21,6 +21,7 @@ use http::{HeaderMap, Method};
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{Destination, InsecureRequestsPolicy, Referrer, RequestBody};
+use net_traits::response::ResponseInit;
 use net_traits::{ReferrerPolicy, ResourceThreads};
 use paint_api::CrossProcessPaintApi;
 use profile_traits::mem::MemoryReportResult;
@@ -145,6 +146,20 @@ pub struct LoadData {
 
     /// If this request is for the initial about:blank document.
     pub is_initial_about_blank: bool,
+
+    /// Set when a redirect took this navigation to another site: the load then goes on in
+    /// a process of that site, from the redirect onwards.
+    pub cross_site_redirect: Option<CrossSiteRedirect>,
+}
+
+/// A navigation that a redirect took to another site, to be carried on in a process of that
+/// site rather than in the one that started it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CrossSiteRedirect {
+    /// The URLs the navigation went through so far, ending with the one that redirected.
+    pub url_list: Vec<ServoUrl>,
+    /// The redirect, whose `location_url` is where the navigation goes next.
+    pub response: ResponseInit,
 }
 
 impl LoadData {
@@ -185,6 +200,7 @@ impl LoadData {
             creation_sandboxing_flag_set,
             container_document_encoding: None,
             is_initial_about_blank: false,
+            cross_site_redirect: None,
         }
     }
 
@@ -741,6 +757,16 @@ pub enum ScriptToConstellationMessage {
     LoadUrl(LoadData, NavigationHistoryBehavior, TargetSnapshotParams),
     /// Abort loading after sending a LoadUrl message.
     AbortLoadUrl,
+    /// The navigation of this pending pipeline was redirected to another site. Its process
+    /// has dropped it, and the load goes on in a process of that site.
+    NavigationRedirectedToAnotherSite {
+        /// The redirect to follow.
+        redirect: CrossSiteRedirect,
+        /// The referrer of the redirected request.
+        referrer: Referrer,
+        /// The referrer policy of the redirected request.
+        referrer_policy: ReferrerPolicy,
+    },
     /// Post a message to the currently active window of a given browsing context.
     PostMessage {
         /// The target of the posted message.

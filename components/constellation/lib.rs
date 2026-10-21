@@ -28,6 +28,8 @@ mod linux_sandbox;
 mod process_manager;
 #[cfg(feature = "multiprocess")]
 mod sandboxing;
+#[cfg(feature = "multiprocess")]
+mod site_lock;
 mod screenshot_readiness_request;
 mod serviceworker;
 mod session_history;

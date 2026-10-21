@@ -19,6 +19,7 @@ use script_traits::{InitialScriptState, ScriptThreadMessage};
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::{GenericReceiver, GenericSender, SendError};
 use servo_base::id::{ScriptEventLoopId, WebViewId};
+use servo_url::Host;
 #[cfg(feature = "multiprocess")]
 use servo_config::opts::{self, Opts};
 #[cfg(feature = "multiprocess")]
@@ -26,6 +27,8 @@ use servo_config::prefs::{self, Preferences};
 use servo_constellation_traits::ServiceWorkerManagerFactory;
 
 use crate::Constellation;
+#[cfg(feature = "multiprocess")]
+use crate::site_lock::SiteLock;
 
 /// <https://html.spec.whatwg.org/multipage/#event-loop>
 pub struct EventLoop {
@@ -67,6 +70,8 @@ impl EventLoop {
         constellation: &mut Constellation<STF, SWF>,
         webview_id: WebViewId,
         is_private: bool,
+        site: Option<Host>,
+        sandboxed: bool,
     ) -> Result<Rc<Self>, SendError> {
         let (script_chan, script_port) =
             servo_base::generic_channel::channel().expect("Pipeline script chan");
@@ -127,12 +132,20 @@ impl EventLoop {
 
         #[cfg(feature = "multiprocess")]
         let event_loop = if opts::get().multiprocess {
-            Self::spawn_in_process(constellation, initial_script_state)?
+            Self::spawn_in_process(
+                constellation,
+                initial_script_state,
+                SiteLock::new(site, sandboxed),
+            )?
         } else {
             Self::spawn_in_thread(constellation, initial_script_state)
         };
         #[cfg(not(feature = "multiprocess"))]
-        let event_loop = Self::spawn_in_thread(constellation, initial_script_state);
+        let event_loop = {
+            // Script running in this process shares its memory: there is no site to lock it to.
+            let _ = (site, sandboxed);
+            Self::spawn_in_thread(constellation, initial_script_state)
+        };
 
         let event_loop = Rc::new(event_loop);
         constellation.add_event_loop(&event_loop);
@@ -168,10 +181,31 @@ impl EventLoop {
     #[cfg(feature = "multiprocess")]
     fn spawn_in_process<STF: ScriptThreadFactory, SWF: ServiceWorkerManagerFactory>(
         constellation: &mut Constellation<STF, SWF>,
-        initial_script_state: InitialScriptState,
+        mut initial_script_state: InitialScriptState,
+        site_lock: SiteLock,
     ) -> Result<Self, SendError> {
         let script_chan = initial_script_state.constellation_to_script_sender.clone();
         let id = initial_script_state.id;
+
+        // The process gets channels of its own to the constellation and to the resource and
+        // storage threads, which know what it runs and refuse what it may not do.
+        let (script_to_constellation_sender, script_to_constellation_receiver) =
+            servo_base::generic_channel::channel().ok_or(SendError::Disconnected)?;
+        let script_from_process_sender = constellation.script_from_process_sender.clone();
+        script_to_constellation_receiver.route_with(move |message| {
+            let _ = script_from_process_sender.send(message.map(
+                |(webview_id, pipeline_id, message)| (Some(id), webview_id, pipeline_id, message),
+            ));
+        });
+        initial_script_state.script_to_constellation_sender = script_to_constellation_sender;
+        let (resource_threads, storage_threads) = crate::site_lock::lock_threads(
+            site_lock,
+            &initial_script_state.resource_threads,
+            &initial_script_state.storage_threads,
+        )
+        .ok_or(SendError::Disconnected)?;
+        initial_script_state.resource_threads = resource_threads;
+        initial_script_state.storage_threads = storage_threads;
 
         let (background_hand_monitor_sender, backgrond_hand_monitor_receiver) =
             servo_base::generic_channel::channel().expect("Sampler chan");

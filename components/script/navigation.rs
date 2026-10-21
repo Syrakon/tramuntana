@@ -193,7 +193,11 @@ impl InProgressLoad {
         new_pipeline_info: NewPipelineInfo,
         webview_state: Rc<WebViewState>,
     ) -> InProgressLoad {
-        let url = new_pipeline_info.load_data.url.clone();
+        // A navigation that another site redirected here keeps the URLs it went through.
+        let url_list = match &new_pipeline_info.load_data.cross_site_redirect {
+            Some(redirect) => redirect.url_list.clone(),
+            None => vec![new_pipeline_info.load_data.url.clone()],
+        };
 
         InProgressLoad {
             pipeline_id: new_pipeline_info.new_pipeline_id,
@@ -207,7 +211,7 @@ impl InProgressLoad {
             navigation_start: CrossProcessInstant::now(),
             canceller: Default::default(),
             load_data: new_pipeline_info.load_data,
-            url_list: vec![url],
+            url_list,
             user_content_manager_id: new_pipeline_info.user_content_manager_id,
             target_snapshot_params: new_pipeline_info.target_snapshot_params,
             frame_name: new_pipeline_info.frame_name,

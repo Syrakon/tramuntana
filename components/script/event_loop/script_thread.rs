@@ -63,7 +63,7 @@ use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
 use net_traits::image_cache::{ImageCacheFactory, ImageCacheResponseMessage};
-use net_traits::pub_domains::is_same_site;
+use net_traits::pub_domains::{is_same_site, registered_domain_name};
 use net_traits::request::{Referrer, RequestId};
 use net_traits::response::ResponseInit;
 use net_traits::{
@@ -94,7 +94,7 @@ use servo_canvas_traits::webgl::WebGLPipeline;
 use servo_config::opts::{self, DiagnosticsLoggingOption};
 use servo_config::{pref, prefs};
 use servo_constellation_traits::{
-    HistoryTraversalSource, LoadData, LoadOrigin, NavigationHistoryBehavior, PaintMetricEvent,
+    CrossSiteRedirect, HistoryTraversalSource, LoadData, LoadOrigin, NavigationHistoryBehavior, PaintMetricEvent,
     RemoteFocusOperation, ScreenshotReadinessResponse, ScriptToConstellationChan,
     ScriptToConstellationMessage, ScrollStateUpdate, SessionHistoryTraversalRequest,
     StructuredSerializedData, TargetSnapshotParams, TraversalDirection, WindowSizeType,
@@ -4157,14 +4157,25 @@ impl ScriptThread {
             .borrow_mut()
             .push((incomplete.pipeline_id, context));
 
-        let request_builder = incomplete.request_builder();
+        let mut request_builder = incomplete.request_builder();
+        // A navigation that another site redirected here goes on from that redirect.
+        let response_init = incomplete
+            .load_data
+            .cross_site_redirect
+            .as_ref()
+            .map(|redirect| redirect.response.clone());
+        if response_init.is_some() &&
+            let Some(client) = &request_builder.client
+        {
+            request_builder.origin = client.origin.clone();
+        }
         incomplete.canceller = FetchCanceller::new(
             request_builder.id,
             false,
             self.resource_threads.core_thread.clone(),
         );
         NavigationListener::new(request_builder, self.senders.self_sender.clone())
-            .initiate_fetch(&self.resource_threads.core_thread, None);
+            .initiate_fetch(&self.resource_threads.core_thread, response_init);
         self.incomplete_loads.borrow_mut().push(incomplete);
     }
 
@@ -4303,12 +4314,13 @@ impl ScriptThread {
         assert!(metadata.location_url.is_some());
 
         let mut incomplete_loads = self.incomplete_loads.borrow_mut();
-        let Some(incomplete_load) = incomplete_loads
-            .iter_mut()
-            .find(|incomplete_load| incomplete_load.pipeline_id == id)
+        let Some(index) = incomplete_loads
+            .iter()
+            .position(|incomplete_load| incomplete_load.pipeline_id == id)
         else {
             return;
         };
+        let incomplete_load = &mut incomplete_loads[index];
 
         // Update the `url_list` of the incomplete load to track all redirects. This will be reflected
         // in the new `RequestBuilder` as well.
@@ -4334,7 +4346,7 @@ impl ScriptThread {
             .map(|headers| headers.clone().into_inner())
             .unwrap_or_default();
 
-        let response_init = Some(ResponseInit {
+        let response_init = ResponseInit {
             url: metadata.final_url.clone(),
             location_url: metadata.location_url.clone(),
             headers,
@@ -4344,7 +4356,39 @@ impl ScriptThread {
                 .try_code()
                 .map(|code| code.as_u16())
                 .unwrap_or(200),
-        });
+        };
+
+        // The documents of another site are not loaded in this event loop. Drop the load,
+        // and the constellation picks it up again in an event loop of that site.
+        if let Some(Ok(location)) = &metadata.location_url &&
+            registered_domain_name(location) !=
+                registered_domain_name(&incomplete_load.load_data.url)
+        {
+            let incomplete_load = incomplete_loads.remove(index);
+            drop(incomplete_loads);
+            self.incomplete_parser_contexts
+                .0
+                .borrow_mut()
+                .retain(|(pipeline_id, _)| *pipeline_id != id);
+            self.devtools_state.notify_pipeline_exited(id);
+
+            let message = ScriptToConstellationMessage::NavigationRedirectedToAnotherSite {
+                redirect: CrossSiteRedirect {
+                    url_list: incomplete_load.url_list,
+                    response: response_init,
+                },
+                referrer: request_builder.referrer,
+                referrer_policy: request_builder.referrer_policy,
+            };
+            if let Err(error) = self.senders.pipeline_to_constellation_sender.send((
+                incomplete_load.webview_state.id,
+                id,
+                message,
+            )) {
+                warn!("{id}: Could not hand a redirect to another site over: {error}");
+            }
+            return;
+        }
 
         incomplete_load.canceller = FetchCanceller::new(
             request_builder.id,
@@ -4352,7 +4396,7 @@ impl ScriptThread {
             self.resource_threads.core_thread.clone(),
         );
         NavigationListener::new(request_builder, self.senders.self_sender.clone())
-            .initiate_fetch(&self.resource_threads.core_thread, response_init);
+            .initiate_fetch(&self.resource_threads.core_thread, Some(response_init));
     }
 
     /// Synchronously fetch a page with fixed content. Stores the `InProgressLoad`

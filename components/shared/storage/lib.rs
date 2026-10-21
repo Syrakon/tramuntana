@@ -72,6 +72,24 @@ impl StorageThreads {
             .send(ClientStorageThreadMessage::Estimate { origin, sender })
     }
 
+    /// The sender to each storage thread: client storage, IndexedDB, web storage and cache
+    /// storage, for whatever stands in front of them.
+    pub fn senders(
+        &self,
+    ) -> (
+        GenericSender<ClientStorageThreadMessage>,
+        GenericSender<IndexedDBThreadMsg>,
+        GenericSender<WebStorageThreadMsg>,
+        GenericSender<CacheStorageThreadMessage>,
+    ) {
+        (
+            self.client_storage_thread.clone(),
+            self.idb_thread.clone(),
+            self.web_storage_thread.clone(),
+            self.cache_storage_thread.clone(),
+        )
+    }
+
     pub fn client_storage_handle(&self) -> ClientStorageThreadHandle {
         self.client_storage_thread.clone().into()
     }

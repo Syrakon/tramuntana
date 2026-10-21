@@ -125,7 +125,8 @@ use log::{debug, error, info, trace, warn};
 use media::WindowGLContext;
 use net::image_cache::ImageCacheFactoryImpl;
 use net_traits::pub_domains::registered_domain_name;
-use net_traits::{self, AsyncRuntime, FetchThread, ResourceThreads};
+use net_traits::request::Referrer;
+use net_traits::{self, AsyncRuntime, FetchThread, ReferrerPolicy, ResourceThreads};
 use paint_api::{
     PaintMessage, PaintProxy, PinchZoomInfos, PipelineExitSource, SendableFrameTree,
     WebRenderExternalImageIdManager,
@@ -159,7 +160,7 @@ use servo_canvas_traits::canvas::{CanvasId, CanvasMsg};
 use servo_config::{opts, pref};
 use servo_constellation_traits::{
     AuxiliaryWebViewCreationRequest, AuxiliaryWebViewCreationResponse, ConstellationInterest,
-    EmbedderToConstellationMessage, HistoryTraversalSource, IFrameLoadInfo, IFrameLoadInfoWithData,
+    CrossSiteRedirect, EmbedderToConstellationMessage, HistoryTraversalSource, IFrameLoadInfo, IFrameLoadInfoWithData,
     IFrameSizeMsg, LoadData, LogEntry, MessagePortMsg, NavigationHistoryBehavior, PaintMetricEvent,
     PortMessageTask, PortTransferInfo, RemoteFocusOperation, SWManagerSenders,
     ScreenshotReadinessResponse, ScriptToConstellationMessage, ScrollStateUpdate,
@@ -197,6 +198,15 @@ struct PendingApprovalNavigation {
 }
 
 type PendingApprovalNavigations = FxHashMap<PipelineId, PendingApprovalNavigation>;
+
+/// A message from script, with the event loop of the content process that sent it, or `None`
+/// when it comes from script running in this process.
+pub(crate) type ScriptMessageFromEventLoop = (
+    Option<ScriptEventLoopId>,
+    WebViewId,
+    PipelineId,
+    ScriptToConstellationMessage,
+);
 
 #[derive(Debug)]
 /// The state used by MessagePortInfo to represent the various states the port can be in.
@@ -313,10 +323,15 @@ pub struct Constellation<STF, SWF> {
     /// This is the script threads' view of `script_receiver`.
     pub(crate) script_sender: GenericSender<(WebViewId, PipelineId, ScriptToConstellationMessage)>,
 
-    /// A channel for the constellation to receive messages from script threads.
-    /// This is the constellation's view of `script_sender`.
-    script_receiver:
-        Receiver<Result<(WebViewId, PipelineId, ScriptToConstellationMessage), SendError>>,
+    /// A channel for the constellation to receive messages from script threads: those of
+    /// `script_sender`, and those of the channel each content process gets of its own.
+    script_receiver: Receiver<Result<ScriptMessageFromEventLoop, SendError>>,
+
+    /// Where the channel of each content process forwards its messages to, tagged with the
+    /// event loop the process runs, so that a process can only speak for its own pipelines.
+    #[cfg(feature = "multiprocess")]
+    pub(crate) script_from_process_sender:
+        Sender<Result<ScriptMessageFromEventLoop, SendError>>,
 
     /// A handle to register components for hang monitoring.
     /// None when in multiprocess mode.
@@ -643,7 +658,14 @@ where
                 servo_base::threadboost::boost_thread(ThreadPriority::Elevated, BoostAffinity::Boost);
                 let (script_ipc_sender, script_ipc_receiver) =
                     generic_channel::channel().expect("ipc channel failure");
-                let script_receiver = script_ipc_receiver.route_preserving_errors();
+                // Script running in this process is trusted: its messages carry no event loop.
+                let (script_from_process_sender, script_receiver) = unbounded();
+                let script_from_this_process = script_from_process_sender.clone();
+                script_ipc_receiver.route_with(move |message| {
+                    let _ = script_from_this_process.send(message.map(
+                        |(webview_id, pipeline_id, message)| (None, webview_id, pipeline_id, message),
+                    ));
+                });
 
                 let (namespace_ipc_sender, namespace_ipc_receiver) =
                     generic_channel::channel().expect("ipc channel failure");
@@ -702,6 +724,8 @@ where
                     background_monitor_register_join_handle,
                     background_monitor_control_sender,
                     script_receiver,
+                    #[cfg(feature = "multiprocess")]
+                    script_from_process_sender,
                     embedder_to_constellation_receiver,
                     layout_factory,
                     embedder_proxy: state.embedder_proxy,
@@ -947,14 +971,11 @@ where
         load_data: &LoadData,
         is_private: bool,
     ) -> Result<Rc<EventLoop>, SendError> {
-        let registered_domain_name = if load_data
+        let sandboxed = load_data
             .creation_sandboxing_flag_set
-            .contains(SandboxingFlagSet::SANDBOXED_ORIGIN_BROWSING_CONTEXT_FLAG)
-        {
-            None
-        } else {
-            registered_domain_name(&load_data.url)
-        };
+            .contains(SandboxingFlagSet::SANDBOXED_ORIGIN_BROWSING_CONTEXT_FLAG);
+        let site = registered_domain_name(&load_data.url);
+        let registered_domain_name = if sandboxed { None } else { site.clone() };
 
         if let Some(event_loop) = self.get_event_loop_for_new_pipeline(
             load_data,
@@ -965,7 +986,8 @@ where
             return Ok(event_loop);
         }
 
-        let event_loop = EventLoop::spawn(self, webview_id, is_private)?;
+        let event_loop =
+            EventLoop::spawn(self, webview_id, is_private, site, sandboxed)?;
         if let Some(registered_domain_name) = registered_domain_name {
             self.set_event_loop(&event_loop, registered_domain_name, &webview_id);
         }
@@ -1159,7 +1181,7 @@ where
         #[derive(Debug)]
         enum Request {
             PipelineNamespace(PipelineNamespaceRequest),
-            Script((WebViewId, PipelineId, ScriptToConstellationMessage)),
+            Script(ScriptMessageFromEventLoop),
             BackgroundHangMonitor(HangAlert),
             Embedder(EmbedderToConstellationMessage),
             #[cfg_attr(not(feature = "multiprocess"), expect(unused))]
@@ -1586,10 +1608,21 @@ where
     #[servo_tracing::instrument(skip_all)]
     fn handle_request_from_script(
         &mut self,
-        message: (WebViewId, PipelineId, ScriptToConstellationMessage),
+        message: ScriptMessageFromEventLoop,
     ) {
-        let (webview_id, source_pipeline_id, content) = message;
+        let (sending_event_loop, webview_id, source_pipeline_id, content) = message;
         trace_script_msg!(content, "{source_pipeline_id}: {content:?}");
+
+        if let Some(sending_event_loop) = sending_event_loop {
+            if !self.event_loop_may_speak_for(
+                sending_event_loop,
+                webview_id,
+                source_pipeline_id,
+                &content,
+            ) {
+                return;
+            }
+        }
 
         match content {
             ScriptToConstellationMessage::CompleteMessagePortTransfer(router_id, ports) => {
@@ -1752,6 +1785,19 @@ where
             },
             ScriptToConstellationMessage::AbortLoadUrl => {
                 self.handle_abort_load_url_msg(webview_id, source_pipeline_id);
+            },
+            ScriptToConstellationMessage::NavigationRedirectedToAnotherSite {
+                redirect,
+                referrer,
+                referrer_policy,
+            } => {
+                self.handle_navigation_redirected_to_another_site(
+                    webview_id,
+                    source_pipeline_id,
+                    redirect,
+                    referrer,
+                    referrer_policy,
+                );
             },
             // A page loaded has completed all parsing, script, and reflow messages have been sent.
             ScriptToConstellationMessage::LoadComplete => {
@@ -2062,6 +2108,68 @@ where
     /// Check the origin of a message against that of the pipeline it came from.
     /// Note: this is still limited as a security check,
     /// see <https://github.com/servo/servo/issues/11722>
+    /// Whether a content process running `event_loop` may send `content` in the name of
+    /// `pipeline_id` of `webview_id`. A process can claim any pipeline in what it sends, so
+    /// without this a compromised one could act for a page of another site.
+    fn event_loop_may_speak_for(
+        &self,
+        event_loop: ScriptEventLoopId,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        content: &ScriptToConstellationMessage,
+    ) -> bool {
+        // Logging names no pipeline, only the event loop it comes from, and none at all from
+        // a thread that runs no event loop.
+        if let ScriptToConstellationMessage::LogEntry(logging_event_loop, ..) = content {
+            if logging_event_loop.is_none_or(|logging_event_loop| logging_event_loop == event_loop)
+            {
+                return true;
+            }
+            warn!("Content process of {event_loop:?} logged as {logging_event_loop:?}; dropped");
+            return false;
+        }
+        // A frame builds the window proxy of an ancestor in another process by asking about
+        // it, in that ancestor's name. It may ask about pages of the tabs it has a frame in.
+        if let ScriptToConstellationMessage::GetBrowsingContextInfo(..) = content {
+            let asked_about_this_tab = self
+                .pipelines
+                .get(&pipeline_id)
+                .is_some_and(|pipeline| pipeline.webview_id == webview_id);
+            let runs_a_frame_in_this_tab = self.pipelines.values().any(|pipeline| {
+                pipeline.event_loop.id() == event_loop && pipeline.webview_id == webview_id
+            });
+            if asked_about_this_tab && runs_a_frame_in_this_tab {
+                return true;
+            }
+            warn!(
+                "Content process of {event_loop:?} asked about {pipeline_id} of {webview_id}, \
+                 a tab it has no frame in; dropped"
+            );
+            return false;
+        }
+        match self.pipelines.get(&pipeline_id) {
+            Some(pipeline)
+                if pipeline.event_loop.id() == event_loop && pipeline.webview_id == webview_id =>
+            {
+                true
+            },
+            Some(_) => {
+                let message: &'static str = content.into();
+                warn!(
+                    "Content process of {event_loop:?} spoke for {pipeline_id} of {webview_id}, \
+                     which it does not run; dropped {message}"
+                );
+                false
+            },
+            // A pipeline that has just closed can still have messages in flight. Its handlers
+            // would have found nothing to act on either.
+            None => {
+                debug!("Message from closed or unknown {pipeline_id} dropped");
+                false
+            },
+        }
+    }
+
     fn check_origin_against_pipeline(
         &self,
         pipeline_id: &PipelineId,
@@ -2538,6 +2646,16 @@ where
 
                 #[cfg(feature = "multiprocess")]
                 if opts::get().multiprocess {
+                    // The service workers of an origin get a process of their own, which may
+                    // only fetch and keep cookies for that origin's site.
+                    let mut sw_senders = sw_senders;
+                    let Some(resource_threads) = crate::site_lock::lock_resource_threads(
+                        std::sync::Arc::new(crate::site_lock::SiteLock::of_origin(&origin)),
+                        &sw_senders.resource_threads,
+                    ) else {
+                        return warn!("Failed to lock the SW manager process to its site.");
+                    };
+                    sw_senders.resource_threads = resource_threads;
                     let (sender, receiver) = generic_channel::channel()
                         .expect("Failed to create lifeline channel for sw");
                     let content =
@@ -4504,6 +4622,85 @@ where
                 &self.pipelines,
             );
         };
+    }
+
+    /// The navigation of the pending `pipeline_id` was redirected to another site, and its
+    /// process dropped it. Spawn the pipeline again, under the same id, in an event loop of
+    /// that site, which picks the load up from the redirect.
+    ///
+    /// Only the redirect comes from the process: everything else about the load is what this
+    /// pipeline was spawned with. All a lying process gets is a navigation of its own pending
+    /// pipeline to some URL, which it could have started anyway.
+    #[servo_tracing::instrument(skip_all)]
+    fn handle_navigation_redirected_to_another_site(
+        &mut self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        redirect: CrossSiteRedirect,
+        referrer: Referrer,
+        referrer_policy: ReferrerPolicy,
+    ) {
+        let location = match &redirect.response.location_url {
+            Some(Ok(location)) if matches!(location.scheme(), "http" | "https") => {
+                location.clone()
+            },
+            _ => return warn!("{pipeline_id}: Redirected to another site without a location"),
+        };
+        let Some(change) = self.webviews.get(&webview_id).and_then(|webview| {
+            webview
+                .pending_changes
+                .iter()
+                .find(|change| change.new_pipeline_id == pipeline_id)
+        }) else {
+            return warn!("{pipeline_id}: Redirected to another site but is not pending");
+        };
+        let browsing_context_id = change.browsing_context_id;
+        let viewport_details = change.viewport_details;
+        let (parent_pipeline_id, is_private) = match &change.new_browsing_context_info {
+            Some(info) => (info.parent_pipeline_id, info.is_private),
+            None => match self.browsing_contexts.get(&browsing_context_id) {
+                Some(browsing_context) => (
+                    browsing_context.parent_pipeline_id,
+                    browsing_context.is_private,
+                ),
+                None => {
+                    return warn!(
+                        "{pipeline_id}: Redirected to another site in closed {browsing_context_id}"
+                    );
+                },
+            },
+        };
+        let Some(old_pipeline) = self.pipelines.remove(&pipeline_id) else {
+            return warn!("{pipeline_id}: Redirected to another site after closure");
+        };
+        debug!("{pipeline_id}: Redirected to {location}, which is another site");
+
+        let load_data = LoadData {
+            url: location,
+            referrer,
+            referrer_policy,
+            cross_site_redirect: Some(redirect),
+            ..old_pipeline.load_data.clone()
+        };
+        self.new_pipeline(
+            pipeline_id,
+            browsing_context_id,
+            webview_id,
+            parent_pipeline_id,
+            old_pipeline.opener,
+            viewport_details,
+            load_data,
+            is_private,
+            old_pipeline.target_snapshot_params,
+            old_pipeline.frame_name.clone(),
+        );
+
+        // Without a pipeline to commit, the pending change would wait forever.
+        if !self.pipelines.contains_key(&pipeline_id) &&
+            let Some(webview) = self.webviews.get_mut(&webview_id)
+        {
+            webview.remove_pending_change_for_pipeline(pipeline_id);
+        }
     }
 
     #[servo_tracing::instrument(skip_all)]

@@ -49,7 +49,7 @@ uuid = { workspace = true }
 webgpu_traits = { workspace = true, optional = true }
 webrender_api = { workspace = true }
 wgpu-core = { workspace = true, optional = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

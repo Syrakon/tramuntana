@@ -68,6 +68,9 @@ webgpu = { workspace = true, optional = true }
 webgpu_traits = { workspace = true, optional = true }
 webxr-api = { workspace = true }
 
+[dev-dependencies]
+servo-default-resources = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 gaol = { workspace = true }
 
