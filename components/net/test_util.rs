@@ -37,14 +37,20 @@ static PEM_FILE: &[u8] = include_bytes!("tests/privatekey_for_testing.key");
 static ASYNC_RUNTIME: LazyLock<Arc<Mutex<Box<dyn AsyncRuntime>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(init_async_runtime())));
 
+/// Start the shared async runtime of the tests, if no test has started it yet. Every test in
+/// a binary shares the runtime, because its handle can only be set once per process.
+pub fn ensure_async_runtime() {
+    if !async_runtime_initialized() {
+        LazyLock::force(&ASYNC_RUNTIME);
+    }
+}
+
 pub fn create_embedder_proxy() -> EmbedderProxy {
     create_generic_embedder_proxy::<EmbedderMsg>()
 }
 
 pub fn create_generic_embedder_proxy<T>() -> GenericEmbedderProxy<T> {
-    if !async_runtime_initialized() {
-        let _init = ASYNC_RUNTIME.clone();
-    }
+    ensure_async_runtime();
     let (sender, _) = unbounded();
     let event_loop_waker = || {
         struct DummyEventLoopWaker {}
@@ -88,9 +94,7 @@ where
         + Sync
         + 'static,
 {
-    if !async_runtime_initialized() {
-        let _ = &*ASYNC_RUNTIME;
-    }
+    ensure_async_runtime();
     let handler = Arc::new(handler);
 
     let listener = StdTcpListener::bind("0.0.0.0:0").unwrap();
@@ -176,9 +180,7 @@ where
         + Sync
         + 'static,
 {
-    if !async_runtime_initialized() {
-        let _ = &*ASYNC_RUNTIME;
-    }
+    ensure_async_runtime();
     let handler = Arc::new(handler);
     let listener = StdTcpListener::bind("[::0]:0").unwrap();
     listener.set_nonblocking(true).unwrap();
