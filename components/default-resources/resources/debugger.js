@@ -422,6 +422,17 @@ function getPreview(obj, depth) {
     return undefined;
 }
 
+// The names of the parameters of a function logged to the console. The global it was logged in
+// need not be a debuggee, and the function may come from another global, hence the unwrap().
+addEventListener("parameterNames", event => {
+    const global = dbg.makeGlobalObjectReference(event.global);
+    const names = global.makeDebuggeeValue(event.functionObject).unwrap()?.parameterNames;
+    if (names !== undefined) {
+        // A destructuring pattern has no name, and is undefined here.
+        parameterNamesResult(event, names.map(name => name ?? null));
+    }
+});
+
 // Evaluate some javascript code in the global context of the debuggee
 // See executeInGlobal() at <https://firefox-source-docs.mozilla.org/devtools-user/debugger-api/debugger.object/index.html#function-properties-of-the-debugger-object-prototype>
 addEventListener("eval", event => {

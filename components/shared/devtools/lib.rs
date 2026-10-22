@@ -179,7 +179,8 @@ pub struct ObjectPreview {
 pub struct FunctionPreview {
     pub name: Option<String>,
     pub display_name: Option<String>,
-    pub parameter_names: Vec<String>,
+    /// None for a parameter that is a destructuring pattern.
+    pub parameter_names: Vec<Option<String>>,
     pub is_async: Option<bool>,
     pub is_generator: Option<bool>,
 }

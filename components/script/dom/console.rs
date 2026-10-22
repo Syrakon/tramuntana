@@ -36,6 +36,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
+use crate::event_loop::script_thread::ScriptThread;
 
 /// The maximum object depth logged by console methods.
 const MAX_LOG_DEPTH: usize = 10;
@@ -478,9 +479,16 @@ fn console_object_from_handle_value(
             let display_name = ptr::NonNull::new(*display_name)
                 .map(|display_name| unsafe { jsstr_to_string(cx, display_name) });
 
-            // TODO: We should get the actual argument names from the function
-            // It's not trivial since we can't access the debugger API here
-            let parameter_names = (0..arity).map(|i| format!("<arg{i}>")).collect();
+            // Only the Debugger API can tell the names of the parameters, and the debugger's
+            // global that is reachable from here is a script thread's. In a worker, or with no
+            // devtools server to send the message to, the parameters keep placeholder names.
+            let parameter_names = GlobalScope::current()
+                .filter(|global| global.devtools_chan().is_some())
+                .zip(ScriptThread::debugger_global())
+                .and_then(|(global, debugger_global)| {
+                    debugger_global.fire_parameter_names(cx, &global, object.handle())
+                })
+                .unwrap_or_else(|| (0..arity).map(|i| Some(format!("<arg{i}>"))).collect());
 
             let function = FunctionPreview {
                 name,

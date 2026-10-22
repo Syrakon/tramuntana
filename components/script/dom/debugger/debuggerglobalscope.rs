@@ -14,6 +14,7 @@ use dom_struct::dom_struct;
 use embedder_traits::ScriptToEmbedderChan;
 use embedder_traits::resources::{self, Resource};
 use js::context::JSContext;
+use js::rust::HandleObject;
 use js::rust::wrappers2::JS_DefineDebuggerObject;
 use net_traits::ResourceThreads;
 use profile_traits::{mem, time};
@@ -44,6 +45,7 @@ use crate::dom::debugger::debuggerclearbreakpointevent::DebuggerClearBreakpointE
 use crate::dom::debugger::debuggerframeevent::DebuggerFrameEvent;
 use crate::dom::debugger::debuggergetenvironmentevent::DebuggerGetEnvironmentEvent;
 use crate::dom::debugger::debuggerinterruptevent::DebuggerInterruptEvent;
+use crate::dom::debugger::debuggerparameternamesevent::DebuggerParameterNamesEvent;
 use crate::dom::debugger::debuggerresumeevent::DebuggerResumeEvent;
 use crate::dom::debugger::debuggersetbreakpointevent::DebuggerSetBreakpointEvent;
 use crate::dom::debugger::debuggerunblackboxevent::DebuggerUnblackboxEvent;
@@ -71,6 +73,8 @@ pub(crate) struct DebuggerGlobalScope {
         RefCell<Option<GenericSender<Vec<devtools_traits::RecommendedBreakpointLocation>>>>,
     #[no_trace]
     get_source_text_result_sender: RefCell<Option<GenericSender<Option<String>>>>,
+    /// Set by debugger.js while `fire_parameter_names` waits for it.
+    parameter_names_result: RefCell<Option<Vec<Option<String>>>>,
     #[no_trace]
     eval_result_sender: RefCell<Option<GenericSender<EvaluateJSReply>>>,
     #[no_trace]
@@ -127,6 +131,7 @@ impl DebuggerGlobalScope {
             devtools_to_script_sender,
             get_possible_breakpoints_result_sender: RefCell::new(None),
             get_source_text_result_sender: RefCell::new(None),
+            parameter_names_result: RefCell::new(None),
             get_list_frame_result_sender: RefCell::new(None),
             get_environment_result_sender: RefCell::new(None),
             eval_result_sender: RefCell::new(None),
@@ -299,6 +304,29 @@ impl DebuggerGlobalScope {
         if !event.fire(cx, self.upcast()) {
             warn!("getSourceText event was cancelled");
         }
+    }
+
+    /// Asks debugger.js for the names of the parameters of a function logged to the console in
+    /// `global`, which only the Debugger API can tell. None if debugger.js cannot tell either,
+    /// such as for a function that is not a script function.
+    pub(crate) fn fire_parameter_names(
+        &self,
+        cx: &mut JSContext,
+        global: &GlobalScope,
+        function: HandleObject,
+    ) -> Option<Vec<Option<String>>> {
+        let mut realm = enter_auto_realm(cx, self);
+        let cx = &mut realm.current_realm();
+        let event = DomRoot::upcast::<Event>(DebuggerParameterNamesEvent::new(
+            cx,
+            self.upcast(),
+            global,
+            function,
+        ));
+        if !event.fire(cx, self.upcast()) {
+            warn!("parameterNames event was cancelled");
+        }
+        self.parameter_names_result.take()
     }
 
     pub(crate) fn fire_set_breakpoint(
@@ -577,6 +605,19 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
         if let Err(error) = sender.send(text.map(|text| text.to_string())) {
             warn!("Failed to send source text to devtools server: {error:?}");
         }
+    }
+
+    fn ParameterNamesResult(
+        &self,
+        _event: &DebuggerParameterNamesEvent,
+        names: Vec<Option<DOMString>>,
+    ) {
+        *self.parameter_names_result.borrow_mut() = Some(
+            names
+                .into_iter()
+                .map(|name| name.map(|name| name.to_string()))
+                .collect(),
+        );
     }
 
     fn GetPossibleBreakpointsResult(

@@ -71,7 +71,8 @@ pub struct FunctionPreview {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    pub parameter_names: Vec<String>,
+    /// None for a parameter that is a destructuring pattern.
+    pub parameter_names: Vec<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_async: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

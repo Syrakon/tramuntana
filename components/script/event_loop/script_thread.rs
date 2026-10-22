@@ -722,6 +722,14 @@ impl ScriptThread {
         with_script_thread(|script_thread| script_thread.documents.borrow().find_document(id))
     }
 
+    /// The global that runs debugger.js for the windows of this thread, if this is a script
+    /// thread.
+    pub(crate) fn debugger_global() -> Option<DomRoot<DebuggerGlobalScope>> {
+        with_script_thread(|script_thread| {
+            Some(DomRoot::from_ref(&*script_thread.debugger_global))
+        })
+    }
+
     /// Creates a guard that sets user_is_interacting to true and returns the
     /// state of user_is_interacting on drop of the guard.
     /// Notice that you need to use `let _guard = ...` as `let _ = ...` is not enough

@@ -10,7 +10,6 @@
 from concurrent.futures import Future
 from queue import Queue
 
-import pytest
 from geckordp.actors.events import Events
 from geckordp.actors.resources import Resources
 from geckordp.actors.web_console import WebConsoleActor
@@ -193,7 +192,6 @@ class TestConsoleTab:
         preview = function["preview"]
         assert preview["kind"] == "Object"
 
-    @pytest.mark.xfail
     def test_console_log_function_arguments(self, run_servoshell):
         script_tag = (
             "<script>function test_arguments(a, b) { return a + b; }"
