@@ -407,6 +407,7 @@ impl WindowProxy {
                 iframe_element_referrer_policy: ReferrerPolicy::EmptyString,
             },
             frame_name: None,
+            parent_cookie_context: None,
         };
 
         with_script_thread(|script_thread| {

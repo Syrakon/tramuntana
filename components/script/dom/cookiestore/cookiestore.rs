@@ -210,6 +210,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 self.droppable.store_id,
                 creation_url,
                 Some(name),
+                self.global().cookie_context(),
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -292,6 +293,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 self.droppable.store_id,
                 final_url,
                 options.name.clone().map(|val| CookieStore::normalize(&val)),
+                self.global().cookie_context(),
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -334,6 +336,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                     self.droppable.store_id,
                     creation_url,
                     Some(name),
+                    self.global().cookie_context(),
                 ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -409,6 +412,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                     self.droppable.store_id,
                     final_url,
                     options.name.clone().map(|val| CookieStore::normalize(&val)),
+                    self.global().cookie_context(),
                 ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -465,6 +469,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 creation_url.clone(),
                 Serde(cookie.into_owned()),
                 NonHTTP,
+                self.global().cookie_context(),
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -514,6 +519,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 creation_url.clone(),
                 Serde(cookie.into_owned()),
                 NonHTTP,
+                self.global().cookie_context(),
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -552,6 +558,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 self.droppable.store_id,
                 global.creation_url(),
                 name.0,
+                self.global().cookie_context(),
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -590,6 +597,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 self.droppable.store_id,
                 global.creation_url(),
                 options.name.to_string(),
+                self.global().cookie_context(),
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");

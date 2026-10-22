@@ -347,6 +347,9 @@ pub struct Preferences {
     /// associated with multiple IP addresses, this timeout will be divided equally among
     /// each IP address.
     pub network_connection_timeout: u64,
+    /// Keep the cookies of a site embedded by another site apart from its own, one set per
+    /// top-level site embedding it, so that it cannot follow the user across sites.
+    pub network_cookie_partitioning_enabled: bool,
     pub network_enforce_tls_enabled: bool,
     pub network_enforce_tls_localhost: bool,
     pub network_enforce_tls_onion: bool,
@@ -578,6 +581,7 @@ impl Preferences {
             media_glvideo_enabled: false,
             media_testing_enabled: false,
             network_connection_timeout: 15,
+            network_cookie_partitioning_enabled: true,
             network_enforce_tls_enabled: false,
             network_enforce_tls_localhost: false,
             network_enforce_tls_onion: false,

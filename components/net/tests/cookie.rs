@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net_traits::CookieSource;
+use net_traits::cookie_partition::{CookieContext, CookiePartition};
 use servo_url::ServoUrl;
 use time::macros::datetime;
 
@@ -245,7 +246,7 @@ fn assert_ip_cookie_bucket_collision_eviction(ip_a: &str, ip_b: &str) {
         add_cookie_to_storage(&mut storage, &ip_b, &format!("b{i}=val{i}"));
     }
 
-    let cookies_a = storage.cookies_for_url(&ip_a, source).unwrap();
+    let cookies_a = storage.cookies_for_url(&ip_a, source, &CookiePartition::FirstParty).unwrap();
     assert_eq!(cookies_a.split("; ").count(), 3);
     for i in 1..=3 {
         assert!(cookies_a.contains(&format!("a{i}=val{i}")));
@@ -295,7 +296,7 @@ fn test_insecure_cookies_cannot_evict_secure_cookie() {
 
     let source = CookieSource::HTTP;
     assert_eq!(
-        storage.cookies_for_url(&secure_url, source).unwrap(),
+        storage.cookies_for_url(&secure_url, source, &CookiePartition::FirstParty).unwrap(),
         "foo=bar; foo2=bar"
     );
 
@@ -303,7 +304,7 @@ fn test_insecure_cookies_cannot_evict_secure_cookie() {
         ServoUrl::parse("https://home.example.org:8888/foo/cookie-parser-result?0001").unwrap();
     let source = CookieSource::HTTP;
     assert_eq!(
-        storage.cookies_for_url(&url, source).unwrap(),
+        storage.cookies_for_url(&url, source, &CookiePartition::FirstParty).unwrap(),
         "foo3=bar; foo4=value; foo=bar; foo2=bar"
     );
 
@@ -311,7 +312,7 @@ fn test_insecure_cookies_cannot_evict_secure_cookie() {
         ServoUrl::parse("https://home.example.org:8888/foo/bar/cookie-parser-result?0001").unwrap();
     let source = CookieSource::HTTP;
     assert_eq!(
-        storage.cookies_for_url(&url, source).unwrap(),
+        storage.cookies_for_url(&url, source, &CookiePartition::FirstParty).unwrap(),
         "foo4=bar; foo3=bar; foo4=value; foo=bar; foo2=bar"
     );
 }
@@ -339,13 +340,18 @@ fn test_secure_cookies_eviction() {
     add_cookie_to_storage(&mut storage, &url, "foo4=value; Path=/foo");
 
     let source = CookieSource::HTTP;
-    assert_eq!(storage.cookies_for_url(&url, source).unwrap(), "foo2=value");
+    assert_eq!(
+        storage
+            .cookies_for_url(&url, source, &CookiePartition::FirstParty)
+            .unwrap(),
+        "foo2=value"
+    );
 
     let url =
         ServoUrl::parse("https://home.example.org:8888/foo/cookie-parser-result?0001").unwrap();
     let source = CookieSource::HTTP;
     assert_eq!(
-        storage.cookies_for_url(&url, source).unwrap(),
+        storage.cookies_for_url(&url, source, &CookiePartition::FirstParty).unwrap(),
         "foo3=bar; foo4=value; foo2=value"
     );
 
@@ -353,7 +359,7 @@ fn test_secure_cookies_eviction() {
         ServoUrl::parse("https://home.example.org:8888/foo/bar/cookie-parser-result?0001").unwrap();
     let source = CookieSource::HTTP;
     assert_eq!(
-        storage.cookies_for_url(&url, source).unwrap(),
+        storage.cookies_for_url(&url, source, &CookiePartition::FirstParty).unwrap(),
         "foo4=bar; foo3=value; foo3=bar; foo4=value; foo2=value"
     );
 }
@@ -381,13 +387,18 @@ fn test_secure_cookies_eviction_non_http_source() {
     add_cookie_to_storage(&mut storage, &url, "foo4=value; Path=/foo");
 
     let source = CookieSource::HTTP;
-    assert_eq!(storage.cookies_for_url(&url, source).unwrap(), "foo2=value");
+    assert_eq!(
+        storage
+            .cookies_for_url(&url, source, &CookiePartition::FirstParty)
+            .unwrap(),
+        "foo2=value"
+    );
 
     let url =
         ServoUrl::parse("https://home.example.org:8888/foo/cookie-parser-result?0001").unwrap();
     let source = CookieSource::HTTP;
     assert_eq!(
-        storage.cookies_for_url(&url, source).unwrap(),
+        storage.cookies_for_url(&url, source, &CookiePartition::FirstParty).unwrap(),
         "foo3=bar; foo4=value; foo2=value"
     );
 
@@ -395,7 +406,7 @@ fn test_secure_cookies_eviction_non_http_source() {
         ServoUrl::parse("https://home.example.org:8888/foo/bar/cookie-parser-result?0001").unwrap();
     let source = CookieSource::HTTP;
     assert_eq!(
-        storage.cookies_for_url(&url, source).unwrap(),
+        storage.cookies_for_url(&url, source, &CookiePartition::FirstParty).unwrap(),
         "foo4=bar; foo3=value; foo3=bar; foo4=value; foo2=value"
     );
 }
@@ -418,7 +429,7 @@ fn add_retrieve_cookies(
     // Get cookies for the test location
     let url = ServoUrl::parse(final_location).unwrap();
     storage
-        .cookies_for_url(&url, source)
+        .cookies_for_url(&url, source, &CookiePartition::FirstParty)
         .unwrap_or(String::new())
 }
 
@@ -558,7 +569,10 @@ fn test_storage_rejecting_all_stays_empty() {
     let cookie = ServoCookie::new_wrapped(cookie, &url, CookieSource::NonHTTP).unwrap();
     storage.push(cookie, &url, CookieSource::NonHTTP);
 
-    assert_eq!(storage.cookies_for_url(&url, CookieSource::HTTP), None);
+    assert_eq!(
+        storage.cookies_for_url(&url, CookieSource::HTTP, &CookiePartition::FirstParty),
+        None
+    );
     assert!(storage.cookie_site_descriptors().is_empty());
 }
 
@@ -570,14 +584,14 @@ fn test_clear_storage_for_url_expires_matching_cookies() {
 
     add_cookie_to_storage(&mut storage, &url, "foo=bar");
     assert_eq!(
-        storage.cookies_for_url(&url, source).as_deref(),
+        storage.cookies_for_url(&url, source, &CookiePartition::FirstParty).as_deref(),
         Some("foo=bar")
     );
 
     storage.clear_storage(Some(&url));
 
     storage.remove_expired_cookies_for_url(&url);
-    assert_eq!(storage.cookies_for_url(&url, source), None);
+    assert_eq!(storage.cookies_for_url(&url, source, &CookiePartition::FirstParty), None);
 }
 
 #[test]
@@ -593,8 +607,8 @@ fn test_clear_storage_without_url_clears_everything() {
     storage.clear_storage(None);
 
     assert!(storage.cookie_site_descriptors().is_empty());
-    assert_eq!(storage.cookies_for_url(&url, source), None);
-    assert_eq!(storage.cookies_for_url(&other_url, source), None);
+    assert_eq!(storage.cookies_for_url(&url, source, &CookiePartition::FirstParty), None);
+    assert_eq!(storage.cookies_for_url(&other_url, source, &CookiePartition::FirstParty), None);
 }
 
 #[test]
@@ -606,11 +620,11 @@ fn test_delete_cookie_with_name_expires_only_matching_cookie() {
     add_cookie_to_storage(&mut storage, &url, "foo=bar");
     add_cookie_to_storage(&mut storage, &url, "baz=qux");
 
-    storage.delete_cookie_with_name(&url, "foo".to_owned());
+    storage.delete_cookie_with_name(&url, "foo".to_owned(), &CookiePartition::FirstParty);
 
     storage.remove_expired_cookies_for_url(&url);
     assert_eq!(
-        storage.cookies_for_url(&url, source).as_deref(),
+        storage.cookies_for_url(&url, source, &CookiePartition::FirstParty).as_deref(),
         Some("baz=qux")
     );
 }
@@ -625,12 +639,167 @@ fn test_delete_cookie_with_name_does_not_affect_other_domains() {
     add_cookie_to_storage(&mut storage, &url, "foo=bar");
     add_cookie_to_storage(&mut storage, &other_url, "foo=bar");
 
-    storage.delete_cookie_with_name(&url, "foo".to_owned());
+    storage.delete_cookie_with_name(&url, "foo".to_owned(), &CookiePartition::FirstParty);
 
     storage.remove_all_expired_cookies();
-    assert_eq!(storage.cookies_for_url(&url, source), None);
+    assert_eq!(storage.cookies_for_url(&url, source, &CookiePartition::FirstParty), None);
     assert_eq!(
-        storage.cookies_for_url(&other_url, source).as_deref(),
+        storage.cookies_for_url(&other_url, source, &CookiePartition::FirstParty).as_deref(),
         Some("foo=bar")
+    );
+}
+
+/// Stores `cookie` for `url` in `partition`, as the network does for a response.
+fn add_cookie_in_partition(
+    storage: &mut CookieStorage,
+    url: &ServoUrl,
+    cookie: &str,
+    partition: &CookiePartition,
+) {
+    let source = CookieSource::HTTP;
+    let mut cookie = ServoCookie::from_cookie_string(cookie, url, source).unwrap();
+    cookie.top_level_site = partition.top_level_site().map(str::to_owned);
+    storage.push(cookie, url, source);
+}
+
+fn context(top_level: &str, has_cross_site_ancestor: bool) -> CookieContext {
+    CookieContext {
+        top_level_origin: ServoUrl::parse(top_level).unwrap().origin(),
+        has_cross_site_ancestor,
+    }
+}
+
+#[test]
+fn test_cookie_partition_for_url() {
+    let url = ServoUrl::parse("https://www.tracker.com/pixel").unwrap();
+    let embedded_in_news = CookiePartition::Embedded("https://news.com".to_owned());
+
+    assert_eq!(CookiePartition::for_url(&url, None), CookiePartition::FirstParty);
+    assert_eq!(
+        CookiePartition::for_url(&url, Some(&context("https://tracker.com/", false))),
+        CookiePartition::FirstParty
+    );
+    assert_eq!(
+        CookiePartition::for_url(&url, Some(&context("https://www.news.com:8443/", false))),
+        embedded_in_news
+    );
+    // A tracker page framed by news.com that frames the tracker again.
+    assert_eq!(
+        CookiePartition::for_url(&url, Some(&context("https://tracker.com/", true))),
+        CookiePartition::Embedded("https://tracker.com".to_owned())
+    );
+    // Another scheme is another site.
+    assert_eq!(
+        CookiePartition::for_url(&url, Some(&context("http://tracker.com/", false))),
+        CookiePartition::Embedded("http://tracker.com".to_owned())
+    );
+    assert_eq!(
+        CookiePartition::for_url(&url, Some(&context("data:text/html,", false))),
+        CookiePartition::Refused
+    );
+}
+
+#[test]
+fn test_cookie_context_of_document() {
+    let news = ServoUrl::parse("https://news.com/").unwrap().origin();
+    let tracker = ServoUrl::parse("https://tracker.com/").unwrap().origin();
+
+    let top = CookieContext::of_document(&news, None);
+    assert_eq!(top, context("https://news.com/", false));
+    let same_site_frame = CookieContext::of_document(&news, Some(&top));
+    assert_eq!(same_site_frame, context("https://news.com/", false));
+    let tracker_frame = CookieContext::of_document(&tracker, Some(&top));
+    assert_eq!(tracker_frame, context("https://news.com/", true));
+    let news_in_tracker_frame = CookieContext::of_document(&news, Some(&tracker_frame));
+    assert_eq!(news_in_tracker_frame, context("https://news.com/", true));
+}
+
+#[test]
+fn test_partitions_keep_cookies_apart() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("https://tracker.com/").unwrap();
+    let in_news = CookiePartition::Embedded("https://news.com".to_owned());
+    let in_shop = CookiePartition::Embedded("https://shop.com".to_owned());
+
+    add_cookie_in_partition(&mut storage, &url, "id=own", &CookiePartition::FirstParty);
+    add_cookie_in_partition(&mut storage, &url, "id=news", &in_news);
+
+    let cookies = |storage: &mut CookieStorage, partition| {
+        storage.cookies_for_url(&url, source, partition)
+    };
+    assert_eq!(cookies(&mut storage, &CookiePartition::FirstParty).as_deref(), Some("id=own"));
+    assert_eq!(cookies(&mut storage, &in_news).as_deref(), Some("id=news"));
+    assert_eq!(cookies(&mut storage, &in_shop), None);
+    assert_eq!(cookies(&mut storage, &CookiePartition::Refused), None);
+
+    // A cookie of the same name replaces only the one in its own partition.
+    add_cookie_in_partition(&mut storage, &url, "id=news2", &in_news);
+    assert_eq!(cookies(&mut storage, &CookiePartition::FirstParty).as_deref(), Some("id=own"));
+    assert_eq!(cookies(&mut storage, &in_news).as_deref(), Some("id=news2"));
+
+    storage.delete_cookie_with_name(&url, "id".to_owned(), &in_news);
+    storage.remove_expired_cookies_for_url(&url);
+    assert_eq!(cookies(&mut storage, &CookiePartition::FirstParty).as_deref(), Some("id=own"));
+    assert_eq!(cookies(&mut storage, &in_news), None);
+}
+
+#[test]
+fn test_partitioned_cookie_must_be_secure() {
+    let url = ServoUrl::parse("https://tracker.com/").unwrap();
+    let source = CookieSource::HTTP;
+    assert!(ServoCookie::from_cookie_string("id=1; Partitioned", &url, source).is_none());
+    assert!(ServoCookie::from_cookie_string("id=1; Secure; Partitioned", &url, source).is_some());
+}
+
+#[test]
+fn test_cookie_limit_is_per_partition() {
+    let mut storage = CookieStorage::new(2);
+    let source = CookieSource::HTTP;
+    let url = ServoUrl::parse("https://tracker.com/").unwrap();
+    let in_news = CookiePartition::Embedded("https://news.com".to_owned());
+
+    add_cookie_in_partition(&mut storage, &url, "a=1", &CookiePartition::FirstParty);
+    add_cookie_in_partition(&mut storage, &url, "b=1", &CookiePartition::FirstParty);
+    for name in ["c", "d", "e"] {
+        add_cookie_in_partition(&mut storage, &url, &format!("{name}=1"), &in_news);
+    }
+
+    assert_eq!(
+        storage
+            .cookies_for_url(&url, source, &CookiePartition::FirstParty)
+            .as_deref(),
+        Some("a=1; b=1")
+    );
+    assert_eq!(
+        storage.cookies_for_url(&url, source, &in_news).as_deref(),
+        Some("d=1; e=1")
+    );
+}
+
+#[test]
+fn test_delete_cookies_for_sites_includes_their_partitions() {
+    let mut storage = CookieStorage::new(5);
+    let source = CookieSource::HTTP;
+    let tracker = ServoUrl::parse("https://tracker.com/").unwrap();
+    let news = ServoUrl::parse("https://news.com/").unwrap();
+    let in_news = CookiePartition::Embedded("https://news.com".to_owned());
+    let in_shop = CookiePartition::Embedded("https://shop.com".to_owned());
+
+    add_cookie_in_partition(&mut storage, &news, "own=1", &CookiePartition::FirstParty);
+    add_cookie_in_partition(&mut storage, &tracker, "id=news", &in_news);
+    add_cookie_in_partition(&mut storage, &tracker, "id=shop", &in_shop);
+
+    storage.delete_cookies_for_sites(&vec!["news.com".to_owned()]);
+    storage.remove_all_expired_cookies();
+
+    assert_eq!(
+        storage.cookies_for_url(&news, source, &CookiePartition::FirstParty),
+        None
+    );
+    assert_eq!(storage.cookies_for_url(&tracker, source, &in_news), None);
+    assert_eq!(
+        storage.cookies_for_url(&tracker, source, &in_shop).as_deref(),
+        Some("id=shop")
     );
 }

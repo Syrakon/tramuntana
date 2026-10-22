@@ -62,6 +62,7 @@ use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, SetWindowProxyClass};
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
+use net_traits::cookie_partition::CookieContext;
 use net_traits::image_cache::{ImageCacheFactory, ImageCacheResponseMessage};
 use net_traits::pub_domains::{is_same_site, registered_domain_name};
 use net_traits::request::{Referrer, RequestId};
@@ -3549,6 +3550,16 @@ impl ScriptThread {
         // <https://html.spec.whatwg.org/multipage/#initialise-the-document-object>
         // Step 3. Let creationURL be navigationParams's response's URL.
         let creation_url = final_url.clone();
+        // A document sandboxed into an opaque origin keeps the cookies of the site it comes
+        // from, as the network sees its requests.
+        let cookie_origin = match final_url.origin() {
+            url_origin if !origin.is_tuple() && url_origin.is_tuple() => url_origin,
+            _ => origin.immutable().clone(),
+        };
+        let cookie_context = CookieContext::of_document(
+            &cookie_origin,
+            incomplete.parent_cookie_context.as_ref(),
+        );
         let window = match window_for_replacement(
             &self.window_proxies,
             incomplete.browsing_context_id,
@@ -3613,6 +3624,9 @@ impl ScriptThread {
                 )
             },
         };
+        window
+            .as_global_scope()
+            .set_cookie_context(Some(cookie_context));
         // The window becomes a debuggee only while a devtools client is connected, see
         // `DevtoolScriptControlMsg::WantsLiveNotifications`: a debugger watching a page costs
         // it memory whether anyone looks or not.

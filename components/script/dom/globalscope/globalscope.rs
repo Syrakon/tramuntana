@@ -37,6 +37,7 @@ use js::rust::{
 };
 use js::{JSCLASS_IS_DOMJSCLASS, JSCLASS_IS_GLOBAL};
 use net_traits::blob_url_store::BlobBuf;
+use net_traits::cookie_partition::CookieContext;
 use net_traits::filemanager_thread::{
     FileManagerResult, FileManagerThreadMsg, ReadFileProgress, RelativePos,
 };
@@ -254,6 +255,12 @@ pub(crate) struct GlobalScope {
     #[no_trace]
     top_level_creation_url: DomRefCell<Option<ServoUrl>>,
 
+    /// Where the cookies of this global are kept: for a window, its top-level origin and
+    /// whether a frame embedding it is of another site; for a worker, those of the document
+    /// that started it. `None` for the globals of service workers and worklets.
+    #[no_trace]
+    cookie_context: DomRefCell<Option<CookieContext>>,
+
     /// A map for storing the previous permission state read results.
     permission_state_invocation_results: DomRefCell<HashMap<PermissionName, PermissionState>>,
 
@@ -433,6 +440,7 @@ impl GlobalScope {
             storage_threads,
             creation_url: DomRefCell::new(creation_url),
             top_level_creation_url: DomRefCell::new(top_level_creation_url),
+            cookie_context: Default::default(),
             permission_state_invocation_results: Default::default(),
             list_auto_close_worker: Default::default(),
             event_source_tracker: DOMTracker::new(),
@@ -2312,6 +2320,15 @@ impl GlobalScope {
         *self.top_level_creation_url.borrow_mut() = Some(url);
     }
 
+    /// Where the cookies of this global are kept, see [`CookieContext`].
+    pub(crate) fn cookie_context(&self) -> Option<CookieContext> {
+        self.cookie_context.borrow().clone()
+    }
+
+    pub(crate) fn set_cookie_context(&self, cookie_context: Option<CookieContext>) {
+        *self.cookie_context.borrow_mut() = cookie_context;
+    }
+
     pub(crate) fn image_cache(&self) -> Arc<dyn ImageCache> {
         if let Some(window) = self.downcast::<Window>() {
             return window.image_cache();
@@ -2376,6 +2393,7 @@ impl GlobalScope {
             is_nested_browsing_context: false,
             insecure_requests_policy: self.insecure_requests_policy(),
             has_trustworthy_ancestor_origin: false,
+            cookie_context: self.cookie_context(),
         }
     }
 

@@ -309,6 +309,7 @@ impl HTMLIFrameElement {
                     user_content_manager_id: None,
                     target_snapshot_params,
                     frame_name: self.frozen_name.borrow().clone(),
+                    parent_cookie_context: window.as_global_scope().cookie_context(),
                 };
 
                 self.pipeline_id.set(Some(new_pipeline_id));

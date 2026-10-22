@@ -15,6 +15,7 @@ use cookie::Cookie;
 use itertools::Itertools;
 use log::info;
 use malloc_size_of_derive::MallocSizeOf;
+use net_traits::cookie_partition::CookiePartition;
 use net_traits::pub_domains::reg_suffix;
 use net_traits::{CookieSource, SiteDescriptor};
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,9 @@ impl CookieStorage {
             let new_path = cookie.cookie.path().as_ref().unwrap().to_owned();
 
             let any_overlapping = cookies.iter().any(|c| {
+                if c.top_level_site != cookie.top_level_site {
+                    return false;
+                }
                 let existing_domain = c.cookie.domain().as_ref().unwrap().to_owned();
                 let existing_path = c.cookie.path().as_ref().unwrap().to_owned();
 
@@ -90,7 +94,8 @@ impl CookieStorage {
 
         // Step 11.1
         let position = cookies.iter().position(|c| {
-            c.cookie.domain() == cookie.cookie.domain() &&
+            c.top_level_site == cookie.top_level_site &&
+                c.cookie.domain() == cookie.cookie.domain() &&
                 c.cookie.path() == cookie.cookie.path() &&
                 c.cookie.name() == cookie.cookie.name()
         });
@@ -129,6 +134,18 @@ impl CookieStorage {
                 }
             }
         }
+        // The cookies other sites have when embedded by these are theirs too.
+        self.cookies_map
+            .values_mut()
+            .flat_map(|cookies| cookies.iter_mut())
+            .filter(|cookie| {
+                cookie
+                    .top_level_site
+                    .as_deref()
+                    .and_then(|top_level_site| top_level_site.split_once("://"))
+                    .is_some_and(|(_, host)| sites.iter().any(|site| site == host))
+            })
+            .for_each(|cookie| cookie.set_expiry_time_in_past());
     }
 
     pub fn clear_session_cookies(&mut self) {
@@ -152,11 +169,16 @@ impl CookieStorage {
         }
     }
 
-    pub fn delete_cookie_with_name(&mut self, url: &ServoUrl, name: String) {
+    pub fn delete_cookie_with_name(
+        &mut self,
+        url: &ServoUrl,
+        name: String,
+        partition: &CookiePartition,
+    ) {
         let domain = reg_host(url.host_str().unwrap_or(""));
         if let Some(cookies) = self.cookies_map.get_mut(&domain) {
             for cookie in cookies.iter_mut() {
-                if cookie.cookie.name() == name {
+                if cookie.cookie.name() == name && is_in_partition(cookie, partition) {
                     cookie.set_expiry_time_in_past();
                 }
             }
@@ -190,14 +212,27 @@ impl CookieStorage {
         let domain = reg_host(cookie.cookie.domain().as_ref().unwrap_or(&""));
         let cookies = self.cookies_map.entry(domain).or_default();
 
-        if cookies.len() == self.max_per_host {
-            let old_len = cookies.len();
+        // The limit is per partition, so that a site embedded by many others cannot have its
+        // own cookies evicted by those it has elsewhere.
+        let top_level_site = cookie.top_level_site.as_deref();
+        let in_partition = |cookies: &Vec<ServoCookie>| {
+            cookies
+                .iter()
+                .filter(|c| c.top_level_site.as_deref() == top_level_site)
+                .count()
+        };
+        if in_partition(cookies) >= self.max_per_host {
+            let old_len = in_partition(cookies);
             cookies.retain(|c| !is_cookie_expired(c));
-            let new_len = cookies.len();
+            let new_len = in_partition(cookies);
 
             // https://www.ietf.org/id/draft-ietf-httpbis-cookie-alone-01.txt
             if new_len == old_len &&
-                !evict_one_cookie(cookie.cookie.secure().unwrap_or(false), cookies)
+                !evict_one_cookie(
+                    cookie.cookie.secure().unwrap_or(false),
+                    top_level_site,
+                    cookies,
+                )
             {
                 return;
             }
@@ -235,9 +270,14 @@ impl CookieStorage {
     }
 
     // http://tools.ietf.org/html/rfc6265#section-5.4
-    pub fn cookies_for_url(&mut self, url: &ServoUrl, source: CookieSource) -> Option<String> {
+    pub fn cookies_for_url(
+        &mut self,
+        url: &ServoUrl,
+        source: CookieSource,
+        partition: &CookiePartition,
+    ) -> Option<String> {
         // Let cookie-list be the set of cookies from the cookie store
-        let cookie_list = self.cookies_data_for_url(url, source);
+        let cookie_list = self.cookies_data_for_url(url, source, partition);
 
         let reducer = |acc: String, cookie: Cookie<'static>| -> String {
             // Serialize the cookie-list into a cookie-string by processing each cookie in the cookie-list in order:
@@ -265,9 +305,14 @@ impl CookieStorage {
     }
 
     /// <https://cookiestore.spec.whatwg.org/#query-cookies>
-    pub fn query_cookies(&mut self, url: &ServoUrl, name: Option<String>) -> Vec<Cookie<'static>> {
+    pub fn query_cookies(
+        &mut self,
+        url: &ServoUrl,
+        name: Option<String>,
+        partition: &CookiePartition,
+    ) -> Vec<Cookie<'static>> {
         // 1. Retrieve cookie-list given request-uri and "non-HTTP" source
-        let cookie_list = self.cookies_data_for_url(url, CookieSource::NonHTTP);
+        let cookie_list = self.cookies_data_for_url(url, CookieSource::NonHTTP, partition);
 
         // 3. For each cookie in cookie-list, run these steps:
         // 3.2. If name is given, then run these steps:
@@ -289,13 +334,14 @@ impl CookieStorage {
         &'a mut self,
         url: &'a ServoUrl,
         source: CookieSource,
+        partition: &'a CookiePartition,
     ) -> impl Iterator<Item = cookie::Cookie<'static>> + 'a {
         let domain = reg_host(url.host_str().unwrap_or(""));
         let cookies = self.cookies_map.entry(domain).or_default();
 
         cookies
             .iter_mut()
-            .filter(move |c| c.appropriate_for_url(url, source))
+            .filter(move |c| is_in_partition(c, partition) && c.appropriate_for_url(url, source))
             .sorted_by(|a: &&mut ServoCookie, b: &&mut ServoCookie| {
                 // The user agent SHOULD sort the cookie-list
                 CookieStorage::cookie_comparator(a, b)
@@ -332,13 +378,23 @@ fn reg_host(url: &str) -> String {
     reg_suffix(url).to_lowercase()
 }
 
+/// Whether `cookie` is one of those `partition` uses. A [`CookiePartition::Refused`] has none.
+fn is_in_partition(cookie: &ServoCookie, partition: &CookiePartition) -> bool {
+    *partition != CookiePartition::Refused &&
+        cookie.top_level_site.as_deref() == partition.top_level_site()
+}
+
 fn is_cookie_expired(cookie: &ServoCookie) -> bool {
     matches!(cookie.expiry_time, Some(date_time) if date_time <= SystemTime::now())
 }
 
-fn evict_one_cookie(is_secure_cookie: bool, cookies: &mut Vec<ServoCookie>) -> bool {
+fn evict_one_cookie(
+    is_secure_cookie: bool,
+    top_level_site: Option<&str>,
+    cookies: &mut Vec<ServoCookie>,
+) -> bool {
     // Remove non-secure cookie with oldest access time
-    let oldest_accessed = get_oldest_accessed(false, cookies);
+    let oldest_accessed = get_oldest_accessed(false, top_level_site, cookies);
 
     if let Some((index, _)) = oldest_accessed {
         cookies.remove(index);
@@ -347,7 +403,7 @@ fn evict_one_cookie(is_secure_cookie: bool, cookies: &mut Vec<ServoCookie>) -> b
         if !is_secure_cookie {
             return false;
         }
-        let oldest_accessed = get_oldest_accessed(true, cookies);
+        let oldest_accessed = get_oldest_accessed(true, top_level_site, cookies);
         if let Some((index, _)) = oldest_accessed {
             cookies.remove(index);
         }
@@ -355,13 +411,17 @@ fn evict_one_cookie(is_secure_cookie: bool, cookies: &mut Vec<ServoCookie>) -> b
     true
 }
 
+/// The oldest accessed of `cookies` that is secure or not as asked, and in the partition of
+/// `top_level_site`.
 fn get_oldest_accessed(
     is_secure_cookie: bool,
+    top_level_site: Option<&str>,
     cookies: &mut [ServoCookie],
 ) -> Option<(usize, SystemTime)> {
     let mut oldest_accessed = None;
     for (i, c) in cookies.iter().enumerate() {
         if (c.cookie.secure().unwrap_or(false) == is_secure_cookie) &&
+            c.top_level_site.as_deref() == top_level_site &&
             oldest_accessed
                 .as_ref()
                 .is_none_or(|(_, current_oldest_time)| c.last_access < *current_oldest_time)

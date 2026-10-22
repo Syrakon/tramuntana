@@ -41,6 +41,7 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CookieOperationId(pub u64);
 
+use crate::cookie_partition::CookieContext;
 use crate::fetch::headers::determine_nosniff;
 use crate::filemanager_thread::FileManagerThreadMsg;
 use crate::http_status::HttpStatus;
@@ -49,6 +50,7 @@ use crate::request::{Request, RequestBuilder};
 use crate::response::{Response, ResponseInit};
 
 pub mod blob_url_store;
+pub mod cookie_partition;
 pub mod filemanager_thread;
 pub mod http_status;
 pub mod image_cache;
@@ -792,16 +794,29 @@ pub enum CoreResourceMsg {
         CookieSource,
         Option<GenericSender<()>>,
     ),
-    /// Store a set of cookies for a given originating URL
-    SetCookiesForUrl(ServoUrl, Vec<Serde<Cookie<'static>>>, CookieSource),
+    /// Store a set of cookies for a given originating URL, from a document whose cookies are
+    /// in the given context.
+    SetCookiesForUrl(
+        ServoUrl,
+        Vec<Serde<Cookie<'static>>>,
+        CookieSource,
+        Option<CookieContext>,
+    ),
     SetCookieForUrlAsync(
         CookieStoreId,
         ServoUrl,
         Serde<Cookie<'static>>,
         CookieSource,
+        Option<CookieContext>,
     ),
-    /// Retrieve the stored cookies as a header string for a given URL.
-    GetCookieStringForUrl(ServoUrl, GenericSender<Option<String>>, CookieSource),
+    /// Retrieve the stored cookies as a header string for a given URL, for a document whose
+    /// cookies are in the given context.
+    GetCookieStringForUrl(
+        ServoUrl,
+        GenericSender<Option<String>>,
+        CookieSource,
+        Option<CookieContext>,
+    ),
     /// Retrieve the stored cookies as a vector for the given URL.
     /// The response is sent via the provided sender.
     GetCookiesForUrl(
@@ -824,8 +839,8 @@ pub enum CoreResourceMsg {
     EmbedderClearCookies(CookieOperationId),
     /// Clear session cookies on behalf of the embedder. The response is sent via NetToEmbedderMsg.
     EmbedderClearSessionCookies(CookieOperationId),
-    GetCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>),
-    GetAllCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>),
+    GetCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>, Option<CookieContext>),
+    GetAllCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>, Option<CookieContext>),
     DeleteCookiesForSites(Vec<String>, GenericSender<()>),
     /// This currently is used by unit tests and WebDriver only.
     /// When url is `None`, this clears cookies across all origins.
@@ -833,7 +848,7 @@ pub enum CoreResourceMsg {
     /// Delete all session cookies (cookies without an expiry or max-age).
     DeleteSessionCookies(GenericSender<()>),
     DeleteCookie(ServoUrl, String),
-    DeleteCookieAsync(CookieStoreId, ServoUrl, String),
+    DeleteCookieAsync(CookieStoreId, ServoUrl, String, Option<CookieContext>),
     NewCookieListener(
         CookieStoreId,
         GenericCallback<CookieAsyncResponse>,

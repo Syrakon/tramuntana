@@ -456,6 +456,7 @@ impl DedicatedWorkerGlobalScope {
         let referrer = current_global.get_referrer();
         let parent = current_global.runtime_handle();
         let current_global_ancestor_trustworthy = current_global.has_trustworthy_ancestor_origin();
+        let cookie_context = current_global.cookie_context();
         let is_secure_context = current_global.is_secure_context();
         let is_nested_browsing_context = current_global.is_nested_browsing_context();
 
@@ -486,6 +487,7 @@ impl DedicatedWorkerGlobalScope {
                     is_nested_browsing_context,
                     insecure_requests_policy,
                     has_trustworthy_ancestor_origin: current_global_ancestor_trustworthy,
+                    cookie_context: cookie_context.clone(),
                 };
 
                 let event_loop_sender = ScriptEventLoopSender::DedicatedWorker {
@@ -588,6 +590,7 @@ impl DedicatedWorkerGlobalScope {
                 }
                 let scope = global.upcast::<WorkerGlobalScope>();
                 let global_scope = global.upcast::<GlobalScope>();
+                global_scope.set_cookie_context(cookie_context);
 
                 // Step 12. Obtain script by switching on options["type"]:
                 {

@@ -27,6 +27,7 @@ use js::jsapi::{GCReason, JSGCParamKey, JSTracer};
 use js::realm::CurrentRealm;
 use js::rust::wrappers2::{JS_GC, JS_GetGCParameter};
 use malloc_size_of::malloc_size_of_is_0;
+use net_traits::cookie_partition::CookieContext;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{Destination, Origin, PreloadedResources, RequestClient};
 use rustc_hash::FxHashMap;
@@ -203,6 +204,7 @@ impl WorkletMethods<crate::DomTypeHolder> for Worklet {
                 global_scope.api_base_url(),
                 module_url_record,
                 global_scope.policy_container(),
+                global_scope.cookie_context(),
                 options.credentials,
                 pending_tasks_struct,
                 &promise,
@@ -263,6 +265,7 @@ pub trait WorkletThreadPool: JSTraceable {
         base_url: ServoUrl,
         script_url: ServoUrl,
         policy_container: Arc<PolicyContainer>,
+        cookie_context: Option<CookieContext>,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: &RootedPromise,
@@ -396,6 +399,7 @@ impl WorkletThreadPool for StatelessWorkletThreadPool {
         base_url: ServoUrl,
         script_url: ServoUrl,
         policy_container: Arc<PolicyContainer>,
+        cookie_context: Option<CookieContext>,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: &RootedPromise,
@@ -415,6 +419,7 @@ impl WorkletThreadPool for StatelessWorkletThreadPool {
                 base_url: base_url.clone(),
                 script_url: script_url.clone(),
                 policy_container: policy_container.clone(),
+                cookie_context: cookie_context.clone(),
                 credentials,
                 pending_tasks_struct: pending_tasks_struct.clone(),
                 promise: TrustedPromise::from(promise),
@@ -472,6 +477,7 @@ pub(crate) enum WorkletControl {
         base_url: ServoUrl,
         script_url: ServoUrl,
         policy_container: Arc<PolicyContainer>,
+        cookie_context: Option<CookieContext>,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: TrustedPromise,
@@ -756,6 +762,7 @@ impl WorkletThread {
         origin: ImmutableOrigin,
         script_url: ServoUrl,
         policy_container: Arc<PolicyContainer>,
+        cookie_context: Option<CookieContext>,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: TrustedPromise,
@@ -776,6 +783,7 @@ impl WorkletThread {
             is_nested_browsing_context: global.is_nested_browsing_context(),
             insecure_requests_policy: global.insecure_requests_policy(),
             has_trustworthy_ancestor_origin: global.has_trustworthy_ancestor_origin(),
+            cookie_context,
         };
 
         // Step 2. If moduleResponsesMap[requestURL] is "fetching", wait in parallel until that entry's value changes, then queue a task on the networking task source to proceed with running the following steps.
@@ -904,6 +912,7 @@ impl WorkletThread {
                 base_url,
                 script_url,
                 policy_container,
+                cookie_context,
                 credentials,
                 pending_tasks_struct,
                 promise,
@@ -926,6 +935,7 @@ impl WorkletThread {
                     origin,
                     script_url,
                     policy_container,
+                    cookie_context,
                     credentials,
                     pending_tasks_struct,
                     promise,

@@ -66,6 +66,7 @@ fn cookie_string(resource_thread: &CoreResourceThread, url: &ServoUrl) -> Option
             url.clone(),
             sender,
             CookieSource::HTTP,
+            None,
         ))
         .unwrap();
     receiver.recv().unwrap()

@@ -16,6 +16,7 @@ use embedder_traits::{ViewportDetails, WebDriverLoadStatus};
 use http::header;
 use js::context::JSContext;
 use net_traits::blob_url_store::UrlWithBlobClaim;
+use net_traits::cookie_partition::CookieContext;
 use net_traits::request::{
     CredentialsMode, InsecureRequestsPolicy, Origin, PreloadedResources, RedirectMode,
     RequestBuilder, RequestClient, RequestMode,
@@ -185,6 +186,9 @@ pub(crate) struct InProgressLoad {
     pub(crate) target_snapshot_params: TargetSnapshotParams,
     /// Name of this iframe, if any
     pub(crate) frame_name: Option<String>,
+    /// The cookie context of the document embedding this one, `None` for a top-level one.
+    #[no_trace]
+    pub(crate) parent_cookie_context: Option<CookieContext>,
 }
 
 impl InProgressLoad {
@@ -215,6 +219,7 @@ impl InProgressLoad {
             user_content_manager_id: new_pipeline_info.user_content_manager_id,
             target_snapshot_params: new_pipeline_info.target_snapshot_params,
             frame_name: new_pipeline_info.frame_name,
+            parent_cookie_context: new_pipeline_info.parent_cookie_context,
         }
     }
 
@@ -243,6 +248,9 @@ impl InProgressLoad {
             is_nested_browsing_context: self.parent_info.is_some(),
             insecure_requests_policy,
             has_trustworthy_ancestor_origin: self.load_data.has_trustworthy_ancestor_origin,
+            // The cookies of a frame are those its site has where its parent is, whatever
+            // site a redirect takes it to.
+            cookie_context: self.parent_cookie_context.clone(),
         };
 
         let mut request_builder = RequestBuilder::new(

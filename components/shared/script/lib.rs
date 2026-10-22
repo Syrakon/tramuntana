@@ -29,6 +29,7 @@ use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
 use media::WindowGLContext;
 use net_traits::ResourceThreads;
+use net_traits::cookie_partition::CookieContext;
 use paint_api::{CrossProcessPaintApi, PinchZoomInfos};
 use pixels::PixelFormat;
 use profile_traits::mem;
@@ -98,6 +99,10 @@ pub struct NewPipelineInfo {
     pub target_snapshot_params: TargetSnapshotParams,
     /// Name of this iframe, if any
     pub frame_name: Option<String>,
+    /// The cookie context of the document embedding this pipeline, `None` for a top-level
+    /// one. The constellation works it out from the frame tree, not the process that asks for
+    /// the load.
+    pub parent_cookie_context: Option<CookieContext>,
 }
 
 /// When a pipeline is closed, should its browsing context be discarded too?

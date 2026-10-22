@@ -148,16 +148,16 @@ impl SiteLock {
             // Script only ever touches cookies as `document.cookie` or the Cookie Store API
             // do: the cookies of its own URL, without those hidden from script.
             CoreResourceMsg::SetCookieForUrl(url, _, source, _) |
-            CoreResourceMsg::SetCookiesForUrl(url, _, source) |
-            CoreResourceMsg::SetCookieForUrlAsync(_, url, _, source) |
-            CoreResourceMsg::GetCookieStringForUrl(url, _, source) |
+            CoreResourceMsg::SetCookiesForUrl(url, _, source, _) |
+            CoreResourceMsg::SetCookieForUrlAsync(_, url, _, source, _) |
+            CoreResourceMsg::GetCookieStringForUrl(url, _, source, _) |
             CoreResourceMsg::GetCookiesForUrl(url, _, source) => {
                 *source == CookieSource::NonHTTP && self.allows_url(url)
             },
-            CoreResourceMsg::GetCookieDataForUrlAsync(_, url, _) |
-            CoreResourceMsg::GetAllCookieDataForUrlAsync(_, url, _) |
+            CoreResourceMsg::GetCookieDataForUrlAsync(_, url, _, _) |
+            CoreResourceMsg::GetAllCookieDataForUrlAsync(_, url, _, _) |
             CoreResourceMsg::DeleteCookie(url, _) |
-            CoreResourceMsg::DeleteCookieAsync(_, url, _) |
+            CoreResourceMsg::DeleteCookieAsync(_, url, _, _) |
             CoreResourceMsg::NewCookieListener(_, _, url) => self.allows_url(url),
             CoreResourceMsg::RemoveCookieListener(_) => true,
             // A history state id is a namespace and a counter: whose it is depends on the

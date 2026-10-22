@@ -5,6 +5,7 @@
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net_traits::CookieSource;
+use net_traits::cookie_partition::CookiePartition;
 use servo_url::ServoUrl;
 
 fn run(set_location: &str, set_cookies: &[&str], final_location: &str) -> String {
@@ -22,7 +23,7 @@ fn run(set_location: &str, set_cookies: &[&str], final_location: &str) -> String
     // Get cookies for the test location
     let url = ServoUrl::parse(final_location).unwrap();
     storage
-        .cookies_for_url(&url, source)
+        .cookies_for_url(&url, source, &CookiePartition::FirstParty)
         .unwrap_or(String::new())
 }
 

@@ -35,6 +35,7 @@ use net::http_loader::{determine_requests_referrer, serialize_origin};
 use net::resource_thread::AuthCacheEntry;
 use net::test::DECODER_BUFFER_SIZE;
 use net_traits::blob_url_store::UrlWithBlobClaim;
+use net_traits::cookie_partition::CookiePartition;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
     CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
@@ -60,7 +61,8 @@ fn assert_cookie_for_domain(
 ) {
     let mut cookie_jar = cookie_jar.write();
     let url = ServoUrl::parse(&*domain).unwrap();
-    let cookies = cookie_jar.cookies_for_url(&url, CookieSource::HTTP);
+    let cookies =
+        cookie_jar.cookies_for_url(&url, CookieSource::HTTP, &CookiePartition::FirstParty);
     assert_eq!(cookies.as_ref().map(|c| &**c), cookie);
 }
 
@@ -919,7 +921,7 @@ fn test_cookie_set_with_httponly_should_not_be_available_using_getcookiesforurl(
     let mut cookie_jar = context.state.cookie_jar.write();
     assert!(
         cookie_jar
-            .cookies_for_url(&url, CookieSource::NonHTTP)
+            .cookies_for_url(&url, CookieSource::NonHTTP, &CookiePartition::FirstParty)
             .is_none()
     );
 }

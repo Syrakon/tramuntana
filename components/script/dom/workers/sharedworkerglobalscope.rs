@@ -395,6 +395,7 @@ impl SharedWorkerGlobalScope {
         let referrer = current_global.get_referrer();
         let is_secure_context = current_global.is_secure_context();
         let current_global_ancestor_trustworthy = current_global.has_trustworthy_ancestor_origin();
+        let cookie_context = current_global.cookie_context();
         let is_nested_browsing_context = current_global.is_nested_browsing_context();
         let worker_name = worker_name.to_string();
 
@@ -422,6 +423,7 @@ impl SharedWorkerGlobalScope {
                     is_nested_browsing_context,
                     insecure_requests_policy,
                     has_trustworthy_ancestor_origin: current_global_ancestor_trustworthy,
+                    cookie_context: cookie_context.clone(),
                 };
 
                 let event_loop_sender = ScriptEventLoopSender::SharedWorker(own_sender.clone());
@@ -509,6 +511,7 @@ impl SharedWorkerGlobalScope {
                 let scope = global.upcast::<WorkerGlobalScope>();
                 let _clear_js_runtime = ClearJsRuntime(scope);
                 let global_scope = global.upcast::<GlobalScope>();
+                global_scope.set_cookie_context(cookie_context);
 
                 // Step 11.5.2. Let workerIsSecureContext be true if insideSettings is a secure context; otherwise, false.
                 let worker_is_secure_context = global_scope.is_secure_context();

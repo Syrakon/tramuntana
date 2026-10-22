@@ -38,6 +38,7 @@ use ipc_channel::router::ROUTER;
 use log::{debug, error, info, log_enabled, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use net_traits::blob_url_store::UrlWithBlobClaim;
+use net_traits::cookie_partition::CookiePartition;
 use net_traits::fetch::headers::get_value_from_header_list;
 use net_traits::http_status::HttpStatus;
 use net_traits::policy_container::{EmbedderPolicyValue, RequestPolicyContainer};
@@ -352,29 +353,40 @@ pub fn determine_requests_referrer(
 
 fn set_request_cookies(
     url: &ServoUrl,
+    partition: &CookiePartition,
     headers: &mut HeaderMap,
     cookie_jar: &RwLock<CookieStorage>,
 ) {
     let mut cookie_jar = cookie_jar.write();
     cookie_jar.remove_expired_cookies_for_url(url);
-    if let Some(cookie_list) = cookie_jar.cookies_for_url(url, CookieSource::HTTP) &&
+    if let Some(cookie_list) = cookie_jar.cookies_for_url(url, CookieSource::HTTP, partition) &&
         let Ok(cookie_list_header_value) = HeaderValue::from_bytes(cookie_list.as_bytes())
     {
         headers.insert(header::COOKIE, cookie_list_header_value);
     }
 }
 
-fn set_cookie_for_url(cookie_jar: &RwLock<CookieStorage>, request: &ServoUrl, cookie_val: &str) {
+fn set_cookie_for_url(
+    cookie_jar: &RwLock<CookieStorage>,
+    request: &ServoUrl,
+    partition: &CookiePartition,
+    cookie_val: &str,
+) {
+    if *partition == CookiePartition::Refused {
+        return;
+    }
     let mut cookie_jar = cookie_jar.write();
     let source = CookieSource::HTTP;
 
-    if let Some(cookie) = ServoCookie::from_cookie_string(cookie_val, request, source) {
+    if let Some(mut cookie) = ServoCookie::from_cookie_string(cookie_val, request, source) {
+        cookie.top_level_site = partition.top_level_site().map(str::to_owned);
         cookie_jar.push(cookie, request, source);
     }
 }
 
 fn set_cookies_from_headers(
     url: &ServoUrl,
+    partition: &CookiePartition,
     headers: &HeaderMap,
     cookie_jar: &RwLock<CookieStorage>,
 ) {
@@ -384,7 +396,7 @@ fn set_cookies_from_headers(
             continue;
         }
         if let Ok(cookie_str) = std::str::from_utf8(cookie_bytes) {
-            set_cookie_for_url(cookie_jar, url, cookie_str);
+            set_cookie_for_url(cookie_jar, url, partition, cookie_str);
         }
     }
 }
@@ -1538,6 +1550,7 @@ async fn http_network_or_cache_fetch(
         // XXXManishearth http_loader has block_cookies: support content blocking here too
         set_request_cookies(
             &current_url,
+            &http_request.cookie_partition(),
             &mut http_request.headers,
             &context.state.cookie_jar,
         );
@@ -2151,6 +2164,7 @@ async fn http_network_fetch(
     // given request.
 
     let url = request.current_url();
+    let cookie_partition = request.cookie_partition();
     let request_id = request.id.0.to_string();
     if log_enabled!(log::Level::Info) {
         info!("{:?} request for {}", request.method, url);
@@ -2459,7 +2473,12 @@ async fn http_network_fetch(
     // TODO this step isn't possible yet
     // Step 15
     if credentials_flag {
-        set_cookies_from_headers(&url, &response.headers, &context.state.cookie_jar);
+        set_cookies_from_headers(
+            &url,
+            &cookie_partition,
+            &response.headers,
+            &context.state.cookie_jar,
+        );
     }
     context
         .state

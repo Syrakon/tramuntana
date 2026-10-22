@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::ReferrerPolicy;
 use crate::blob_url_store::UrlWithBlobClaim;
+use crate::cookie_partition::{CookieContext, CookiePartition};
 use crate::policy_container::{PolicyContainer, RequestPolicyContainer};
 use crate::pub_domains::is_same_site;
 use crate::resource_fetch_timing::ResourceTimingType;
@@ -226,6 +227,9 @@ pub struct RequestClient {
     pub insecure_requests_policy: InsecureRequestsPolicy,
     /// <https://w3c.github.io/webappsec-secure-contexts/#potentially-trustworthy-origin>
     pub has_trustworthy_ancestor_origin: bool,
+    /// Where the cookies of the request are taken from. `None` for a top-level navigation,
+    /// whose cookies are always those the site has as a top-level site.
+    pub cookie_context: Option<CookieContext>,
 }
 
 /// <https://html.spec.whatwg.org/multipage/#system-visibility-state>
@@ -936,6 +940,16 @@ impl Request {
     /// <https://fetch.spec.whatwg.org/#concept-request-current-url>
     pub fn current_url(&self) -> ServoUrl {
         self.current_url_with_blob_claim().url()
+    }
+
+    /// The cookies this request sends and sets, for its current URL: a redirect can take it
+    /// to another site, whose cookies are then those it has where the request comes from.
+    pub fn cookie_partition(&self) -> CookiePartition {
+        let context = self
+            .client
+            .as_ref()
+            .and_then(|client| client.cookie_context.as_ref());
+        CookiePartition::for_url(&self.current_url(), context)
     }
 
     /// <https://fetch.spec.whatwg.org/#concept-request-current-url>

@@ -6791,7 +6791,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             .window
             .as_global_scope()
             .resource_threads()
-            .send(GetCookieStringForUrl(url, tx, NonHTTP));
+            .send(GetCookieStringForUrl(
+                url,
+                tx,
+                NonHTTP,
+                self.window.as_global_scope().cookie_context(),
+            ));
         let cookies = rx.recv().unwrap();
         Ok(cookies.map_or(DOMString::new(), DOMString::from))
     }
@@ -6820,7 +6825,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             .window
             .as_global_scope()
             .resource_threads()
-            .send(SetCookiesForUrl(self.url(), cookies, NonHTTP));
+            .send(SetCookiesForUrl(
+                self.url(),
+                cookies,
+                NonHTTP,
+                self.window.as_global_scope().cookie_context(),
+            ));
         Ok(())
     }
 

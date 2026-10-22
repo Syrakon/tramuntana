@@ -124,6 +124,7 @@ use layout_api::{LayoutFactory, ScriptThreadFactory};
 use log::{debug, error, info, trace, warn};
 use media::WindowGLContext;
 use net::image_cache::ImageCacheFactoryImpl;
+use net_traits::cookie_partition::CookieContext;
 use net_traits::pub_domains::registered_domain_name;
 use net_traits::request::Referrer;
 use net_traits::{self, AsyncRuntime, FetchThread, ReferrerPolicy, ResourceThreads};
@@ -1041,6 +1042,8 @@ where
             .get(&webview_id)
             .and_then(|webview| webview.user_content_manager_id);
 
+        let parent_cookie_context =
+            parent_pipeline_id.and_then(|parent| self.cookie_context_of_pipeline(parent));
         let new_pipeline_info = NewPipelineInfo {
             webview_state,
             parent_info: parent_pipeline_id,
@@ -1052,6 +1055,7 @@ where
             user_content_manager_id,
             target_snapshot_params,
             frame_name: name,
+            parent_cookie_context,
         };
         let pipeline = match Pipeline::spawn(new_pipeline_info, event_loop, self, webview_hidden) {
             Ok(pipeline) => pipeline,
@@ -1060,6 +1064,40 @@ where
 
         assert!(!self.pipelines.contains_key(&new_pipeline_id));
         self.pipelines.insert(new_pipeline_id, pipeline);
+    }
+
+    /// The cookie context of the document of `pipeline_id`, worked out from the frames that
+    /// embed it. `None` if one of them is gone.
+    fn cookie_context_of_pipeline(&self, pipeline_id: PipelineId) -> Option<CookieContext> {
+        // The pipeline and those that embed it, from the pipeline up.
+        let mut chain = vec![];
+        let mut current = Some(pipeline_id);
+        while let Some(id) = current {
+            let pipeline = self.pipelines.get(&id)?;
+            chain.push(pipeline);
+            current = self
+                .browsing_contexts
+                .get(&pipeline.browsing_context_id)?
+                .parent_pipeline_id;
+        }
+        let mut context: Option<CookieContext> = None;
+        let mut parent_origin: Option<ImmutableOrigin> = None;
+        for pipeline in chain.iter().rev() {
+            // An `about:blank` or `about:srcdoc` frame has the origin of its parent, and an
+            // `about:blank` window that of the document that opened it.
+            let origin = match parent_origin {
+                _ if pipeline.url.scheme() != "about" => pipeline.url.origin(),
+                Some(parent_origin) => parent_origin,
+                None => pipeline
+                    .load_data
+                    .creator_pipeline_id
+                    .and_then(|creator| self.pipelines.get(&creator))
+                    .map_or_else(|| pipeline.url.origin(), |creator| creator.url.origin()),
+            };
+            context = Some(CookieContext::of_document(&origin, context.as_ref()));
+            parent_origin = Some(origin);
+        }
+        context
     }
 
     /// Get an iterator for the fully active browsing contexts in a subtree.

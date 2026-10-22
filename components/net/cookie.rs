@@ -39,6 +39,12 @@ pub struct ServoCookie {
     pub creation_time: SystemTime,
     pub last_access: SystemTime,
     pub expiry_time: Option<SystemTime>,
+    /// The top-level site of the pages that embed the site this cookie is for, as
+    /// [`net_traits::cookie_partition::CookiePartition::Embedded`] names it; `None` for a
+    /// cookie the site has as a top-level site. A cookie is only ever used in the partition
+    /// it was set in.
+    #[serde(default)]
+    pub top_level_site: Option<String>,
 }
 
 impl ServoCookie {
@@ -255,6 +261,12 @@ impl ServoCookie {
             }
         }
 
+        // A cookie with the `Partitioned` attribute must be secure.
+        // <https://github.com/privacycg/CHIPS#opt-in-partitioned-cookies>
+        if cookie.partitioned().unwrap_or(false) && !secure_only {
+            return None;
+        }
+
         // Step 22. If the cookie-name is empty and either of the following conditions are true,
         // abort these steps and ignore the cookie entirely:
         if cookie.name().is_empty() {
@@ -276,6 +288,7 @@ impl ServoCookie {
             creation_time: SystemTime::now(),
             last_access: SystemTime::now(),
             expiry_time,
+            top_level_site: None,
         })
     }
 
@@ -377,7 +390,6 @@ impl ServoCookie {
             return false;
         }
         // TODO: Apply same site checks
-        // TOOD: Apply Partitioning checks
 
         true
     }

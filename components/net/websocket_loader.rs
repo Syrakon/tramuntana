@@ -23,6 +23,7 @@ use headers::{
 use http::HeaderMap;
 use http::header::{self, HeaderName, HeaderValue};
 use log::{debug, trace, warn};
+use net_traits::cookie_partition::CookiePartition;
 use net_traits::request::{RequestBuilder, RequestMode};
 use net_traits::{CookieSource, MessageData, WebSocketDomAction, WebSocketNetworkEvent};
 use profile_traits::generic_callback::GenericCallback as ProfileGenericCallback;
@@ -101,9 +102,16 @@ pub fn create_handshake_request(
         headers.insert("Sec-WebSocket-Protocol", HeaderValue::from_str(&protocols)?);
     }
 
+    let cookie_context = request
+        .client
+        .as_ref()
+        .and_then(|client| client.cookie_context.as_ref());
+    let cookie_partition = CookiePartition::for_url(&request.url, cookie_context);
     let mut cookie_jar = http_state.cookie_jar.write();
     cookie_jar.remove_expired_cookies_for_url(&request.url);
-    if let Some(cookie_list) = cookie_jar.cookies_for_url(&request.url, CookieSource::HTTP) {
+    if let Some(cookie_list) =
+        cookie_jar.cookies_for_url(&request.url, CookieSource::HTTP, &cookie_partition)
+    {
         headers.insert("Cookie", HeaderValue::from_str(&cookie_list)?);
     }
 
@@ -124,6 +132,7 @@ fn process_ws_response(
     http_state: &HttpState,
     response: &Response,
     resource_url: &ServoUrl,
+    cookie_partition: &CookiePartition,
     protocols: &[String],
 ) -> Result<Option<String>, Error> {
     trace!("processing websocket http response for {}", resource_url);
@@ -145,10 +154,12 @@ fn process_ws_response(
         if !ServoCookie::is_valid_name_or_value(cookie_bytes) {
             continue;
         }
-        if let Ok(s) = std::str::from_utf8(cookie_bytes) &&
-            let Some(cookie) =
+        if *cookie_partition != CookiePartition::Refused &&
+            let Ok(s) = std::str::from_utf8(cookie_bytes) &&
+            let Some(mut cookie) =
                 ServoCookie::from_cookie_string(s, resource_url, CookieSource::HTTP)
         {
+            cookie.top_level_site = cookie_partition.top_level_site().map(str::to_owned);
             jar.push(cookie, resource_url, CookieSource::HTTP);
         }
     }
@@ -352,7 +363,13 @@ pub(crate) async fn start_websocket(
     let (stream, response) =
         client_async_tls_with_connector_and_config(builder, socket, Some(connector), None).await?;
 
-    let protocol_in_use = process_ws_response(&http_state, &response, &url, protocols)?;
+    let protocol_in_use = process_ws_response(
+        &http_state,
+        &response,
+        &url,
+        &client.cookie_partition(),
+        protocols,
+    )?;
 
     if !initiated_close.load(Ordering::SeqCst) {
         if resource_event_sender

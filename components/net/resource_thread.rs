@@ -21,6 +21,7 @@ use hyper_serde::Serde;
 use log::{debug, trace, warn};
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::blob_url_store::{BlobTokenCommunicator, parse_blob_url};
+use net_traits::cookie_partition::CookiePartition;
 use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::pub_domains::public_suffix_list_size_of;
 use net_traits::request::{Destination, PreloadEntry, PreloadId, RequestBuilder, RequestId};
@@ -650,14 +651,15 @@ impl ResourceChannelManager {
                 http_state
                     .cookie_jar
                     .write()
-                    .delete_cookie_with_name(&request, name);
+                    .delete_cookie_with_name(&request, name, &CookiePartition::FirstParty);
                 return true;
             },
-            CoreResourceMsg::DeleteCookieAsync(cookie_store_id, url, name) => {
+            CoreResourceMsg::DeleteCookieAsync(cookie_store_id, url, name, context) => {
+                let partition = CookiePartition::for_url(&url, context.as_ref());
                 http_state
                     .cookie_jar
                     .write()
-                    .delete_cookie_with_name(&url, name);
+                    .delete_cookie_with_name(&url, name, &partition);
                 self.send_cookie_response(cookie_store_id, CookieData::Delete(Ok(())));
             },
             CoreResourceMsg::FetchRedirect(request_builder, res_init, sender) => {
@@ -677,60 +679,73 @@ impl ResourceChannelManager {
                     &request,
                     cookie.into_inner().to_owned(),
                     source,
+                    &CookiePartition::FirstParty,
                     http_state,
                 );
                 if let Some(sender) = sender {
                     let _ = sender.send(());
                 }
             },
-            CoreResourceMsg::SetCookiesForUrl(request, cookies, source) => {
+            CoreResourceMsg::SetCookiesForUrl(request, cookies, source, context) => {
+                let partition = CookiePartition::for_url(&request, context.as_ref());
                 for cookie in cookies {
                     self.resource_manager.set_cookie_for_url(
                         &request,
                         cookie.into_inner(),
                         source,
+                        &partition,
                         http_state,
                     );
                 }
             },
-            CoreResourceMsg::SetCookieForUrlAsync(cookie_store_id, url, cookie, source) => {
+            CoreResourceMsg::SetCookieForUrlAsync(
+                cookie_store_id,
+                url,
+                cookie,
+                source,
+                context,
+            ) => {
                 self.resource_manager.set_cookie_for_url(
                     &url,
                     cookie.into_inner().to_owned(),
                     source,
+                    &CookiePartition::for_url(&url, context.as_ref()),
                     http_state,
                 );
                 self.send_cookie_response(cookie_store_id, CookieData::Set(Ok(())));
             },
-            CoreResourceMsg::GetCookieStringForUrl(url, consumer, source) => {
+            CoreResourceMsg::GetCookieStringForUrl(url, consumer, source, context) => {
+                let partition = CookiePartition::for_url(&url, context.as_ref());
                 let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
-                consumer.send_or_ignore(cookie_jar.cookies_for_url(&url, source));
+                consumer.send_or_ignore(cookie_jar.cookies_for_url(&url, source, &partition));
             },
             CoreResourceMsg::GetCookiesForUrl(url, consumer, source) => {
                 let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 let cookies = cookie_jar
-                    .cookies_data_for_url(&url, source)
+                    .cookies_data_for_url(&url, source, &CookiePartition::FirstParty)
                     .map(Serde)
                     .collect();
                 consumer.send_or_ignore(cookies);
             },
-            CoreResourceMsg::GetCookieDataForUrlAsync(cookie_store_id, url, name) => {
+            CoreResourceMsg::GetCookieDataForUrlAsync(cookie_store_id, url, name, context) => {
+                let partition = CookiePartition::for_url(&url, context.as_ref());
                 let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 let cookie = cookie_jar
-                    .query_cookies(&url, name)
+                    .query_cookies(&url, name, &partition)
                     .into_iter()
                     .map(Serde)
                     .next();
                 self.send_cookie_response(cookie_store_id, CookieData::Get(cookie));
             },
-            CoreResourceMsg::GetAllCookieDataForUrlAsync(cookie_store_id, url, name) => {
+            CoreResourceMsg::GetAllCookieDataForUrlAsync(cookie_store_id, url, name, context) => {
+                let partition = CookiePartition::for_url(&url, context.as_ref());
                 let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 let cookies = cookie_jar
-                    .query_cookies(&url, name)
+                    .query_cookies(&url, name, &partition)
                     .into_iter()
                     .map(Serde)
                     .collect();
@@ -739,8 +754,9 @@ impl ResourceChannelManager {
             CoreResourceMsg::EmbedderGetCookiesForUrl(operation_id, url, source) => {
                 let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
-                let cookies: Vec<Cookie<'static>> =
-                    cookie_jar.cookies_data_for_url(&url, source).collect();
+                let cookies: Vec<Cookie<'static>> = cookie_jar
+                    .cookies_data_for_url(&url, source, &CookiePartition::FirstParty)
+                    .collect();
                 http_state.embedder_proxy.send(
                     NetToEmbedderMsg::EmbedderCookieOperationResponseWithCookies(
                         operation_id,
@@ -753,6 +769,7 @@ impl ResourceChannelManager {
                     &url,
                     cookie.into_inner(),
                     source,
+                    &CookiePartition::FirstParty,
                     http_state,
                 );
                 http_state
@@ -945,9 +962,14 @@ impl CoreResourceManager {
         request: &ServoUrl,
         cookie: Cookie<'static>,
         source: CookieSource,
+        partition: &CookiePartition,
         http_state: &Arc<HttpState>,
     ) {
-        if let Some(cookie) = ServoCookie::new_wrapped(cookie, request, source) {
+        if *partition == CookiePartition::Refused {
+            return;
+        }
+        if let Some(mut cookie) = ServoCookie::new_wrapped(cookie, request, source) {
+            cookie.top_level_site = partition.top_level_site().map(str::to_owned);
             let mut cookie_jar = http_state.cookie_jar.write();
             cookie_jar.push(cookie, request, source)
         }
