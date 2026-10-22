@@ -9,8 +9,10 @@ use js::rust::Runtime;
 use script_bindings::settings_stack::*;
 
 // use script_bindings::interfaces::{DomHelpers, GlobalScopeHelpers};
+use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::trace::JSTraceable;
+use crate::dom::debugger::debuggerglobalscope::DebuggerGlobalScope;
 use crate::dom::globalscope::GlobalScope;
 
 thread_local!(pub(super) static STACK: RefCell<Vec<StackEntry<crate::DomTypeHolder>>> = const {
@@ -40,14 +42,21 @@ pub(crate) fn entry_global() -> DomRoot<GlobalScope> {
 ///
 /// ["entry"]: https://html.spec.whatwg.org/multipage/#entry
 pub(crate) fn maybe_entry_global() -> Option<DomRoot<GlobalScope>> {
-    STACK.with(|stack| {
+    let entry = STACK.with(|stack| {
         stack
             .borrow()
             .iter()
             .rev()
             .find(|entry| entry.kind == StackEntryKind::Entry)
             .map(|entry| DomRoot::from_ref(&*entry.global))
-    })
+    })?;
+    // Code that devtools evaluates in a page is run by the debugger's global, which is the entry
+    // on the stack, but the code stands for the page: `location` must answer it and relative URLs
+    // must resolve against the page, not against the debugger's opaque origin and internal URL.
+    let debuggee = entry
+        .downcast::<DebuggerGlobalScope>()
+        .and_then(DebuggerGlobalScope::eval_entry);
+    Some(debuggee.unwrap_or(entry))
 }
 
 /// Returns the ["incumbent"] global object.

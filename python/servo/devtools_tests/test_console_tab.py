@@ -279,6 +279,26 @@ class TestConsoleTab:
             assert result["result"] == 4
             assert not result["exception"]
 
+    def test_evaluation_runs_with_the_page_as_entry(self, run_servoshell, web_server_urls):
+        run_servoshell(url=f"{web_server_urls[0]}/console/log_object.html")
+
+        with Devtools.connect() as devtools:
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+            evaluation_result = Future()
+
+            def on_evaluation(data):
+                evaluation_result.set_result(data)
+
+            devtools.client.add_event_listener(console.actor_id, Events.WebConsole.EVALUATION_RESULT, on_evaluation)
+
+            # `Location` checks the entry's origin against the page's, so this throws a
+            # SecurityError if the debugger's global is left as the entry.
+            console.evaluate_js_async("location.pathname")
+            result = evaluation_result.result(1)
+
+            assert not result["exception"]
+            assert result["result"] == "/console/log_object.html"
+
     def test_eager_evaluation_aborts_assignment(self, run_servoshell):
         run_servoshell(url="data:text/html,<head><script>let value = 5;</script></head>")
 

@@ -36,7 +36,7 @@ use crate::dom::bindings::codegen::GenericBindings::DebuggerGlobalScopeBinding::
     DebuggerGlobalScopeMethods, NotifyNewSource, PipelineIdInit,
 };
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::utils::define_all_exposed_interfaces;
 use crate::dom::debugger::debuggerblackboxevent::DebuggerBlackboxEvent;
@@ -54,7 +54,7 @@ use crate::dom::types::{
 };
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
-use crate::event_loop::script_thread::with_script_thread;
+use crate::event_loop::script_thread::{ScriptThread, with_script_thread};
 use crate::realms::enter_auto_realm;
 use crate::runtime::script_runtime::IntroductionType;
 
@@ -81,6 +81,8 @@ pub(crate) struct DebuggerGlobalScope {
     pipeline_id: PipelineId,
     #[no_trace]
     origin: MutableOrigin,
+    /// The window a devtools evaluation is running in, while it runs; see [`Self::eval_entry`].
+    eval_entry: MutNullableDom<GlobalScope>,
 }
 
 impl DebuggerGlobalScope {
@@ -130,6 +132,7 @@ impl DebuggerGlobalScope {
             eval_result_sender: RefCell::new(None),
             pipeline_id: debugger_pipeline_id,
             origin: MutableOrigin::new(ImmutableOrigin::new_opaque()),
+            eval_entry: MutNullableDom::new(None),
         });
         let global =
             DebuggerGlobalScopeBinding::Wrap::<crate::DomTypeHolder>(cx, &global.origin(), global);
@@ -219,6 +222,10 @@ impl DebuggerGlobalScope {
                 .replace(Some(result_sender))
                 .is_none()
         );
+        let debuggee_window = debuggee_worker_id
+            .is_none()
+            .then(|| ScriptThread::find_window(debuggee_pipeline_id))
+            .flatten();
         let mut realm = enter_auto_realm(cx, self);
         let cx = &mut realm;
         let debuggee_pipeline_id =
@@ -232,10 +239,19 @@ impl DebuggerGlobalScope {
             frame_actor_id.map(|id| id.into()),
             eager,
         ));
-        assert!(
-            event.fire(cx, self.upcast()),
-            "Guaranteed by DebuggerEvalEvent::new"
-        );
+        // The evaluated code runs while the event is dispatched; until it is done, the window it
+        // runs in stands in for this global as the entry. Workers have no window here, and keep
+        // the debugger's global as their entry.
+        self.eval_entry.set(debuggee_window.as_deref().map(Castable::upcast));
+        let fired = event.fire(cx, self.upcast());
+        self.eval_entry.set(None);
+        assert!(fired, "Guaranteed by DebuggerEvalEvent::new");
+    }
+
+    /// The global that stands in for this one as the entry while a devtools evaluation runs in a
+    /// window. See `maybe_entry_global`.
+    pub(crate) fn eval_entry(&self) -> Option<DomRoot<GlobalScope>> {
+        self.eval_entry.get()
     }
 
     pub(crate) fn fire_get_possible_breakpoints(
