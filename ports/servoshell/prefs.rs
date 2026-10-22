@@ -764,6 +764,7 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         random_pipeline_closure_probability: cmd_args.random_pipeline_closure_probability,
         random_pipeline_closure_seed: cmd_args.random_pipeline_closure_seed,
         config_dir,
+        cache_dir: None,
         temporary_storage,
         shaders_path: cmd_args.shaders,
         certificate_path: cmd_args
