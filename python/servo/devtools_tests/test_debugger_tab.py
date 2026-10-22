@@ -32,6 +32,7 @@ from .utils import (
     wait_and_assert_no_pause,
     wait_for_pause,
     wait_for_source,
+    without_srcdoc_id,
 )
 
 
@@ -634,15 +635,21 @@ class TestDebuggerTab:
         run_servoshell(url='data:text/html,<a href="javascript:1"></a>')
         assert_sources_list(Counter([frozen_multiset([])]))
 
-    @pytest.mark.xfail(strict=False)
     def test_sources_list_with_event_handler_and_display_url(self, run_servoshell):
-        run_servoshell(url='data:text/html,<a onclick="//%23 sourceURL=http://test"></a>')
+        # An event handler is only compiled when it is first needed, so the page clicks the link.
+        run_servoshell(
+            url='data:text/html,<a onclick="//%23 sourceURL=http://test"></a><script>document.querySelector("a").click()</script>'
+        )
         assert_sources_list(
             Counter(
                 [
                     frozen_multiset(
                         [
                             Source("eventHandler", "http://test/"),
+                            Source(
+                                "inlineScript",
+                                'data:text/html,<a onclick="//%23 sourceURL=http://test"></a><script>document.querySelector("a").click()</script>',
+                            ),
                         ]
                     )
                 ]
@@ -653,7 +660,6 @@ class TestDebuggerTab:
         run_servoshell(url='data:text/html,<a onclick="1"></a>')
         assert_sources_list(Counter([frozen_multiset([])]))
 
-    @pytest.mark.xfail(strict=False)
     def test_sources_list_with_dom_timer_and_display_url(self, run_servoshell):
         run_servoshell(url='data:text/html,<script>setTimeout("//%23 sourceURL=http://test",0)</script>')
         assert_sources_list(
@@ -662,16 +668,30 @@ class TestDebuggerTab:
                     frozen_multiset(
                         [
                             Source("domTimer", "http://test/"),
+                            Source(
+                                "inlineScript",
+                                'data:text/html,<script>setTimeout("//%23 sourceURL=http://test",0)</script>',
+                            ),
                         ]
                     )
                 ]
             )
         )
 
-    @pytest.mark.xfail(strict=False)
     def test_sources_list_with_dom_timer_but_no_display_url(self, run_servoshell):
+        # Only the inline script that sets the timer is listed.
         run_servoshell(url='data:text/html,<script>setTimeout("1",0)</script>')
-        assert_sources_list(Counter([frozen_multiset([])]))
+        assert_sources_list(
+            Counter(
+                [
+                    frozen_multiset(
+                        [
+                            Source("inlineScript", 'data:text/html,<script>setTimeout("1",0)</script>'),
+                        ]
+                    )
+                ]
+            )
+        )
 
     # Sources list for scripts with `displayURL` (`//# sourceURL`), despite not being required by `introductionType`
 
@@ -734,7 +754,6 @@ class TestDebuggerTab:
             )
         )
 
-    @pytest.mark.xfail(strict=False)
     def test_sources_list_with_iframe_srcdoc_but_no_display_url(self, run_servoshell):
         run_servoshell(url='data:text/html,<iframe srcdoc="<script>1</script>">')
         assert_sources_list(
@@ -742,15 +761,14 @@ class TestDebuggerTab:
                 [
                     frozen_multiset(
                         [
-                            # FIXME: it's not really gonna be 0
-                            Source("inlineScript", "about:srcdoc#0"),
+                            Source("inlineScript", "about:srcdoc#<id>"),
                         ]
                     )
                 ]
-            )
+            ),
+            normalize=without_srcdoc_id,
         )
 
-    @pytest.mark.xfail(strict=False)
     def test_sources_list_with_iframe_srcdoc_multiple_inline_scripts(self, run_servoshell):
         run_servoshell(
             url='data:text/html,<iframe srcdoc="<script>//%23 sourceURL=http://test</script><script>2</script>">'
@@ -761,12 +779,12 @@ class TestDebuggerTab:
                     frozen_multiset(
                         [
                             Source("inlineScript", "http://test/"),
-                            # FIXME: it's not really gonna be 0
-                            Source("inlineScript", "about:srcdoc#0"),
+                            Source("inlineScript", "about:srcdoc#<id>"),
                         ]
                     )
                 ]
-            )
+            ),
+            normalize=without_srcdoc_id,
         )
 
     # Source contents

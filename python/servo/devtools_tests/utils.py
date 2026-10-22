@@ -8,10 +8,12 @@
 # except according to those terms.
 
 from __future__ import annotations
+
+import re
 from collections import Counter
 from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, TypeVar
+from typing import Any, Callable, Iterable, Optional, TypeVar
 
 from geckordp.actors.events import Events
 from geckordp.actors.resources import Resources
@@ -109,6 +111,17 @@ class Devtools:
 class Source:
     introduction_type: str
     url: str
+
+
+def without_srcdoc_id(source: Source) -> Source:
+    """
+    Each inline script in an `<iframe srcdoc>` is listed at `about:srcdoc#` and the id of its
+    source, which a test cannot know in advance. Pass this to `assert_sources_list` to compare
+    such sources as `about:srcdoc#<id>`.
+    """
+    if re.fullmatch(r"about:srcdoc#\d+", source.url):
+        return Source(source.introduction_type, "about:srcdoc#<id>")
+    return source
 
 
 # Attach to the thread actor and return it.
@@ -223,7 +236,10 @@ def frozen_multiset(items: Iterable[T] = []) -> FrozenMultiset[T]:
 
 
 def assert_sources_list(
-    expected_sources_by_target: Counter[FrozenMultiset[Source]], *, devtools: Optional[Devtools] = None
+    expected_sources_by_target: Counter[FrozenMultiset[Source]],
+    *,
+    devtools: Optional[Devtools] = None,
+    normalize: Callable[[Source], Source] = lambda source: source,
 ):
     expected_targets = len(expected_sources_by_target)
     if devtools is None:
@@ -237,7 +253,7 @@ def assert_sources_list(
                 try:
                     assert resource_type == "source"
                     source_urls = frozen_multiset(
-                        [Source(source["introductionType"], source["url"]) for source in sources]
+                        [normalize(Source(source["introductionType"], source["url"])) for source in sources]
                     )
                     assert source_urls not in actual_sources_by_target  # See NOTE above
                     actual_sources_by_target.update([source_urls])
