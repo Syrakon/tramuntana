@@ -1548,9 +1548,14 @@ async fn http_network_or_cache_fetch(
         // Substep 1
         // TODO http://mxr.mozilla.org/servo/source/components/net/http_loader.rs#504
         // XXXManishearth http_loader has block_cookies: support content blocking here too
+        let partition = context
+            .state
+            .cookie_jar
+            .read()
+            .partition_for_request(&current_url, http_request);
         set_request_cookies(
             &current_url,
-            &http_request.cookie_partition(),
+            &partition,
             &mut http_request.headers,
             &context.state.cookie_jar,
         );
@@ -2164,7 +2169,11 @@ async fn http_network_fetch(
     // given request.
 
     let url = request.current_url();
-    let cookie_partition = request.cookie_partition();
+    let cookie_partition = context
+        .state
+        .cookie_jar
+        .read()
+        .partition_for_request(&url, request);
     let request_id = request.id.0.to_string();
     if log_enabled!(log::Level::Info) {
         info!("{:?} request for {}", request.method, url);

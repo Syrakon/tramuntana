@@ -9,14 +9,15 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::IpAddr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cookie::Cookie;
 use itertools::Itertools;
 use log::info;
 use malloc_size_of_derive::MallocSizeOf;
-use net_traits::cookie_partition::CookiePartition;
-use net_traits::pub_domains::reg_suffix;
+use net_traits::cookie_partition::{CookieContext, CookiePartition, top_level_site};
+use net_traits::pub_domains::{is_same_site, reg_suffix};
+use net_traits::request::Request;
 use net_traits::{CookieSource, SiteDescriptor};
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
@@ -28,10 +29,47 @@ pub struct CookieStorage {
     version: u32,
     cookies_map: HashMap<String, Vec<ServoCookie>>,
     max_per_host: usize,
+    /// The sites the user let use their first-party cookies where another site embeds them,
+    /// through `document.requestStorageAccess()`.
+    #[serde(default)]
+    storage_access: Vec<StorageAccessGrant>,
     /// Whether this storage refuses every cookie it is given, so that it
     /// stays empty. It is a property of the session, not of what is stored.
     #[serde(skip)]
     rejects_all: bool,
+}
+
+/// How long the user's answer to a site asking for its cookies stays valid, as in Firefox.
+const STORAGE_ACCESS_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// A site that may use its first-party cookies in its documents embedded by another site,
+/// both named as [`top_level_site`] gives them.
+#[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
+struct StorageAccessGrant {
+    top_level_site: String,
+    embedded_site: String,
+    /// When the grant ends, in seconds since the Unix epoch.
+    expires: u64,
+}
+
+impl StorageAccessGrant {
+    fn has_expired(&self) -> bool {
+        seconds_since_epoch(SystemTime::now()) >= self.expires
+    }
+
+    /// Whether either site is one of `hosts`, registered domains with no scheme.
+    fn names_any_of(&self, hosts: &[String]) -> bool {
+        [&self.top_level_site, &self.embedded_site].into_iter().any(|site| {
+            site.split_once("://")
+                .is_some_and(|(_, host)| hosts.iter().any(|candidate| candidate == host))
+        })
+    }
+}
+
+fn seconds_since_epoch(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Debug)]
@@ -46,6 +84,7 @@ impl CookieStorage {
             version: 1,
             cookies_map: HashMap::new(),
             max_per_host: max_cookies,
+            storage_access: Vec::new(),
             rejects_all: false,
         }
     }
@@ -146,6 +185,7 @@ impl CookieStorage {
                     .is_some_and(|(_, host)| sites.iter().any(|site| site == host))
             })
             .for_each(|cookie| cookie.set_expiry_time_in_past());
+        self.storage_access.retain(|grant| !grant.names_any_of(sites));
     }
 
     pub fn clear_session_cookies(&mut self) {
@@ -166,7 +206,83 @@ impl CookieStorage {
             }
         } else {
             self.cookies_map.clear();
+            self.storage_access.clear();
         }
+    }
+
+    /// The cookies for `url` when used from `context`: those of [`CookiePartition::for_url`],
+    /// unless a document of the site of `url` asks for them where the user let that site use
+    /// its first-party cookies.
+    pub fn partition_for(
+        &self,
+        url: &ServoUrl,
+        context: Option<&CookieContext>,
+    ) -> CookiePartition {
+        let partition = CookiePartition::for_url(url, context);
+        let (CookiePartition::Embedded(top_level), Some(context)) = (&partition, context) else {
+            return partition;
+        };
+        if !is_same_site(&url.origin(), &context.origin) {
+            return partition;
+        }
+        let Some(embedded) = top_level_site(&context.origin) else {
+            return partition;
+        };
+        let granted = self.storage_access.iter().any(|grant| {
+            grant.top_level_site == *top_level &&
+                grant.embedded_site == embedded &&
+                !grant.has_expired()
+        });
+        if granted {
+            CookiePartition::FirstParty
+        } else {
+            partition
+        }
+    }
+
+    /// [`Self::partition_for`] a request to `url`. The client of a navigation request is the
+    /// document that embeds the frame, but the document it loads is of the site of `url`, so
+    /// a grant that site has applies to it.
+    pub fn partition_for_request(&self, url: &ServoUrl, request: &Request) -> CookiePartition {
+        let Some(context) = request.cookie_context() else {
+            return self.partition_for(url, None);
+        };
+        if !request.is_navigation_request() {
+            return self.partition_for(url, Some(context));
+        }
+        let loaded = CookieContext {
+            origin: url.origin(),
+            ..context.clone()
+        };
+        self.partition_for(url, Some(&loaded))
+    }
+
+    /// Let the documents of the site of `context` use their first-party cookies where its
+    /// top-level site embeds them, from now on and for [`STORAGE_ACCESS_LIFETIME`]. Nothing
+    /// changes for a context that has them already.
+    pub fn grant_storage_access(&mut self, context: &CookieContext) {
+        let first_party = !context.has_cross_site_ancestor &&
+            is_same_site(&context.origin, &context.top_level_origin);
+        if first_party {
+            return;
+        }
+        let (Some(top_level_site_name), Some(embedded_site)) = (
+            top_level_site(&context.top_level_origin),
+            top_level_site(&context.origin),
+        ) else {
+            return;
+        };
+        let expires = seconds_since_epoch(SystemTime::now() + STORAGE_ACCESS_LIFETIME);
+        self.storage_access.retain(|grant| {
+            !grant.has_expired() &&
+                !(grant.top_level_site == top_level_site_name &&
+                    grant.embedded_site == embedded_site)
+        });
+        self.storage_access.push(StorageAccessGrant {
+            top_level_site: top_level_site_name,
+            embedded_site,
+            expires,
+        });
     }
 
     pub fn delete_cookie_with_name(

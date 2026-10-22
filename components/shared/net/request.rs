@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::ReferrerPolicy;
 use crate::blob_url_store::UrlWithBlobClaim;
-use crate::cookie_partition::{CookieContext, CookiePartition};
+use crate::cookie_partition::CookieContext;
 use crate::policy_container::{PolicyContainer, RequestPolicyContainer};
 use crate::pub_domains::is_same_site;
 use crate::resource_fetch_timing::ResourceTimingType;
@@ -942,14 +942,13 @@ impl Request {
         self.current_url_with_blob_claim().url()
     }
 
-    /// The cookies this request sends and sets, for its current URL: a redirect can take it
-    /// to another site, whose cookies are then those it has where the request comes from.
-    pub fn cookie_partition(&self) -> CookiePartition {
-        let context = self
-            .client
+    /// Where the cookies this request sends and sets come from, if it has a client: see
+    /// [`CookieContext`]. The cookies themselves depend on its current URL too, since a
+    /// redirect can take it to another site.
+    pub fn cookie_context(&self) -> Option<&CookieContext> {
+        self.client
             .as_ref()
-            .and_then(|client| client.cookie_context.as_ref());
-        CookiePartition::for_url(&self.current_url(), context)
+            .and_then(|client| client.cookie_context.as_ref())
     }
 
     /// <https://fetch.spec.whatwg.org/#concept-request-current-url>

@@ -106,8 +106,8 @@ pub fn create_handshake_request(
         .client
         .as_ref()
         .and_then(|client| client.cookie_context.as_ref());
-    let cookie_partition = CookiePartition::for_url(&request.url, cookie_context);
     let mut cookie_jar = http_state.cookie_jar.write();
+    let cookie_partition = cookie_jar.partition_for(&request.url, cookie_context);
     cookie_jar.remove_expired_cookies_for_url(&request.url);
     if let Some(cookie_list) =
         cookie_jar.cookies_for_url(&request.url, CookieSource::HTTP, &cookie_partition)
@@ -367,7 +367,10 @@ pub(crate) async fn start_websocket(
         &http_state,
         &response,
         &url,
-        &client.cookie_partition(),
+        &http_state
+            .cookie_jar
+            .read()
+            .partition_for(&client.current_url(), client.cookie_context()),
         protocols,
     )?;
 

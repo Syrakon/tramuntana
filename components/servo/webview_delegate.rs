@@ -12,7 +12,8 @@ use embedder_traits::{
     FilterPattern, InputEventId, InputEventResult, InputMethodType, LoadStatus, MediaSessionEvent,
     NewWebViewDetails, Notification, PasskeyOperation, PasskeyResponse, PermissionFeature,
     PromptResponse, RgbColor, ScreenGeometry,
-    SelectElementOptionOrOptgroup, SelectElementRequest, SimpleDialogRequest, TraversalId,
+    SelectElementOptionOrOptgroup, SelectElementRequest, SimpleDialogRequest, StorageAccessSites,
+    TraversalId,
     WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
 };
 use paint_api::rendering_context::RenderingContext;
@@ -79,6 +80,7 @@ impl Drop for NavigationRequest {
 /// interface.
 pub struct PermissionRequest {
     pub(crate) requested_feature: PermissionFeature,
+    pub(crate) storage_access_sites: Option<StorageAccessSites>,
     pub(crate) allow_deny_request: AllowOrDenyRequest,
 }
 
@@ -86,6 +88,12 @@ impl PermissionRequest {
     /// Get the [`PermissionFeature`] for which permission is being requested by page content.
     pub fn feature(&self) -> PermissionFeature {
         self.requested_feature
+    }
+
+    /// For [`PermissionFeature::StorageAccess`], the site that asks and the site where it
+    /// asks, which the user needs to know to decide.
+    pub fn storage_access_sites(&self) -> Option<&StorageAccessSites> {
+        self.storage_access_sites.as_ref()
     }
 
     /// Grant permission to the web content to access the requested feature.

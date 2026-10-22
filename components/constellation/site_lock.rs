@@ -160,6 +160,12 @@ impl SiteLock {
             CoreResourceMsg::DeleteCookieAsync(_, url, _, _) |
             CoreResourceMsg::NewCookieListener(_, _, url) => self.allows_url(url),
             CoreResourceMsg::RemoveCookieListener(_) => true,
+            CoreResourceMsg::HasStorageAccess(url, context, _) => {
+                self.allows_url(url) && self.allows_origin(&context.origin)
+            },
+            // The grant gives a site the cookies it already has as a top-level site, in its
+            // own process; a process may ask for it only for its own site.
+            CoreResourceMsg::GrantStorageAccess(context) => self.allows_origin(&context.origin),
             // A history state id is a namespace and a counter: whose it is depends on the
             // namespaces the process was given, see [`allows_resource_message`].
             CoreResourceMsg::GetHistoryState(..) |

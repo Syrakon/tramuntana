@@ -849,6 +849,13 @@ pub enum CoreResourceMsg {
     DeleteSessionCookies(GenericSender<()>),
     DeleteCookie(ServoUrl, String),
     DeleteCookieAsync(CookieStoreId, ServoUrl, String, Option<CookieContext>),
+    /// Whether a document at the given URL, in the given context, uses its site's
+    /// first-party cookies, see
+    /// <https://privacycg.github.io/storage-access/#dom-document-hasstorageaccess>
+    HasStorageAccess(ServoUrl, CookieContext, GenericSender<bool>),
+    /// The user let the site of the given context use its first-party cookies where its
+    /// top-level site embeds it.
+    GrantStorageAccess(CookieContext),
     NewCookieListener(
         CookieStoreId,
         GenericCallback<CookieAsyncResponse>,

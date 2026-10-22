@@ -655,12 +655,17 @@ impl ResourceChannelManager {
                 return true;
             },
             CoreResourceMsg::DeleteCookieAsync(cookie_store_id, url, name, context) => {
-                let partition = CookiePartition::for_url(&url, context.as_ref());
-                http_state
-                    .cookie_jar
-                    .write()
-                    .delete_cookie_with_name(&url, name, &partition);
+                let mut cookie_jar = http_state.cookie_jar.write();
+                let partition = cookie_jar.partition_for(&url, context.as_ref());
+                cookie_jar.delete_cookie_with_name(&url, name, &partition);
                 self.send_cookie_response(cookie_store_id, CookieData::Delete(Ok(())));
+            },
+            CoreResourceMsg::HasStorageAccess(url, context, sender) => {
+                let partition = http_state.cookie_jar.read().partition_for(&url, Some(&context));
+                sender.send_or_ignore(partition == CookiePartition::FirstParty);
+            },
+            CoreResourceMsg::GrantStorageAccess(context) => {
+                http_state.cookie_jar.write().grant_storage_access(&context);
             },
             CoreResourceMsg::FetchRedirect(request_builder, res_init, sender) => {
                 let cancellation_listener =
@@ -687,7 +692,10 @@ impl ResourceChannelManager {
                 }
             },
             CoreResourceMsg::SetCookiesForUrl(request, cookies, source, context) => {
-                let partition = CookiePartition::for_url(&request, context.as_ref());
+                let partition = http_state
+                    .cookie_jar
+                    .read()
+                    .partition_for(&request, context.as_ref());
                 for cookie in cookies {
                     self.resource_manager.set_cookie_for_url(
                         &request,
@@ -705,18 +713,22 @@ impl ResourceChannelManager {
                 source,
                 context,
             ) => {
+                let partition = http_state
+                    .cookie_jar
+                    .read()
+                    .partition_for(&url, context.as_ref());
                 self.resource_manager.set_cookie_for_url(
                     &url,
                     cookie.into_inner().to_owned(),
                     source,
-                    &CookiePartition::for_url(&url, context.as_ref()),
+                    &partition,
                     http_state,
                 );
                 self.send_cookie_response(cookie_store_id, CookieData::Set(Ok(())));
             },
             CoreResourceMsg::GetCookieStringForUrl(url, consumer, source, context) => {
-                let partition = CookiePartition::for_url(&url, context.as_ref());
                 let mut cookie_jar = http_state.cookie_jar.write();
+                let partition = cookie_jar.partition_for(&url, context.as_ref());
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 consumer.send_or_ignore(cookie_jar.cookies_for_url(&url, source, &partition));
             },
@@ -730,8 +742,8 @@ impl ResourceChannelManager {
                 consumer.send_or_ignore(cookies);
             },
             CoreResourceMsg::GetCookieDataForUrlAsync(cookie_store_id, url, name, context) => {
-                let partition = CookiePartition::for_url(&url, context.as_ref());
                 let mut cookie_jar = http_state.cookie_jar.write();
+                let partition = cookie_jar.partition_for(&url, context.as_ref());
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 let cookie = cookie_jar
                     .query_cookies(&url, name, &partition)
@@ -741,8 +753,8 @@ impl ResourceChannelManager {
                 self.send_cookie_response(cookie_store_id, CookieData::Get(cookie));
             },
             CoreResourceMsg::GetAllCookieDataForUrlAsync(cookie_store_id, url, name, context) => {
-                let partition = CookiePartition::for_url(&url, context.as_ref());
                 let mut cookie_jar = http_state.cookie_jar.write();
+                let partition = cookie_jar.partition_for(&url, context.as_ref());
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 let cookies = cookie_jar
                     .query_cookies(&url, name, &partition)

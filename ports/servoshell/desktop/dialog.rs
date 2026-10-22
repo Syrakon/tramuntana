@@ -99,10 +99,16 @@ impl Dialog {
     }
 
     pub fn new_permission_request_dialog(permission_request: PermissionRequest) -> Self {
-        let message = format!(
-            "Do you want to grant permission for {:?}?",
-            permission_request.feature()
-        );
+        let message = match permission_request.storage_access_sites() {
+            Some(sites) => format!(
+                "Do you want to let {} use its cookies on {}?",
+                sites.embedded_site, sites.top_level_site
+            ),
+            None => format!(
+                "Do you want to grant permission for {:?}?",
+                permission_request.feature()
+            ),
+        };
         Dialog::Permission {
             message,
             request: Some(permission_request),

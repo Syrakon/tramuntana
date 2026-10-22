@@ -7344,6 +7344,16 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         self.exit_fullscreen(cx)
     }
 
+    /// <https://privacycg.github.io/storage-access/#dom-document-hasstorageaccess>
+    fn HasStorageAccess(&self, cx: &mut CurrentRealm) -> RootedPromise {
+        self.has_storage_access(cx)
+    }
+
+    /// <https://privacycg.github.io/storage-access/#dom-document-requeststorageaccess>
+    fn RequestStorageAccess(&self, cx: &mut CurrentRealm) -> RootedPromise {
+        self.request_storage_access(cx)
+    }
+
     // check-tidy: no specs after this line
     // Servo only API to get an instance of the controls of a specific
     // media element matching the given id.

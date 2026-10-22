@@ -229,6 +229,12 @@ partial interface Document {
     readonly attribute DocumentTimeline timeline;
 };
 
+// https://privacycg.github.io/storage-access/#the-document-object
+partial interface Document {
+  Promise<boolean> hasStorageAccess();
+  Promise<undefined> requestStorageAccess();
+};
+
 // Servo internal API.
 partial interface Document {
   [Throws]

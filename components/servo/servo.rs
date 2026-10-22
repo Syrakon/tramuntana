@@ -619,6 +619,7 @@ impl ServoInner {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let permission_request = PermissionRequest {
                         requested_feature,
+                        storage_access_sites: None,
                         allow_deny_request: AllowOrDenyRequest::new(
                             response_sender,
                             AllowOrDeny::Deny,
@@ -634,6 +635,23 @@ impl ServoInner {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     let permission_request = PermissionRequest {
                         requested_feature: PermissionFeature::ScreenWakeLock(type_),
+                        storage_access_sites: None,
+                        allow_deny_request: AllowOrDenyRequest::new_from_callback(
+                            callback,
+                            AllowOrDeny::Deny,
+                            self.servo_errors.sender(),
+                        ),
+                    };
+                    webview
+                        .delegate()
+                        .request_permission(webview, permission_request);
+                }
+            },
+            EmbedderMsg::RequestStorageAccess(webview_id, sites, callback) => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    let permission_request = PermissionRequest {
+                        requested_feature: PermissionFeature::StorageAccess,
+                        storage_access_sites: Some(sites),
                         allow_deny_request: AllowOrDenyRequest::new_from_callback(
                             callback,
                             AllowOrDeny::Deny,

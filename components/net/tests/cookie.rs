@@ -7,7 +7,11 @@ use std::time::{Duration, SystemTime};
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net_traits::CookieSource;
+use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::cookie_partition::{CookieContext, CookiePartition};
+use net_traits::request::{
+    Destination, InsecureRequestsPolicy, Origin, Referrer, Request, RequestBuilder, RequestClient,
+};
 use servo_url::ServoUrl;
 use time::macros::datetime;
 
@@ -663,9 +667,14 @@ fn add_cookie_in_partition(
 }
 
 fn context(top_level: &str, has_cross_site_ancestor: bool) -> CookieContext {
+    frame_context(top_level, has_cross_site_ancestor, top_level)
+}
+
+fn frame_context(top_level: &str, has_cross_site_ancestor: bool, origin: &str) -> CookieContext {
     CookieContext {
         top_level_origin: ServoUrl::parse(top_level).unwrap().origin(),
         has_cross_site_ancestor,
+        origin: ServoUrl::parse(origin).unwrap().origin(),
     }
 }
 
@@ -709,7 +718,10 @@ fn test_cookie_context_of_document() {
     let same_site_frame = CookieContext::of_document(&news, Some(&top));
     assert_eq!(same_site_frame, context("https://news.com/", false));
     let tracker_frame = CookieContext::of_document(&tracker, Some(&top));
-    assert_eq!(tracker_frame, context("https://news.com/", true));
+    assert_eq!(
+        tracker_frame,
+        frame_context("https://news.com/", true, "https://tracker.com/")
+    );
     let news_in_tracker_frame = CookieContext::of_document(&news, Some(&tracker_frame));
     assert_eq!(news_in_tracker_frame, context("https://news.com/", true));
 }
@@ -801,5 +813,109 @@ fn test_delete_cookies_for_sites_includes_their_partitions() {
     assert_eq!(
         storage.cookies_for_url(&tracker, source, &in_shop).as_deref(),
         Some("id=shop")
+    );
+}
+
+#[test]
+fn test_storage_access_gives_first_party_cookies() {
+    let mut storage = CookieStorage::new(5);
+    let url = ServoUrl::parse("https://www.tracker.com/login").unwrap();
+    let in_news = frame_context("https://news.com/", true, "https://tracker.com/");
+    let in_shop = frame_context("https://shop.com/", true, "https://tracker.com/");
+    // The page of news.com itself, loading something from the tracker.
+    let news_page = context("https://news.com/", false);
+    let embedded_in_news = CookiePartition::Embedded("https://news.com".to_owned());
+
+    assert_eq!(storage.partition_for(&url, Some(&in_news)), embedded_in_news);
+    storage.grant_storage_access(&in_news);
+    assert_eq!(
+        storage.partition_for(&url, Some(&in_news)),
+        CookiePartition::FirstParty
+    );
+    // Only where the user said so, and only for the documents of the tracker.
+    assert_eq!(
+        storage.partition_for(&url, Some(&in_shop)),
+        CookiePartition::Embedded("https://shop.com".to_owned())
+    );
+    assert_eq!(storage.partition_for(&url, Some(&news_page)), embedded_in_news);
+
+    // A first-party context has nothing to be granted.
+    storage.grant_storage_access(&news_page);
+    let news_url = ServoUrl::parse("https://news.com/").unwrap();
+    assert_eq!(
+        storage.partition_for(&news_url, Some(&in_news)),
+        CookiePartition::Embedded("https://news.com".to_owned())
+    );
+
+    // Clearing the data of either site takes the grant away.
+    storage.delete_cookies_for_sites(&vec!["news.com".to_owned()]);
+    assert_eq!(storage.partition_for(&url, Some(&in_news)), embedded_in_news);
+}
+
+fn request_from(context: &CookieContext, url: &ServoUrl, destination: Destination) -> Request {
+    let client = RequestClient {
+        preloaded_resources: Default::default(),
+        policy_container: Default::default(),
+        origin: Origin::Origin(context.origin.clone()),
+        is_nested_browsing_context: true,
+        insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
+        has_trustworthy_ancestor_origin: false,
+        cookie_context: Some(context.clone()),
+    };
+    let url = UrlWithBlobClaim::from_url_without_having_claimed_blob(url.clone());
+    RequestBuilder::new(None, url, Referrer::NoReferrer)
+        .destination(destination)
+        .client(client)
+        .build()
+}
+
+#[test]
+fn test_storage_access_reaches_the_frame_navigation() {
+    let mut storage = CookieStorage::new(5);
+    let url = ServoUrl::parse("https://tracker.com/login").unwrap();
+    let in_news = frame_context("https://news.com/", true, "https://tracker.com/");
+    let news_page = context("https://news.com/", false);
+    let embedded_in_news = CookiePartition::Embedded("https://news.com".to_owned());
+    storage.grant_storage_access(&in_news);
+
+    // The client of the frame's navigation is the news page, but the document it loads is
+    // the tracker's, as when the frame is reloaded.
+    let navigation = request_from(&news_page, &url, Destination::IFrame);
+    assert_eq!(
+        storage.partition_for_request(&url, &navigation),
+        CookiePartition::FirstParty
+    );
+    // An image the news page loads from the tracker is not the tracker's document.
+    let image = request_from(&news_page, &url, Destination::Image);
+    assert_eq!(storage.partition_for_request(&url, &image), embedded_in_news);
+    // A request of the frame itself.
+    let fetch = request_from(&in_news, &url, Destination::None);
+    assert_eq!(
+        storage.partition_for_request(&url, &fetch),
+        CookiePartition::FirstParty
+    );
+}
+
+#[test]
+fn test_storage_access_survives_the_jar_being_saved() {
+    let mut storage = CookieStorage::new(5);
+    let url = ServoUrl::parse("https://tracker.com/").unwrap();
+    let in_news = frame_context("https://news.com/", true, "https://tracker.com/");
+    storage.grant_storage_access(&in_news);
+
+    let saved = serde_json::to_string(&storage).unwrap();
+    let loaded: CookieStorage = serde_json::from_str(&saved).unwrap();
+    assert_eq!(
+        loaded.partition_for(&url, Some(&in_news)),
+        CookiePartition::FirstParty
+    );
+
+    // A jar saved before storage access existed loads with no grant.
+    let mut old = serde_json::to_value(&CookieStorage::new(5)).unwrap();
+    old.as_object_mut().unwrap().remove("storage_access");
+    let loaded: CookieStorage = serde_json::from_value(old).unwrap();
+    assert_eq!(
+        loaded.partition_for(&url, Some(&in_news)),
+        CookiePartition::Embedded("https://news.com".to_owned())
     );
 }

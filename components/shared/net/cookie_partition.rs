@@ -27,6 +27,9 @@ pub struct CookieContext {
     /// that of `top_level_origin`. A site embedded in another site that embeds the first one
     /// again is then not first-party there.
     pub has_cross_site_ancestor: bool,
+    /// The origin of the document or worker itself. A site embedded elsewhere may have been
+    /// given access to its first-party cookies there, and only its own documents use them.
+    pub origin: ImmutableOrigin,
 }
 
 impl CookieContext {
@@ -37,11 +40,13 @@ impl CookieContext {
             None => CookieContext {
                 top_level_origin: origin.clone(),
                 has_cross_site_ancestor: false,
+                origin: origin.clone(),
             },
             Some(parent) => CookieContext {
                 top_level_origin: parent.top_level_origin.clone(),
                 has_cross_site_ancestor: parent.has_cross_site_ancestor ||
                     !is_same_site(origin, &parent.top_level_origin),
+                origin: origin.clone(),
             },
         }
     }

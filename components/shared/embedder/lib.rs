@@ -580,6 +580,10 @@ pub enum EmbedderMsg {
     /// with the user's decision, which resolves or rejects the pending promise
     /// without blocking the script thread.
     RequestWakeLockPermission(WebViewId, GenericCallback<AllowOrDeny>, WakeLockType),
+    /// A document embedded by a site other than its own asks to use its site's first-party
+    /// cookies there, through `document.requestStorageAccess()`. The callback settles the
+    /// pending promise without blocking the script thread.
+    RequestStorageAccess(WebViewId, StorageAccessSites, GenericCallback<AllowOrDeny>),
     /// A page asks for a passkey to be made or used. The string is the origin of
     /// the asking document, which is the top-level one of its webview. The
     /// callback settles the pending promise without blocking the script thread.
@@ -705,6 +709,19 @@ pub enum PermissionFeature {
     PersistentStorage,
     ScreenWakeLock(WakeLockType),
     Gamepad,
+    /// A site embedded by another asks to use its first-party cookies there. The request
+    /// names both sites: see [`StorageAccessSites`].
+    StorageAccess,
+}
+
+/// The two sites of a request for [`PermissionFeature::StorageAccess`], each as a scheme
+/// and a registered domain, such as `https://example.com`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct StorageAccessSites {
+    /// The site that asks to use its first-party cookies.
+    pub embedded_site: String,
+    /// The site of the page that embeds it, where it would use them.
+    pub top_level_site: String,
 }
 
 /// Used to specify the kind of input method editor appropriate to edit a field.
