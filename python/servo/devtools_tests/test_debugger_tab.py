@@ -14,7 +14,6 @@ import time
 from collections import Counter
 from concurrent.futures import Future
 
-import pytest
 from geckordp.actors.events import Events
 from geckordp.actors.web_console import WebConsoleActor
 
