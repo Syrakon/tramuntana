@@ -1185,6 +1185,15 @@ impl WorkerGlobalScope {
         self.debugger_global.set(*wrapped_global);
     }
 
+    /// The debugger's global of this worker, once `init_debugger_global` has set it.
+    pub(crate) fn debugger_global(
+        &self,
+        cx: &mut JSContext,
+    ) -> Option<DomRoot<DebuggerGlobalScope>> {
+        let debugger_global_handle = rooted_heap_handle(self, |this| &this.debugger_global);
+        root_from_handlevalue::<DebuggerGlobalScope>(cx, debugger_global_handle).ok()
+    }
+
     pub(crate) fn handle_devtools_message(&self, msg: DevtoolScriptControlMsg, cx: &mut JSContext) {
         match msg {
             DevtoolScriptControlMsg::WantsLiveNotifications(_pipe_id, _wants_updates) => {},

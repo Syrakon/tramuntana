@@ -479,13 +479,16 @@ fn console_object_from_handle_value(
             let display_name = ptr::NonNull::new(*display_name)
                 .map(|display_name| unsafe { jsstr_to_string(cx, display_name) });
 
-            // Only the Debugger API can tell the names of the parameters, and the debugger's
-            // global that is reachable from here is a script thread's. In a worker, or with no
-            // devtools server to send the message to, the parameters keep placeholder names.
+            // Only the Debugger API can tell the names of the parameters. A worker has a
+            // debugger's global of its own; a window uses its script thread's. With no devtools
+            // server to send the message to, the parameters keep placeholder names.
             let parameter_names = GlobalScope::current()
                 .filter(|global| global.devtools_chan().is_some())
-                .zip(ScriptThread::debugger_global())
-                .and_then(|(global, debugger_global)| {
+                .and_then(|global| {
+                    let debugger_global = match global.downcast::<WorkerGlobalScope>() {
+                        Some(worker) => worker.debugger_global(cx),
+                        None => ScriptThread::debugger_global(),
+                    }?;
                     debugger_global.fire_parameter_names(cx, &global, object.handle())
                 })
                 .unwrap_or_else(|| (0..arity).map(|i| Some(format!("<arg{i}>"))).collect());

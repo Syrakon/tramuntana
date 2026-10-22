@@ -7,6 +7,7 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
+import time
 from concurrent.futures import Future
 from queue import Queue
 
@@ -201,6 +202,45 @@ class TestConsoleTab:
         run_servoshell(url=f"data:text/html,{script_tag}")
 
         result = evaluate_and_capture_console_log_output("log_arguments();")
+        assert result["arguments"][0]["parameterNames"] == ["a", "b"]
+
+    def test_console_log_function_destructuring_arguments(self, run_servoshell):
+        script_tag = (
+            "<script>function test_arguments(a, { b }, [c]) { }"
+            "let log_arguments = () => console.log(test_arguments);"
+            "</script>"
+        )
+        run_servoshell(url=f"data:text/html,{script_tag}")
+
+        result = evaluate_and_capture_console_log_output("log_arguments();")
+        # A destructuring pattern has no name.
+        assert result["arguments"][0]["parameterNames"] == ["a", None, None]
+
+    def test_console_log_function_arguments_in_worker(self, run_servoshell, web_server_urls):
+        run_servoshell(url=f"{web_server_urls[0]}/console/log_function_in_worker.html")
+
+        # Devtools keeps the console messages of a worker for when the resources are watched, but
+        # only those logged while a client is connected.
+        with Devtools.connect(expected_targets=2) as devtools:
+            console = WebConsoleActor(devtools.client, devtools.targets[0]["consoleActor"])
+            console.evaluate_js_async("log_in_worker();")
+            time.sleep(0.5)
+            evaluation_result = Future()
+
+            async def on_resource_available(data):
+                for resource in data["array"]:
+                    if resource[0] != "console-message" or not resource[1]:
+                        continue
+                    evaluation_result.set_result(resource[1][0])
+                    return
+
+            for target in devtools.targets:
+                devtools.client.add_event_listener(
+                    target["actor"], Events.Watcher.RESOURCES_AVAILABLE_ARRAY, on_resource_available
+                )
+            devtools.watcher.watch_resources([Resources.CONSOLE_MESSAGE])
+            result = evaluation_result.result(1)
+
         assert result["arguments"][0]["parameterNames"] == ["a", "b"]
 
     def test_console_log_sprintf_substitutions(self, run_servoshell):

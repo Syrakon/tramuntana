@@ -1,0 +1,5 @@
+<!doctype html><meta charset=utf-8>
+<script>
+let worker = new Worker("log_function_in_worker.js");
+let log_in_worker = () => worker.postMessage(null);
+</script>
