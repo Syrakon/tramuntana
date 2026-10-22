@@ -164,6 +164,9 @@ struct DevtoolsInstance {
     sender: Sender<DevtoolsControlMsg>,
     receiver: Receiver<DevtoolsControlMsg>,
     pipelines: FxHashMap<PipelineId, BrowsingContextId>,
+    /// The browsing context of the tab that each page is in. Only a tab is a target, so the
+    /// sources of a page in an iframe are listed under the tab's.
+    tab_browsing_contexts: FxHashMap<PipelineId, BrowsingContextId>,
     actor_workers: FxHashMap<WorkerId, String>,
     actor_requests: HashMap<String, String>,
     /// A map of active TCP connections to devtools clients.
@@ -223,6 +226,7 @@ impl DevtoolsInstance {
             id_map: Arc::new(Mutex::new(IdMap::default())),
             browsing_contexts: FxHashMap::default(),
             pipelines: FxHashMap::default(),
+            tab_browsing_contexts: FxHashMap::default(),
             sender: sender.clone(),
             receiver,
             actor_requests: HashMap::new(),
@@ -554,6 +558,8 @@ impl DevtoolsInstance {
             Root::DedicatedWorker(worker_actor.name().into())
         } else {
             self.pipelines.insert(pipeline_id, browsing_context_id);
+            self.tab_browsing_contexts
+                .insert(pipeline_id, BrowsingContextId::from(webview_id));
             let has_client = self.has_client();
             let browsing_context_name = self
                 .browsing_contexts
@@ -811,7 +817,7 @@ impl DevtoolsInstance {
                 );
             }
         } else {
-            let Some(browsing_context_id) = self.pipelines.get(&pipeline_id) else {
+            let Some(browsing_context_id) = self.tab_browsing_contexts.get(&pipeline_id) else {
                 return;
             };
             let Some(browsing_context_name) = self.browsing_contexts.get(browsing_context_id)

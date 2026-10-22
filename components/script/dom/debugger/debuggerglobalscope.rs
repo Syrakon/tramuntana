@@ -479,7 +479,6 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
             // - SourceActor#url <https://searchfox.org/mozilla-central/rev/85667ab51e4b2a3352f7077a9ee43513049ed2d6/devtools/server/actors/source.js#157-162>
 
             // Firefox impl: getDebuggerSourceURL(), getSourceURL()
-            // TODO: handle `about:srcdoc` case (see Firefox getDebuggerSourceURL())
             // TODO: remove trailing details that may have been appended by SpiderMonkey
             // (currently impossible to do robustly due to <https://bugzilla.mozilla.org/show_bug.cgi?id=1982001>)
             let url_original = args.url.str();
@@ -524,9 +523,23 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
             // nor are sources created for `<iframe srcdoc>`, since they are not necessarily a substring of the
             // page markup as originally sent by the server.
             // Firefox impl: SourceActor#_isInlineSource
-            // TODO: handle `about:srcdoc` case (see Firefox SourceActor#_isInlineSource)
             let inline = introduction_type.str() == "inlineScript" && url_override.is_none();
-            let Some(url) = url_override.or(url_original) else {
+
+            // An inline script is compiled with the base URL of its document, and the base URL
+            // of an `<iframe srcdoc>` document is its parent's, so the document is looked at
+            // instead. As in Firefox, each script in a srcdoc is a source of its own, with the
+            // id of its source after the document URL, since a client cannot fetch the srcdoc.
+            // Firefox impl: getDebuggerSourceURL()
+            let srcdoc_url = inline
+                .then(|| ScriptThread::find_document(pipeline_id))
+                .flatten()
+                .filter(|document| document.url().as_str() == "about:srcdoc")
+                .and_then(|_| {
+                    ServoUrl::parse(&format!("about:srcdoc#{}", args.spidermonkeyId)).ok()
+                });
+            let inline = inline && srcdoc_url.is_none();
+
+            let Some(url) = url_override.or(srcdoc_url).or(url_original) else {
                 debug!("Not creating debuggee: no valid url");
                 return;
             };

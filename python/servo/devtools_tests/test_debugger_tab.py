@@ -720,7 +720,6 @@ class TestDebuggerTab:
 
     # Sources list for inline scripts in `<iframe srcdoc>`
 
-    @pytest.mark.xfail(strict=False)
     def test_sources_list_with_iframe_srcdoc_and_display_url(self, run_servoshell):
         run_servoshell(url='data:text/html,<iframe srcdoc="<script>//%23 sourceURL=http://test</script>">')
         assert_sources_list(
