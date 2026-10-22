@@ -21,6 +21,7 @@ mod http_cache;
 mod http_disk_cache;
 mod http_loader;
 mod image_cache;
+mod orb;
 mod resource_thread;
 mod subresource_integrity;
 use std::sync::Arc;
@@ -34,6 +35,7 @@ use net::connector::{CACertificates, create_http_client, create_tls_config};
 use net::embedder::NetToEmbedderMsg;
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, FetchContext};
+use net::fetch::orb::MediaUrls;
 use net::filemanager_thread::FileManager;
 use net::protocols::ProtocolRegistry;
 use net::request_interceptor::RequestInterceptor;
@@ -116,6 +118,7 @@ fn create_http_state(fc: Option<GenericEmbedderProxy<NetToEmbedderMsg>>) -> Http
         cookie_jar: RwLock::new(net::cookie_storage::CookieStorage::new(150)),
         auth_cache: RwLock::new(net::resource_thread::AuthCache::default()),
         history_states: RwLock::new(FxHashMap::default()),
+        orb_media_urls: RwLock::new(MediaUrls::default()),
         http_cache: net::http_cache::HttpCache::default(),
         client: create_http_client(create_tls_config(
             net::connector::CACertificates::Default,

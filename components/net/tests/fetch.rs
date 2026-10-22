@@ -1665,3 +1665,80 @@ fn test_fetch_request_intercepted() {
         "The status_message was not set correctly!"
     );
 }
+
+/// Collects the body chunks a fetch hands to its target.
+struct ChunkCollector {
+    chunks: Vec<u8>,
+    sender: Option<tokio::sync::oneshot::Sender<(Response, Vec<u8>)>>,
+}
+
+impl FetchTaskTarget for ChunkCollector {
+    fn process_request_body(&mut self, _: &Request) {}
+    fn process_response(&mut self, _: &Request, _: &Response) {}
+    fn process_response_chunk(&mut self, _: &Request, chunk: Bytes) {
+        self.chunks.extend_from_slice(&chunk);
+    }
+    fn process_response_eof(&mut self, _: &Request, response: &Response) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send((response.clone(), std::mem::take(&mut self.chunks)));
+        }
+    }
+    fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
+    fn process_response_length_hint(&mut self, _: &Request, _: usize) {}
+}
+
+/// Fetches `body` served as `content_type` with a `no-cors` request from
+/// another origin, and returns the response with the chunks handed on.
+fn fetch_opaque(content_type: &'static str, body: Vec<u8>) -> (Response, Vec<u8>) {
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(content_type),
+            );
+            *response.body_mut() = make_body(body.clone());
+        };
+    let (server, url) = make_server(handler);
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(ImmutableOrigin::new_opaque())
+        .build();
+    let result = fetch_collecting_chunks(request, &mut new_fetch_context(None, None));
+    let _ = server.close();
+    result
+}
+
+/// Fetches `request` and returns the response with the chunks handed on.
+fn fetch_collecting_chunks(request: Request, context: &mut FetchContext) -> (Response, Vec<u8>) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut target = ChunkCollector {
+        chunks: Vec::new(),
+        sender: Some(sender),
+    };
+    spawn_blocking_task(async move {
+        methods::fetch(request, &mut target, context).await;
+        receiver.await.expect("the fetch reaches its end")
+    })
+}
+
+#[test]
+fn test_opaque_json_is_blocked() {
+    let (response, chunks) = fetch_opaque("application/json", b"{\"secret\": 1}".to_vec());
+    assert_eq!(
+        response.get_network_error(),
+        Some(&NetworkError::CrossOriginResponse)
+    );
+    assert!(chunks.is_empty());
+}
+
+#[test]
+fn test_opaque_script_reaches_the_target_whole() {
+    // Plain text makes the body be read before deciding, and the body is
+    // longer than what is read, so both the read part and the rest go on.
+    let body: Vec<u8> = b"var x = 1;\n".repeat(400);
+    let (response, chunks) = fetch_opaque("text/plain", body.clone());
+    assert!(!response.is_network_error());
+    assert_eq!(response.response_type, ResponseType::Opaque);
+    assert_eq!(chunks, body);
+}

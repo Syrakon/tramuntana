@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, mem, str};
@@ -56,6 +57,7 @@ use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::{
     ConsumePreloadedResources, FetchParams, SharedPreloadedResources,
 };
+use crate::fetch::orb;
 use crate::filemanager_thread::FileManager;
 use crate::http_loader::{HttpState, determine_requests_referrer, http_fetch, set_default_accept};
 use crate::protocols::{ProtocolRegistry, is_url_potentially_trustworthy};
@@ -870,11 +872,38 @@ pub async fn main_fetch(
         response = Response::network_error(error);
     }
 
+    // Opaque Response Blocking: a cross-origin no-cors response goes on only
+    // when it can be an image, media, a script or a stylesheet. The body data
+    // read to decide is handed on before the rest of the body.
+    let mut orb_head = VecDeque::new();
+    if !response.is_network_error() &&
+        response.response_type == ResponseType::Opaque &&
+        !orb::check_response(
+            &response,
+            done_chan,
+            &mut orb_head,
+            &context.state.orb_media_urls,
+        )
+        .await
+    {
+        response = Response::network_error(NetworkError::CrossOriginResponse);
+        orb_head.clear();
+        *done_chan = None;
+    }
+
     // Step 19. If response is not a network error and any of the following returns blocked
     let mut response_loaded = false;
     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
         // Step 19.1.
-        wait_for_response(request, &mut response, target, done_chan, context).await;
+        wait_for_response(
+            request,
+            &mut response,
+            target,
+            done_chan,
+            &mut orb_head,
+            context,
+        )
+        .await;
         response_loaded = true;
 
         // Step 19.2.
@@ -896,7 +925,15 @@ pub async fn main_fetch(
         // by sync fetch, but we overload it here for simplicity
         target.process_response(request, &response);
         if !response_loaded {
-            wait_for_response(request, &mut response, target, done_chan, context).await;
+            wait_for_response(
+                request,
+                &mut response,
+                target,
+                done_chan,
+                &mut orb_head,
+                context,
+            )
+            .await;
         }
         // overloaded similarly to process_response
         target.process_response_eof(request, &response);
@@ -920,7 +957,15 @@ pub async fn main_fetch(
 
     // Step 23.
     if !response_loaded {
-        wait_for_response(request, &mut response, target, done_chan, context).await;
+        wait_for_response(
+            request,
+            &mut response,
+            target,
+            done_chan,
+            &mut orb_head,
+            context,
+        )
+        .await;
     }
 
     // Step 24.
@@ -946,12 +991,17 @@ async fn wait_for_response(
     response: &mut Response,
     target: Target<'_>,
     done_chan: &mut DoneChannel,
+    head: &mut VecDeque<Data>,
     context: &FetchContext,
 ) {
     if let Some(ref mut ch) = *done_chan {
         let mut devtools_body = context.devtools_chan.as_ref().map(|_| Vec::new());
         loop {
-            match ch.1.recv().await {
+            let data = match head.pop_front() {
+                Some(data) => Some(data),
+                None => ch.1.recv().await,
+            };
+            match data {
                 Some(Data::ContentLength(length)) => {
                     target.process_response_length_hint(request, length);
                 },

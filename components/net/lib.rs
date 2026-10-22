@@ -34,6 +34,7 @@ pub mod fetch {
     pub mod fetch_params;
     pub mod headers;
     pub mod methods;
+    pub mod orb;
 }
 
 /// A module for re-exports of items used in unit tests.

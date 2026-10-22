@@ -226,6 +226,16 @@ impl MimeClassifier {
         Ok(())
     }
 
+    /// Whether the bytes start with the signature of an image format.
+    pub fn sniffs_as_image(&self, data: &[u8]) -> bool {
+        self.image_classifier.classify(data).is_some()
+    }
+
+    /// Whether the bytes start with the signature of an audio or video format.
+    pub fn sniffs_as_audio_video(&self, data: &[u8]) -> bool {
+        self.audio_video_classifier.classify(data).is_some()
+    }
+
     // some sort of iterator over the classifiers might be better?
     fn sniff_unknown_type(&self, no_sniff_flag: NoSniffFlag, data: &[u8]) -> Mime {
         let should_sniff_scriptable = no_sniff_flag == NoSniffFlag::Off;
@@ -253,7 +263,7 @@ impl MimeClassifier {
     /// <https://mimesniff.spec.whatwg.org/#xml-mime-type>
     /// SVG is worth distinguishing from other XML MIME types:
     /// <https://mimesniff.spec.whatwg.org/#mime-type-miscellaneous>
-    fn is_xml(mt: &Mime) -> bool {
+    pub fn is_xml(mt: &Mime) -> bool {
         !Self::is_image(mt) &&
             (mt.suffix() == Some(mime::XML) ||
                 mt.essence_str() == "text/xml" ||
@@ -261,7 +271,7 @@ impl MimeClassifier {
     }
 
     /// <https://mimesniff.spec.whatwg.org/#html-mime-type>
-    fn is_html(mt: &Mime) -> bool {
+    pub fn is_html(mt: &Mime) -> bool {
         mt.essence_str() == "text/html"
     }
 
