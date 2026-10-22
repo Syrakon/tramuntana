@@ -68,7 +68,8 @@ dbg.onNewScript = function(script) {
     sourceIdsToScripts.set(script.source.id, script);
     notifyNewSource({
         pipelineId: debuggeesToPipelineIds.get(script.global),
-        workerId: debuggeesToWorkerIds.get(script.global),
+        // Windows have no entry in `debuggeesToWorkerIds`; `workerId` is required, and null for them.
+        workerId: debuggeesToWorkerIds.get(script.global) ?? null,
         spidermonkeyId: script.source.id,
         url: script.source.url,
         urlOverride: script.source.displayURL,
