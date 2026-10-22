@@ -807,6 +807,7 @@ impl ServoParser {
             .as_ref()
             .map(|content| content.take())
         {
+            self.document.set_markup_for_devtools(&content_for_devtools);
             let global = self.document.global();
             let chan = global.devtools_chan().expect("Guaranteed by new");
             let pipeline_id = self.document.global().pipeline_id();

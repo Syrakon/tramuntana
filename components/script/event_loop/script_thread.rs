@@ -2277,6 +2277,16 @@ impl ScriptThread {
                 self.debugger_global
                     .fire_get_source_text(cx, spidermonkey_id, result_sender);
             },
+            DevtoolScriptControlMsg::GetPageMarkup(pipeline_id, result_sender) => {
+                let markup = self
+                    .documents
+                    .borrow()
+                    .find_document(pipeline_id)
+                    .and_then(|document| document.markup_for_devtools());
+                if let Err(error) = result_sender.send(markup) {
+                    warn!("Failed to send page markup to devtools server: {error:?}");
+                }
+            },
             DevtoolScriptControlMsg::SetBreakpoint(spidermonkey_id, script_id, offset) => {
                 self.debugger_global
                     .fire_set_breakpoint(cx, spidermonkey_id, script_id, offset);

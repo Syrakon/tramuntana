@@ -486,6 +486,9 @@ pub enum DevtoolScriptControlMsg {
     GetPossibleBreakpoints(u32, GenericSender<Vec<RecommendedBreakpointLocation>>),
     /// The text of the source with this SpiderMonkey id, if the script thread still has it.
     GetSourceText(u32, GenericSender<Option<String>>),
+    /// The markup of the document in this pipeline, which inline scripts show as their source,
+    /// if the script thread kept it.
+    GetPageMarkup(PipelineId, GenericSender<Option<String>>),
     SetBreakpoint(u32, u32, u32),
     ClearBreakpoint(u32, u32, u32),
     Interrupt,

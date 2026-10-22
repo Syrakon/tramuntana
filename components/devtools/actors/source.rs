@@ -106,6 +106,8 @@ pub(crate) struct SourceActor {
     /// `introductionType` in SpiderMonkey `CompileOptionsWrapper`.
     introduction_type: String,
 
+    /// The pipeline of the document the source belongs to.
+    pipeline_id: PipelineId,
     pub script_sender: GenericSender<DevtoolScriptControlMsg>,
 }
 
@@ -169,6 +171,7 @@ impl SourceActor {
             is_black_boxed: false,
             spidermonkey_id,
             introduction_type,
+            pipeline_id,
             script_sender,
         };
         registry.register_source_actor(pipeline_id, &name);
@@ -203,16 +206,17 @@ impl Actor for SourceActor {
             "source" => {
                 // Script threads keep the text of their sources and only send it when a client
                 // asks, so pages do not pay for a copy of every script in the devtools server.
-                // Inline sources get the page markup instead, through `UpdateSourceContent`: the
-                // script alone would put every line of it in the wrong place.
-                if !self.inline && self.content.borrow().is_none() {
+                // Inline sources get the page markup instead: the script alone would put every
+                // line of it in the wrong place. A client connected during the load has it from
+                // `UpdateSourceContent`; a later one asks the script thread for it.
+                if self.content.borrow().is_none() {
                     let (tx, rx) = channel().ok_or(ActorError::Internal)?;
-                    self.script_sender
-                        .send(DevtoolScriptControlMsg::GetSourceText(
-                            self.spidermonkey_id,
-                            tx,
-                        ))
-                        .map_err(|_| ActorError::Internal)?;
+                    let msg = if self.inline {
+                        DevtoolScriptControlMsg::GetPageMarkup(self.pipeline_id, tx)
+                    } else {
+                        DevtoolScriptControlMsg::GetSourceText(self.spidermonkey_id, tx)
+                    };
+                    self.script_sender.send(msg).map_err(|_| ActorError::Internal)?;
                     let text = rx.recv().map_err(|_| ActorError::Internal)?;
                     *self.content.borrow_mut() = text;
                 }

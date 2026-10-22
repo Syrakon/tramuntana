@@ -237,6 +237,10 @@ use crate::tasks::task_manager::TaskManager;
 use crate::tasks::task_source::TaskSourceName;
 use crate::xpath::parse_expression;
 
+/// Pages whose markup is larger than this are not kept for devtools; their inline scripts show
+/// no source to a client that connects after they load.
+const MAX_MARKUP_FOR_DEVTOOLS: usize = 2 * 1024 * 1024;
+
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum FireMouseEventType {
     Move,
@@ -657,6 +661,10 @@ pub(crate) struct Document {
     visibility_state: Cell<DocumentVisibilityState>,
     /// <https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml>
     status_code: Option<u16>,
+    /// The markup this document was parsed from, kept for devtools when a devtools server runs.
+    /// Inline scripts show it as their source; a client that connects after the load asks for it
+    /// here, as nothing else has it then.
+    markup_for_devtools: DomRefCell<Option<String>>,
     /// <https://html.spec.whatwg.org/multipage/#is-initial-about:blank>
     is_initial_about_blank: Cell<bool>,
     /// <https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots>
@@ -3522,6 +3530,17 @@ impl Document {
         self.status_code
     }
 
+    /// Keep the markup of the page for devtools, unless it is too large to be worth keeping.
+    pub(crate) fn set_markup_for_devtools(&self, markup: &str) {
+        if markup.len() <= MAX_MARKUP_FOR_DEVTOOLS {
+            *self.markup_for_devtools.borrow_mut() = Some(markup.to_owned());
+        }
+    }
+
+    pub(crate) fn markup_for_devtools(&self) -> Option<String> {
+        self.markup_for_devtools.borrow().clone()
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#encoding-parsing-a-url>
     pub(crate) fn encoding_parse_a_url(&self, url: &str) -> Result<ServoUrl, url::ParseError> {
         // NOTE: This algorithm is defined for both Document and environment settings objects.
@@ -4308,6 +4327,7 @@ impl Document {
             // which involves more work.
             visibility_state: Cell::new(DocumentVisibilityState::Visible),
             status_code,
+            markup_for_devtools: Default::default(),
             is_initial_about_blank: Cell::new(is_initial_about_blank),
             allow_declarative_shadow_roots: Cell::new(allow_declarative_shadow_roots),
             inherited_insecure_requests_policy: Cell::new(inherited_insecure_requests_policy),
