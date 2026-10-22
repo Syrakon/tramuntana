@@ -632,17 +632,29 @@ fn create_cached_response(
 }
 
 /// Create a new resource, based on the bytes requested, and an existing resource,
-/// with a status-code of 206.
+/// with a status-code of 206. `headers` are those of the existing resource; the
+/// new one says in its `Content-Range` that `bytes` start at `start` of `total`.
 fn create_resource_with_bytes_from_resource(
     bytes: &[u8],
+    start: u64,
+    total: u64,
     resource: &CachedResource,
-) -> CachedResource {
-    CachedResource {
+    headers: &HeaderMap,
+) -> Option<CachedResource> {
+    let end = start.checked_add(bytes.len() as u64)?;
+    let content_range = ContentRange::bytes(start..end, total).ok()?;
+    let mut headers = headers.clone();
+    headers.typed_insert(content_range);
+    headers.typed_insert(ContentLength(bytes.len() as u64));
+    Some(CachedResource {
         request_headers: resource.request_headers.clone(),
         body: Arc::new(ParkingLotMutex::new(ResponseBody::Done(bytes.to_owned()))),
         aborted: Arc::new(AtomicBool::new(false)),
         awaiting_body: Arc::new(ParkingLotMutex::new(vec![])),
-        metadata: resource.metadata.clone(),
+        metadata: CachedMetadata {
+            headers: Arc::new(ParkingLotMutex::new(headers)),
+            ..resource.metadata.clone()
+        },
         location_url: resource.location_url.clone(),
         status: StatusCode::PARTIAL_CONTENT.into(),
         url_list: resource.url_list.clone(),
@@ -652,7 +664,7 @@ fn create_resource_with_bytes_from_resource(
         last_validated: resource.last_validated,
         stored_body: None,
         stored: false,
-    }
+    })
 }
 
 /// Support for range requests <https://tools.ietf.org/html/rfc7233>.
@@ -695,9 +707,15 @@ fn handle_range_request(
                     let b = beginning as usize;
                     let e = end as usize + 1;
                     let requested = body.get(b..e);
-                    if let Some(bytes) = requested {
-                        let new_resource =
-                            create_resource_with_bytes_from_resource(bytes, complete_resource);
+                    if let Some(bytes) = requested &&
+                        let Some(new_resource) = create_resource_with_bytes_from_resource(
+                            bytes,
+                            beginning,
+                            body_len as u64,
+                            complete_resource,
+                            &complete_resource.metadata.headers.lock(),
+                        )
+                    {
                         let cached_headers = new_resource.metadata.headers.lock();
                         let cached_response = create_cached_response(
                             request,
@@ -715,9 +733,15 @@ fn handle_range_request(
                 if let ResponseBody::Done(ref body) = *complete_resource.body.lock() {
                     let b = beginning as usize;
                     let requested = body.get(b..);
-                    if let Some(bytes) = requested {
-                        let new_resource =
-                            create_resource_with_bytes_from_resource(bytes, complete_resource);
+                    if let Some(bytes) = requested &&
+                        let Some(new_resource) = create_resource_with_bytes_from_resource(
+                            bytes,
+                            beginning,
+                            body_len as u64,
+                            complete_resource,
+                            &complete_resource.metadata.headers.lock(),
+                        )
+                    {
                         let cached_headers = new_resource.metadata.headers.lock();
                         let cached_response = create_cached_response(
                             request,
@@ -763,11 +787,22 @@ fn handle_range_request(
                             },
                             _ => continue,
                         };
-                        if let Some(bytes) = requested {
-                            let new_resource =
-                                create_resource_with_bytes_from_resource(bytes, partial_resource);
-                            let cached_response =
-                                create_cached_response(request, &new_resource, &headers, done_chan);
+                        if let Some(bytes) = requested &&
+                            let Some(new_resource) = create_resource_with_bytes_from_resource(
+                                bytes,
+                                beginning,
+                                body_len,
+                                partial_resource,
+                                &headers,
+                            )
+                        {
+                            let cached_headers = new_resource.metadata.headers.lock();
+                            let cached_response = create_cached_response(
+                                request,
+                                &new_resource,
+                                &cached_headers,
+                                done_chan,
+                            );
                             if let Some(cached_response) = cached_response {
                                 return Some(cached_response);
                             }
@@ -804,10 +839,22 @@ fn handle_range_request(
                                 // Requested range goes beyond the available range.
                                 continue;
                             }
-                            let new_resource =
-                                create_resource_with_bytes_from_resource(bytes, partial_resource);
-                            let cached_response =
-                                create_cached_response(request, &new_resource, &headers, done_chan);
+                            let Some(new_resource) = create_resource_with_bytes_from_resource(
+                                bytes,
+                                beginning,
+                                total,
+                                partial_resource,
+                                &headers,
+                            ) else {
+                                continue;
+                            };
+                            let cached_headers = new_resource.metadata.headers.lock();
+                            let cached_response = create_cached_response(
+                                request,
+                                &new_resource,
+                                &cached_headers,
+                                done_chan,
+                            );
                             if let Some(cached_response) = cached_response {
                                 return Some(cached_response);
                             }
@@ -1046,7 +1093,15 @@ pub fn refresh(
     if let Some(constructed_response) = constructed_response.as_mut() {
         let mut stored_headers = cached_resource.metadata.headers.lock();
         stored_headers.extend(response.headers);
-        constructed_response.headers = stored_headers.clone();
+        // A range answered from the stored resource keeps saying which of its
+        // bytes it carries.
+        let mut headers = stored_headers.clone();
+        for name in [header::CONTENT_RANGE, header::CONTENT_LENGTH] {
+            if let Some(value) = constructed_response.headers.get(&name) {
+                headers.insert(name, value.clone());
+            }
+        }
+        constructed_response.headers = headers;
         // The freshness lifetime comes from the updated headers and counts
         // from this validation.
         cached_resource.expires = get_response_expiry(constructed_response);

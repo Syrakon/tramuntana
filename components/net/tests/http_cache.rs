@@ -701,3 +701,75 @@ async fn http_cache_do_not_evict_unfinished_requests() {
     println!("cache {:?}", cache);
     assert!(result.is_some());
 }
+
+/// A request for `url` asking for the bytes in `range`.
+fn range_request_for(url: &ServoUrl, range: &'static str) -> Request {
+    let mut headers = HeaderMap::new();
+    headers.insert(RANGE, HeaderValue::from_static(range));
+    RequestBuilder::new(
+        None,
+        UrlWithBlobClaim::new(url.clone(), None),
+        Referrer::NoReferrer,
+    )
+    .pipeline_id(Some(TEST_PIPELINE_ID))
+    .origin(url.origin())
+    .headers(headers)
+    .build()
+}
+
+#[tokio::test]
+async fn test_range_from_a_whole_response_says_which_bytes_it_has() {
+    let url = ServoUrl::parse("https://servo.org/video.webm").unwrap();
+    let cache = HttpCache::default();
+    cache
+        .store(&request_for(&url), &fresh_response(&url, b"0123456789"))
+        .await;
+
+    for (range, content_range, content_length) in [
+        ("bytes=0-", "bytes 0-9/10", "10"),
+        ("bytes=3-", "bytes 3-9/10", "7"),
+        ("bytes=2-4", "bytes 2-4/10", "3"),
+    ] {
+        let mut done_chan = None;
+        let response = cache
+            .construct_response(&range_request_for(&url, range), &mut done_chan)
+            .await
+            .expect("the whole response answers a range");
+        assert_eq!(response.status.code(), StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(
+            response.headers.get(CONTENT_RANGE),
+            Some(&HeaderValue::from_static(content_range)),
+            "{range}"
+        );
+        assert_eq!(
+            response.headers.get(CONTENT_LENGTH),
+            Some(&HeaderValue::from_static(content_length)),
+            "{range}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_range_after_revalidation_says_which_bytes_it_has() {
+    let url = ServoUrl::parse("https://servo.org/video.webm").unwrap();
+    let cache = HttpCache::default();
+    let mut response = fresh_response(&url, b"0123456789");
+    cache.store(&request_for(&url), &response).await;
+
+    response.status = StatusCode::NOT_MODIFIED.into();
+    let mut resource = cache.get_or_guard(CacheKey::new(&request_for(&url))).await;
+    let mut done_chan = None;
+    let refreshed = refresh(
+        &range_request_for(&url, "bytes=0-"),
+        response,
+        &mut done_chan,
+        resource.try_as_mut().unwrap(),
+    )
+    .expect("the stored response answers the range");
+
+    assert_eq!(refreshed.status.code(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        refreshed.headers.get(CONTENT_RANGE),
+        Some(&HeaderValue::from_static("bytes 0-9/10"))
+    );
+}
