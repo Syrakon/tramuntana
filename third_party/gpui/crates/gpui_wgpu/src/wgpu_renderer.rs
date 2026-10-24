@@ -191,6 +191,11 @@ struct WgpuResources {
     /// because `draw_external_sprites` runs behind `&self` (the render pass
     /// borrows `self`).
     external_texture_cache: RefCell<ExternalTextureCache>,
+    /// Read leases of the external buffers the frame being encoded samples.
+    /// Moved into an `on_submitted_work_done` callback at submit, so each is
+    /// dropped — telling its producer the buffer may be written again — only
+    /// once the GPU has finished the frame.
+    external_read_leases: RefCell<Vec<gpui::external_texture::ExternalReadLease>>,
 }
 
 impl WgpuResources {
@@ -553,6 +558,7 @@ impl WgpuRenderer {
             path_msaa_texture: None,
             path_msaa_view: None,
             external_texture_cache: RefCell::new(ExternalTextureCache::default()),
+            external_read_leases: RefCell::new(Vec::new()),
         };
 
         Ok(Self {
@@ -1182,6 +1188,20 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    /// Run the callbacks of frames the GPU has finished, which drops their
+    /// external read leases: a producer waiting for a buffer gets it back
+    /// without waiting for the next submit to notice. The platform also calls
+    /// this before asking the app for a frame, so a producer that exports
+    /// while the app renders sees the leases of the frames already done.
+    pub fn release_finished_frames(&self) {
+        let Some(resources) = self.resources.as_ref() else {
+            return;
+        };
+        if let Err(error) = resources.device.poll(wgpu::PollType::Poll) {
+            log::warn!("polling the device for finished frames failed: {error}");
+        }
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
         // Bail out early if the surface has been unconfigured (e.g. during
         // Android background/rotation transitions).  Attempting to acquire
@@ -1216,6 +1236,8 @@ impl WgpuRenderer {
         }
 
         self.atlas.before_frame();
+
+        self.release_finished_frames();
 
         let frame = match self.resources().surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -1436,9 +1458,16 @@ impl WgpuRenderer {
                 continue;
             }
 
-            self.resources()
+            let resources = self.resources();
+            resources
                 .queue
                 .submit(std::iter::once(encoder.finish()));
+            let leases = resources.external_read_leases.take();
+            if !leases.is_empty() {
+                resources
+                    .queue
+                    .on_submitted_work_done(move || drop(leases));
+            }
             frame.present();
             return true;
         }
@@ -1624,6 +1653,12 @@ impl WgpuRenderer {
                     Some(texture) => texture,
                     None => continue, // import_external_texture logs the cause
                 };
+
+                // Held until the GPU has finished this frame, so the producer
+                // does not write into the buffer while the draw below reads it.
+                if let Some(lease) = sprite.handle.read_lease() {
+                    resources.external_read_leases.borrow_mut().push(lease);
+                }
 
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 

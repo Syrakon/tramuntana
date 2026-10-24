@@ -597,6 +597,7 @@ impl WaylandWindowStatePtr {
         state.resize_throttle = false;
         let force_render = state.force_render_after_recovery;
         state.force_render_after_recovery = false;
+        state.renderer.release_finished_frames();
         drop(state);
 
         let mut cb = self.callbacks.borrow_mut();

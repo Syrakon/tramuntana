@@ -433,6 +433,29 @@ pub struct DmaBufHandle {
     /// the fence-sync extensions; the consumer should fall back to a
     /// coarser barrier such as `vkQueueWaitIdle` or accept tearing.
     pub fence_fd: Option<OwnedFd>,
+    /// Marks the buffer as in use for as long as any clone of it lives. The
+    /// producer does not blit into a buffer whose lease is held, so the
+    /// consumer keeps a clone until the GPU has finished every frame that
+    /// samples the buffer.
+    pub lease: DmaBufLease,
+}
+
+/// See [`DmaBufHandle::lease`]. Cheap to clone; carries no data. Only held:
+/// the producer counts the clones of `_readers` that are alive.
+#[derive(Clone, Debug)]
+pub struct DmaBufLease {
+    _readers: Arc<()>,
+}
+
+/// Why [`WindowRenderingContext::export_framebuffer_dma_buf`] (or the
+/// offscreen variant) produced no handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaBufExportError {
+    /// Every buffer of the export ring is still leased by the consumer. The
+    /// framebuffer is untouched: export again on a later frame.
+    Busy,
+    /// The export path is not available, or failed; the cause is logged.
+    Unavailable,
 }
 
 /// A [`RenderingContext`] that uses the `surfman` library to render to a
@@ -659,7 +682,9 @@ impl WindowRenderingContext {
     /// `EGL_MESA_image_dma_buf_export` (the standard MESA extension; on NVIDIA
     /// it is exposed by the proprietary driver alongside `EGL_NV_*` siblings).
     ///
-    /// Returns `None` if:
+    /// Returns [`DmaBufExportError::Busy`] while the consumer still holds the
+    /// lease of every ring buffer (see [`DmaBufHandle::lease`]), and
+    /// [`DmaBufExportError::Unavailable`] if:
     /// - The current FBO has no GL texture color attachment
     ///   (see [`framebuffer_color_texture_id`])
     /// - No EGL display/context is current (e.g. running under GLX)
@@ -679,7 +704,7 @@ impl WindowRenderingContext {
     ///
     /// See `docs/STAGE_2_GPU_SHARING.md` for the full producer/consumer
     /// design.
-    pub fn export_framebuffer_dma_buf(&self) -> Option<DmaBufHandle> {
+    pub fn export_framebuffer_dma_buf(&self) -> Result<DmaBufHandle, DmaBufExportError> {
         let size = self.size.get();
 
         // Identify Servo's bound FBO so we can blit FROM it. We can't export
@@ -690,10 +715,14 @@ impl WindowRenderingContext {
         let source_fbo = {
             let device = self.surfman_context.device.borrow();
             let context = self.surfman_context.context.borrow();
-            device.make_context_current(&context).ok()?;
+            device
+                .make_context_current(&context)
+                .map_err(|_| DmaBufExportError::Unavailable)?;
             device
                 .context_surface_info(&context)
-                .ok()??
+                .ok()
+                .flatten()
+                .ok_or(DmaBufExportError::Unavailable)?
                 .framebuffer_object
                 .map(|fb| fb.0.get())
                 .unwrap_or(0)
@@ -944,10 +973,12 @@ impl OffscreenRenderingContext {
     /// from our own FBO. The embedder can resize that FBO safely (the
     /// `RenderingContext::resize` impl for this type just swaps the FBO),
     /// unlike the surfman window surface. See `docs/STAGE_2_GPU_SHARING.md`.
-    pub fn export_framebuffer_dma_buf(&self) -> Option<DmaBufHandle> {
+    pub fn export_framebuffer_dma_buf(&self) -> Result<DmaBufHandle, DmaBufExportError> {
         // Make our GL/EGL context current so the EGL export queries see the
         // right display/context.
-        self.parent_context.make_current().ok()?;
+        self.parent_context
+            .make_current()
+            .map_err(|_| DmaBufExportError::Unavailable)?;
         let source_fbo = self.framebuffer.borrow().framebuffer_id;
         let gl = self.parent_context.gleam_gl_api();
         let mut cache = self.dma_buf_cache.borrow_mut();
@@ -1170,7 +1201,10 @@ mod dma_buf_export {
     use gleam::gl::{self, Gl};
     use khronos_egl as egl;
 
-    use super::DmaBufHandle;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{DmaBufExportError, DmaBufHandle, DmaBufLease};
 
     /// `EGL_GL_TEXTURE_2D_KHR` from `EGL_KHR_gl_texture_2D_image`.
     const EGL_GL_TEXTURE_2D_KHR: egl::Enum = 0x30B1;
@@ -1251,6 +1285,12 @@ mod dma_buf_export {
     /// read-after-write direction; this ring covers write-after-read.
     const EXPORT_RING_LEN: usize = 2;
 
+    /// How long every buffer of the ring may stay leased before the producer
+    /// writes into one anyway. The consumer releases a lease a frame or two
+    /// after it stops showing a buffer; one held this long means a consumer
+    /// that has stopped drawing, and waiting longer would freeze the tab.
+    const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+
     /// One slot of the export ring: a private GL texture + FBO, exported once
     /// as a dma-buf. The producer blits into a different slot each frame.
     struct ExportBuffer {
@@ -1271,6 +1311,9 @@ mod dma_buf_export {
         /// Owned EGLImage backing `gl_texture`. Kept alive so the dma-buf fd
         /// remains valid; destroyed on cache invalidation.
         egl_image: egl::EGLImage,
+        /// Held by every [`DmaBufHandle`] emitted for this buffer; a strong
+        /// count above one means the consumer may still read it.
+        readers: Arc<()>,
         /// Export format, queried per buffer. Identical across the ring in
         /// practice (same size/format) but each EGLImage reports its own.
         fourcc: u32,
@@ -1288,6 +1331,9 @@ mod dma_buf_export {
         /// Index of the slot to blit into on the next export. Advances
         /// round-robin, wrapping at `buffers.len()`.
         next: usize,
+        /// When an export first found every buffer leased, if the latest one
+        /// did. Reset by any export that finds a free buffer.
+        busy_since: Option<Instant>,
         /// EGL display handle the cache was built with. Stored so we can tear
         /// down each `egl_image` and any fence sync correctly.
         egl_display: egl::EGLDisplay,
@@ -1384,6 +1430,7 @@ mod dma_buf_export {
         Some(Cache {
             buffers,
             next: 0,
+            busy_since: None,
             egl_display: display.as_ptr(),
             egl_funcs,
             width: size.width,
@@ -1546,6 +1593,7 @@ mod dma_buf_export {
             gl_fbo: fbo,
             dma_buf_fd,
             egl_image: image,
+            readers: Arc::new(()),
             fourcc: fourcc as u32,
             modifier,
             stride: stride as u32,
@@ -1581,12 +1629,42 @@ mod dma_buf_export {
         Some(unsafe { OwnedFd::from_raw_fd(raw_fd) })
     }
 
+    /// The ring slot to blit into next: the first one from `cache.next` on
+    /// whose lease no consumer holds a clone. This is the write-after-read fix:
+    /// the consumer keeps a lease until the GPU has finished every frame that
+    /// samples a buffer, so a free lease means nothing can still be reading it.
+    /// `None` when every slot is leased, unless that has gone on for longer
+    /// than [`BUSY_TIMEOUT`]: then the next slot is taken anyway.
+    fn pick_slot(cache: &mut Cache) -> Option<usize> {
+        let len = cache.buffers.len();
+        let free = (0..len)
+            .map(|k| (cache.next + k) % len)
+            .find(|&i| Arc::strong_count(&cache.buffers[i].readers) == 1);
+        let idx = match free {
+            Some(idx) => idx,
+            None => {
+                let since = *cache.busy_since.get_or_insert_with(Instant::now);
+                if since.elapsed() < BUSY_TIMEOUT {
+                    return None;
+                }
+                log::warn!(
+                    "Stage 2 export: every ring buffer still leased after {BUSY_TIMEOUT:?}; \
+                     writing into one the consumer may be reading"
+                );
+                cache.next
+            },
+        };
+        cache.busy_since = None;
+        cache.next = (idx + 1) % len;
+        Some(idx)
+    }
+
     pub(super) fn blit_and_export(
         cache_slot: &mut Option<Cache>,
         size: PhysicalSize<u32>,
         source_fbo: u32,
         gl: &Rc<dyn Gl>,
-    ) -> Option<DmaBufHandle> {
+    ) -> Result<DmaBufHandle, DmaBufExportError> {
         // Invalidate cache if the window resized.
         if let Some(c) = cache_slot.as_ref() {
             if c.width != size.width || c.height != size.height {
@@ -1594,18 +1672,13 @@ mod dma_buf_export {
             }
         }
         if cache_slot.is_none() {
-            *cache_slot = Some(build_cache(size, gl)?);
+            *cache_slot = Some(build_cache(size, gl).ok_or(DmaBufExportError::Unavailable)?);
         }
-        let cache = cache_slot.as_mut()?;
+        let cache = cache_slot.as_mut().ok_or(DmaBufExportError::Unavailable)?;
 
-        // Round-robin to the next ring slot. This is the write-after-read fix:
-        // blit into a buffer the consumer is NOT currently sampling instead of
-        // stomping a single shared buffer mid-read. Advance the cursor before
-        // borrowing the slot so the next frame moves on; copy the slot's scalar
-        // fields out so the immutable borrow ends before `make_fence_fd` and the
-        // fd dup re-borrow `cache`.
-        let idx = cache.next;
-        cache.next = (cache.next + 1) % cache.buffers.len();
+        // Copy the slot's scalar fields out so the immutable borrow ends before
+        // `make_fence_fd` and the fd dup re-borrow `cache`.
+        let idx = pick_slot(cache).ok_or(DmaBufExportError::Busy)?;
         let (gl_fbo, buffer_id, fourcc, modifier, stride, offset) = {
             let buf = &cache.buffers[idx];
             (buf.gl_fbo, buf.buffer_id, buf.fourcc, buf.modifier, buf.stride, buf.offset)
@@ -1638,12 +1711,12 @@ mod dma_buf_export {
 
         // Dup this slot's dma-buf fd so the consumer owns an independent fd it
         // can close without affecting our cache.
-        let fd = cache.buffers[idx].dma_buf_fd.try_clone().ok().or_else(|| {
-            log::warn!("Stage 2 export: failed to dup cached dma-buf fd");
-            None
+        let fd = cache.buffers[idx].dma_buf_fd.try_clone().map_err(|error| {
+            log::warn!("Stage 2 export: failed to dup cached dma-buf fd: {error}");
+            DmaBufExportError::Unavailable
         })?;
 
-        Some(DmaBufHandle {
+        Ok(DmaBufHandle {
             buffer_id,
             fd,
             width: cache.width,
@@ -1653,6 +1726,9 @@ mod dma_buf_export {
             offset,
             modifier,
             fence_fd,
+            lease: DmaBufLease {
+                _readers: cache.buffers[idx].readers.clone(),
+            },
         })
     }
 }

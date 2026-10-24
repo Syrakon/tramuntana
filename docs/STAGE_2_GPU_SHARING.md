@@ -226,13 +226,37 @@ driver. Known sharp edges:
    vendor-specific modifier and wgpu's Vulkan import does not advertise
    support for that modifier, the import fails. Fallback path needed.
 
-## Feature flag and fallback
+### Buffer reuse: read leases
 
-Add `--features stage2-gpu-share` to `rumb-shell` (off by default until
-validated). When off, the existing CPU readback path is the only one
-compiled. When on, `engine.rs` probes `export_framebuffer_dma_buf` at
-startup — if it returns `None` on the first frame, log a warning and
-disable the feature for the session, transparently falling back.
+The export ring has two buffers. The producer must not blit into one while
+a submitted gpui frame may still sample it (write-after-read). Each ring
+buffer carries a lease (`DmaBufHandle::lease`, an `Arc` the producer counts):
+
+- rumb keeps the handle of the frame on screen, so that buffer stays leased
+  while it is shown.
+- `gpui_wgpu` takes a clone (`ExternalGpuTexture::read_lease`) for every
+  external sprite it draws, and drops the frame's clones in an
+  `on_submitted_work_done` callback. Those callbacks run in
+  `WgpuRenderer::release_finished_frames`, which the Linux platform calls
+  before asking the app for a frame, and again at the start of `draw`.
+- `blit_and_export` picks the first buffer whose lease nobody holds. If none
+  is free it returns `DmaBufExportError::Busy`, leaves the framebuffer
+  alone, and rumb exports on the next tick. After 250 ms of `Busy` it
+  writes into a buffer anyway and logs it, so a consumer that stopped
+  drawing cannot freeze the tab.
+
+rumb does not hand a new frame to gpui until its fence has signalled
+(`Frames` in `engine.rs`, checked with a zero-timeout `poll`). Until then
+the previous frame stays on screen, so gpui's own fence wait almost never
+blocks the UI thread.
+
+## Fallback
+
+When the export fails (`DmaBufExportError::Unavailable`), rumb reads the
+tab's framebuffer back through the CPU (`read_to_image`, swapped to BGRA)
+and draws it as a gpui image. The next export that works switches the tab
+back. `RUMB_CPU_FRAMES=1` forces the CPU path for every tab: for a driver
+the export breaks on, and for testing that path.
 
 ## Out of scope
 

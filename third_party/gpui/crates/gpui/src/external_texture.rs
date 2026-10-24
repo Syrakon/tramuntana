@@ -52,6 +52,36 @@ pub trait ExternalGpuTexture: Send + Sync {
     /// hints and bounds clipping; must match the texture extent the
     /// descriptor will export.
     fn size(&self) -> Size<DevicePixels>;
+
+    /// A token that keeps the buffer [`Self::buffer_id`] names marked as in
+    /// use. The compositor holds it until the GPU has finished the frame that
+    /// samples the buffer, so the producer can tell when writing into it again
+    /// is safe. `None` (the default) for producers that do not track readers.
+    fn read_lease(&self) -> Option<ExternalReadLease> {
+        None
+    }
+}
+
+/// Held by the compositor while a submitted frame may still read an external
+/// buffer; dropped once that frame's GPU work is done. What it holds is up to
+/// the producer: its drop is the signal.
+pub struct ExternalReadLease {
+    _token: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl ExternalReadLease {
+    /// Wrap the producer's token.
+    pub fn new(token: impl std::any::Any + Send + Sync) -> Self {
+        Self {
+            _token: Box::new(token),
+        }
+    }
+}
+
+impl std::fmt::Debug for ExternalReadLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExternalReadLease")
+    }
 }
 
 /// Platform-tagged handle to a GPU texture exported by another process or

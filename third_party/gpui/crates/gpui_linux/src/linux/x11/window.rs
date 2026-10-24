@@ -1140,6 +1140,7 @@ impl X11WindowStatePtr {
     }
 
     pub fn refresh(&self, request_frame_options: RequestFrameOptions) {
+        self.state.borrow().renderer.release_finished_frames();
         let callback = self.callbacks.borrow_mut().request_frame.take();
         if let Some(mut fun) = callback {
             fun(request_frame_options);
