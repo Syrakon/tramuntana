@@ -149,6 +149,7 @@ khronos-egl = { version = "6", features = ["static"] }
 kurbo = { version = "0.13.1", features = ["euclid"] }
 landlock = "0.4.7"
 libc = "0.2"
+libloading = "0.8"
 log = "0.4.32"
 mach2 = "0.7"
 malloc_size_of_derive = "0.1"

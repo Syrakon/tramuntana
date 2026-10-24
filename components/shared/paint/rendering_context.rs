@@ -704,7 +704,15 @@ impl WindowRenderingContext {
     ///
     /// See `docs/STAGE_2_GPU_SHARING.md` for the full producer/consumer
     /// design.
-    pub fn export_framebuffer_dma_buf(&self) -> Result<DmaBufHandle, DmaBufExportError> {
+    ///
+    /// `importable` lists the DRM modifiers the consumer can import
+    /// `DRM_FORMAT_ABGR8888` with. When given, the export buffers are
+    /// allocated with one of them, and the export is `Unavailable` when none
+    /// works; `None` lets the driver pick, for a consumer that cannot say.
+    pub fn export_framebuffer_dma_buf(
+        &self,
+        importable: Option<&[u64]>,
+    ) -> Result<DmaBufHandle, DmaBufExportError> {
         let size = self.size.get();
 
         // Identify Servo's bound FBO so we can blit FROM it. We can't export
@@ -734,6 +742,7 @@ impl WindowRenderingContext {
             size,
             source_fbo,
             &self.surfman_context.gleam_gl,
+            importable,
         )
     }
 }
@@ -973,7 +982,15 @@ impl OffscreenRenderingContext {
     /// from our own FBO. The embedder can resize that FBO safely (the
     /// `RenderingContext::resize` impl for this type just swaps the FBO),
     /// unlike the surfman window surface. See `docs/STAGE_2_GPU_SHARING.md`.
-    pub fn export_framebuffer_dma_buf(&self) -> Result<DmaBufHandle, DmaBufExportError> {
+    ///
+    /// `importable` lists the DRM modifiers the consumer can import
+    /// `DRM_FORMAT_ABGR8888` with. When given, the export buffers are
+    /// allocated with one of them, and the export is `Unavailable` when none
+    /// works; `None` lets the driver pick, for a consumer that cannot say.
+    pub fn export_framebuffer_dma_buf(
+        &self,
+        importable: Option<&[u64]>,
+    ) -> Result<DmaBufHandle, DmaBufExportError> {
         // Make our GL/EGL context current so the EGL export queries see the
         // right display/context.
         self.parent_context
@@ -982,7 +999,7 @@ impl OffscreenRenderingContext {
         let source_fbo = self.framebuffer.borrow().framebuffer_id;
         let gl = self.parent_context.gleam_gl_api();
         let mut cache = self.dma_buf_cache.borrow_mut();
-        dma_buf_export::blit_and_export(&mut cache, self.size.get(), source_fbo, &gl)
+        dma_buf_export::blit_and_export(&mut cache, self.size.get(), source_fbo, &gl, importable)
     }
 
     pub fn parent_context(&self) -> &WindowRenderingContext {
@@ -1193,7 +1210,10 @@ fn print_diagnostics_information_on_context_creation_failure(
 /// and only torn down on resize.
 #[allow(unsafe_code)]
 mod dma_buf_export {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::ffi::{CStr, c_char, c_void};
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1264,6 +1284,162 @@ mod dma_buf_export {
         create_sync: Option<EglCreateSyncKhr>,
         destroy_sync: Option<EglDestroySyncKhr>,
         dup_fence_fd: Option<EglDupNativeFenceFdAndroid>,
+        /// Needed only for GBM buffers. gleam implements it for GLES alone and
+        /// panics on desktop GL, so it is loaded here.
+        image_target_texture: Option<GlEglImageTargetTexture2dOes>,
+    }
+
+    type GlEglImageTargetTexture2dOes =
+        unsafe extern "system" fn(target: gl::GLenum, image: *const c_void);
+
+    /// `EGL_LINUX_DMA_BUF_EXT` and its attributes, from
+    /// `EGL_EXT_image_dma_buf_import` and `EGL_EXT_image_dma_buf_import_modifiers`.
+    const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
+    const EGL_LINUX_DRM_FOURCC_EXT: egl::Int = 0x3271;
+    const EGL_DMA_BUF_PLANE0_FD_EXT: egl::Int = 0x3272;
+    const EGL_DMA_BUF_PLANE0_OFFSET_EXT: egl::Int = 0x3273;
+    const EGL_DMA_BUF_PLANE0_PITCH_EXT: egl::Int = 0x3274;
+    const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: egl::Int = 0x3443;
+    const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Int = 0x3444;
+    /// `EGL_DEVICE_EXT` from `EGL_EXT_device_query`.
+    const EGL_DEVICE_EXT: egl::Int = 0x322C;
+    /// `EGL_DRM_DEVICE_FILE_EXT` from `EGL_EXT_device_drm`.
+    const EGL_DRM_DEVICE_FILE_EXT: egl::Int = 0x3233;
+    /// `EGL_DRM_RENDER_NODE_FILE_EXT` from `EGL_EXT_device_drm_render_node`.
+    const EGL_DRM_RENDER_NODE_FILE_EXT: egl::Int = 0x3377;
+    /// `DRM_FORMAT_ABGR8888`: RGBA8 in memory byte order, what a GL RGBA8
+    /// texture is.
+    const DRM_FORMAT_ABGR8888: u32 = 0x34324241;
+    /// `GBM_BO_USE_RENDERING`: the buffer is a render target.
+    const GBM_BO_USE_RENDERING: u32 = 1 << 2;
+
+    type EglQueryDisplayAttribExt = unsafe extern "system" fn(
+        dpy: egl::EGLDisplay,
+        attribute: egl::Int,
+        value: *mut egl::Attrib,
+    ) -> egl::Boolean;
+
+    type EglQueryDeviceStringExt =
+        unsafe extern "system" fn(device: *mut c_void, name: egl::Int) -> *const c_char;
+
+    /// A GBM device on the DRM node the current EGL display renders with. It
+    /// allocates the export buffers with a DRM modifier the consumer can
+    /// import, which a GL texture cannot be asked for: the driver picks the
+    /// modifier of a texture itself, and on NVIDIA it picks a compressed one
+    /// Vulkan does not import.
+    ///
+    /// libgbm is loaded at run time, so a system without it still gets the
+    /// GL-texture export.
+    struct Gbm {
+        device: *mut c_void,
+        bo_create_with_modifiers2:
+            unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const u64, u32, u32) -> *mut c_void,
+        bo_get_plane_count: unsafe extern "C" fn(*mut c_void) -> i32,
+        bo_get_fd_for_plane: unsafe extern "C" fn(*mut c_void, i32) -> i32,
+        bo_get_stride_for_plane: unsafe extern "C" fn(*mut c_void, i32) -> u32,
+        bo_get_offset: unsafe extern "C" fn(*mut c_void, i32) -> u32,
+        bo_get_modifier: unsafe extern "C" fn(*mut c_void) -> u64,
+        bo_destroy: unsafe extern "C" fn(*mut c_void),
+        device_destroy: unsafe extern "C" fn(*mut c_void),
+        /// The DRM node `device` was created on. Must outlive it.
+        _node: File,
+        /// Keeps every entry point above valid.
+        _library: libloading::Library,
+    }
+
+    impl Gbm {
+        /// Open a GBM device on the DRM node behind `display`. `None`, with
+        /// the cause logged, when libgbm, the EGL device extensions or the
+        /// node are missing.
+        fn open(egl_instance: &egl::Instance<egl::Static>, display: egl::EGLDisplay) -> Option<Self> {
+            let node = Self::node_path(egl_instance, display)?;
+            let node = match OpenOptions::new().read(true).write(true).open(&node) {
+                Ok(file) => file,
+                Err(error) => {
+                    log::warn!("Stage 2 GBM: cannot open {node:?}: {error}");
+                    return None;
+                },
+            };
+            // SAFETY: libgbm runs no initialisation code with preconditions
+            // when loaded.
+            let library = match unsafe { libloading::Library::new("libgbm.so.1") } {
+                Ok(library) => library,
+                Err(error) => {
+                    log::info!("Stage 2 GBM: libgbm not loaded ({error}); exporting GL textures");
+                    return None;
+                },
+            };
+            // SAFETY: each type below is the C signature of the symbol it is
+            // read from, as declared in gbm.h.
+            let create_device: unsafe extern "C" fn(i32) -> *mut c_void =
+                unsafe { *library.get(b"gbm_create_device\0").ok()? };
+            let mut gbm = unsafe {
+                Self {
+                    device: std::ptr::null_mut(),
+                    bo_create_with_modifiers2: *library.get(b"gbm_bo_create_with_modifiers2\0").ok()?,
+                    bo_get_plane_count: *library.get(b"gbm_bo_get_plane_count\0").ok()?,
+                    bo_get_fd_for_plane: *library.get(b"gbm_bo_get_fd_for_plane\0").ok()?,
+                    bo_get_stride_for_plane: *library.get(b"gbm_bo_get_stride_for_plane\0").ok()?,
+                    bo_get_offset: *library.get(b"gbm_bo_get_offset\0").ok()?,
+                    bo_get_modifier: *library.get(b"gbm_bo_get_modifier\0").ok()?,
+                    bo_destroy: *library.get(b"gbm_bo_destroy\0").ok()?,
+                    device_destroy: *library.get(b"gbm_device_destroy\0").ok()?,
+                    _node: node,
+                    _library: library,
+                }
+            };
+            // SAFETY: the fd is an open DRM node that `gbm` keeps open for as
+            // long as the device lives.
+            gbm.device = unsafe { create_device(gbm._node.as_raw_fd()) };
+            if gbm.device.is_null() {
+                log::warn!("Stage 2 GBM: gbm_create_device failed");
+                return None;
+            }
+            Some(gbm)
+        }
+
+        /// The DRM render node (else the primary node) the EGL display is on.
+        fn node_path(
+            egl_instance: &egl::Instance<egl::Static>,
+            display: egl::EGLDisplay,
+        ) -> Option<PathBuf> {
+            // SAFETY: each type is the signature of the entry point named.
+            let query_display: EglQueryDisplayAttribExt =
+                unsafe { load(egl_instance, "eglQueryDisplayAttribEXT")? };
+            let query_device: EglQueryDeviceStringExt =
+                unsafe { load(egl_instance, "eglQueryDeviceStringEXT")? };
+            let mut device: egl::Attrib = 0;
+            // SAFETY: `display` is the current, initialised display and
+            // `device` a valid out pointer.
+            if unsafe { query_display(display, EGL_DEVICE_EXT, &mut device) } != EGL_TRUE {
+                log::warn!("Stage 2 GBM: eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed");
+                return None;
+            }
+            for name in [EGL_DRM_RENDER_NODE_FILE_EXT, EGL_DRM_DEVICE_FILE_EXT] {
+                // SAFETY: `device` came from the query above. The returned
+                // string, when not null, is owned by EGL and stays valid.
+                let path = unsafe { query_device(device as *mut c_void, name) };
+                if !path.is_null() {
+                    let path = unsafe { CStr::from_ptr(path) };
+                    return Some(PathBuf::from(path.to_string_lossy().into_owned()));
+                }
+            }
+            log::warn!("Stage 2 GBM: the EGL device names no DRM node");
+            None
+        }
+    }
+
+    impl Drop for Gbm {
+        fn drop(&mut self) {
+            // Null when `gbm_create_device` failed in `open`.
+            if self.device.is_null() {
+                return;
+            }
+            // SAFETY: `device` was created by `gbm_create_device` and every
+            // buffer object allocated from it is destroyed before the cache
+            // drops its `Gbm` (see `Cache::drop`).
+            unsafe { (self.device_destroy)(self.device) };
+        }
     }
 
     /// Monotonic source of unique [`ExportBuffer`] / [`DmaBufHandle`] ids. One
@@ -1320,6 +1496,9 @@ mod dma_buf_export {
         modifier: u64,
         stride: u32,
         offset: u32,
+        /// The GBM buffer object behind the dma-buf, or null when the buffer
+        /// is an exported GL texture. Destroyed after `egl_image`.
+        gbm_bo: *mut c_void,
     }
 
     /// Per-(WindowRenderingContext, size) cached state for the Stage 2 export:
@@ -1344,21 +1523,34 @@ mod dma_buf_export {
         /// stamp emitted [`DmaBufHandle`]s.
         width: u32,
         height: u32,
+        /// The modifiers the consumer said it imports when the ring was
+        /// built; a different list rebuilds it.
+        importable: Option<Vec<u64>>,
+        /// Allocator of the ring's buffers, when they came from GBM. `Drop`
+        /// destroys the buffers before this field drops.
+        gbm: Option<Gbm>,
     }
 
-    /// Destroy the EGLImages backing a set of export buffers so the kernel can
-    /// release the dma-buf memory once all importers close their copies. The
-    /// owned `dma_buf_fd`s close themselves via `OwnedFd`'s Drop afterwards
-    /// (when the `Vec<ExportBuffer>` drops). Used both on cache teardown and on
-    /// the partial-failure path in `build_cache`.
+    /// Destroy the EGLImages backing a set of export buffers, and the GBM
+    /// buffer objects behind them, so the kernel can release the dma-buf
+    /// memory once all importers close their copies. The owned `dma_buf_fd`s
+    /// close themselves via `OwnedFd`'s Drop afterwards (when the
+    /// `Vec<ExportBuffer>` drops). Used both on cache teardown and on the
+    /// partial-failure path in `build_cache`.
     fn destroy_export_buffers(
         buffers: &[ExportBuffer],
         egl_funcs: &EglFuncs,
         display: egl::EGLDisplay,
+        gbm: Option<&Gbm>,
     ) {
         for buf in buffers {
             unsafe {
                 (egl_funcs.destroy_image)(display, buf.egl_image);
+            }
+            if let Some(gbm) = gbm.filter(|_| !buf.gbm_bo.is_null()) {
+                // SAFETY: `gbm_bo` was allocated from this device and nothing
+                // uses it after its EGLImage is gone.
+                unsafe { (gbm.bo_destroy)(buf.gbm_bo) };
             }
         }
         // GL textures and FBOs leak deliberately: we don't have access to the
@@ -1370,7 +1562,12 @@ mod dma_buf_export {
 
     impl Drop for Cache {
         fn drop(&mut self) {
-            destroy_export_buffers(&self.buffers, &self.egl_funcs, self.egl_display);
+            destroy_export_buffers(
+                &self.buffers,
+                &self.egl_funcs,
+                self.egl_display,
+                self.gbm.as_ref(),
+            );
         }
     }
 
@@ -1389,7 +1586,15 @@ mod dma_buf_export {
         Some(unsafe { std::mem::transmute_copy::<extern "system" fn(), T>(&raw) })
     }
 
-    fn build_cache(size: PhysicalSize<u32>, gl: &Rc<dyn Gl>) -> Option<Cache> {
+    /// Build the export ring. With `importable` (the modifiers the consumer
+    /// imports, see [`blit_and_export`]) the buffers come from GBM with one of
+    /// those modifiers, else from exported GL textures; a ring the consumer
+    /// cannot import is refused, so the caller falls back to the CPU path.
+    fn build_cache(
+        size: PhysicalSize<u32>,
+        gl: &Rc<dyn Gl>,
+        importable: Option<&[u64]>,
+    ) -> Option<Cache> {
         let egl_instance = egl::Instance::new(egl::Static);
         let display = egl_instance.get_current_display()?;
         let context = egl_instance.get_current_context()?;
@@ -1402,29 +1607,53 @@ mod dma_buf_export {
             create_sync: unsafe { load(&egl_instance, "eglCreateSyncKHR") },
             destroy_sync: unsafe { load(&egl_instance, "eglDestroySyncKHR") },
             dup_fence_fd: unsafe { load(&egl_instance, "eglDupNativeFenceFDANDROID") },
+            image_target_texture: unsafe { load(&egl_instance, "glEGLImageTargetTexture2DOES") },
         };
 
         // Build the export ring. On any per-buffer failure, tear down the
         // buffers built so far before bailing so we don't leak EGLImages /
         // dma-buf fds.
+        let gbm = importable
+            .filter(|modifiers| !modifiers.is_empty() && egl_funcs.image_target_texture.is_some())
+            .and_then(|_| Gbm::open(&egl_instance, display.as_ptr()));
         let mut buffers = Vec::with_capacity(EXPORT_RING_LEN);
         for i in 0..EXPORT_RING_LEN {
-            match build_export_buffer(size, gl, display.as_ptr(), context.as_ptr(), &egl_funcs) {
+            let buffer = match (gbm.as_ref(), importable) {
+                (Some(gbm), Some(modifiers)) => {
+                    build_gbm_export_buffer(size, gl, display.as_ptr(), &egl_funcs, gbm, modifiers)
+                },
+                _ => build_export_buffer(size, gl, display.as_ptr(), context.as_ptr(), &egl_funcs),
+            };
+            match buffer {
                 Some(buffer) => buffers.push(buffer),
                 None => {
                     log::warn!(
                         "Stage 2 cache: failed to build export buffer {}/{EXPORT_RING_LEN}",
                         i + 1
                     );
-                    destroy_export_buffers(&buffers, &egl_funcs, display.as_ptr());
+                    destroy_export_buffers(&buffers, &egl_funcs, display.as_ptr(), gbm.as_ref());
                     return None;
                 }
             }
         }
 
+        if let Some(modifiers) = importable {
+            if let Some(buffer) = buffers.iter().find(|b| !modifiers.contains(&b.modifier)) {
+                log::warn!(
+                    "Stage 2 cache: the consumer cannot import modifier 0x{:016x} (it imports \
+                     {modifiers:x?}); no dma-buf export",
+                    buffer.modifier
+                );
+                destroy_export_buffers(&buffers, &egl_funcs, display.as_ptr(), gbm.as_ref());
+                return None;
+            }
+        }
+
         log::info!(
-            "Stage 2 cache: built {EXPORT_RING_LEN}-buffer export ring {}x{}",
-            size.width, size.height
+            "Stage 2 cache: built {EXPORT_RING_LEN}-buffer export ring {}x{} ({})",
+            size.width,
+            size.height,
+            if gbm.is_some() { "GBM" } else { "GL textures" }
         );
 
         Some(Cache {
@@ -1435,6 +1664,156 @@ mod dma_buf_export {
             egl_funcs,
             width: size.width,
             height: size.height,
+            importable: importable.map(<[u64]>::to_vec),
+            gbm,
+        })
+    }
+
+    /// Build one ring slot on a GBM buffer object allocated with one of
+    /// `modifiers`, imported into GL as an EGLImage-backed texture + FBO.
+    fn build_gbm_export_buffer(
+        size: PhysicalSize<u32>,
+        gl: &Rc<dyn Gl>,
+        display: egl::EGLDisplay,
+        egl_funcs: &EglFuncs,
+        gbm: &Gbm,
+        modifiers: &[u64],
+    ) -> Option<ExportBuffer> {
+        // SAFETY: `gbm.device` is a live GBM device and `modifiers` holds
+        // `modifiers.len()` values for the whole call.
+        let bo = unsafe {
+            (gbm.bo_create_with_modifiers2)(
+                gbm.device,
+                size.width,
+                size.height,
+                DRM_FORMAT_ABGR8888,
+                modifiers.as_ptr(),
+                modifiers.len() as u32,
+                GBM_BO_USE_RENDERING,
+            )
+        };
+        if bo.is_null() {
+            log::warn!("Stage 2 GBM: gbm_bo_create_with_modifiers2 failed for {modifiers:x?}");
+            return None;
+        }
+        // Every exit below that fails destroys `bo`.
+        let fail = |what: &str| -> Option<ExportBuffer> {
+            log::warn!("Stage 2 GBM: {what}");
+            // SAFETY: `bo` came from this device and nothing else holds it.
+            unsafe { (gbm.bo_destroy)(bo) };
+            None
+        };
+
+        // SAFETY: `bo` is a live buffer object for every call below.
+        let (planes, modifier, stride, offset, raw_fd) = unsafe {
+            (
+                (gbm.bo_get_plane_count)(bo),
+                (gbm.bo_get_modifier)(bo),
+                (gbm.bo_get_stride_for_plane)(bo, 0),
+                (gbm.bo_get_offset)(bo, 0),
+                (gbm.bo_get_fd_for_plane)(bo, 0),
+            )
+        };
+        if raw_fd < 0 {
+            return fail("gbm_bo_get_fd_for_plane failed");
+        }
+        // SAFETY: GBM returned a new fd that nothing else owns.
+        let dma_buf_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        if planes != 1 {
+            return fail(&format!("modifier 0x{modifier:016x} has {planes} planes; single-plane only"));
+        }
+
+        let attribs: [egl::Int; 17] = [
+            egl::WIDTH,
+            size.width as egl::Int,
+            egl::HEIGHT,
+            size.height as egl::Int,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            DRM_FORMAT_ABGR8888 as egl::Int,
+            EGL_DMA_BUF_PLANE0_FD_EXT,
+            dma_buf_fd.as_raw_fd(),
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+            offset as egl::Int,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,
+            stride as egl::Int,
+            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+            (modifier & 0xffff_ffff) as u32 as egl::Int,
+            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+            (modifier >> 32) as u32 as egl::Int,
+            egl::NONE,
+        ];
+        // SAFETY: `attribs` is NONE-terminated and outlives the call; EGL
+        // dups the fd it names, so `dma_buf_fd` stays ours.
+        let image = unsafe {
+            (egl_funcs.create_image)(
+                display,
+                egl::NO_CONTEXT,
+                EGL_LINUX_DMA_BUF_EXT,
+                std::ptr::null_mut(),
+                attribs.as_ptr(),
+            )
+        };
+        if image.is_null() {
+            return fail(&format!(
+                "eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT) refused modifier 0x{modifier:016x}"
+            ));
+        }
+
+        let Some(image_target_texture) = egl_funcs.image_target_texture else {
+            // SAFETY: the image was created above and nothing uses it now.
+            unsafe { (egl_funcs.destroy_image)(display, image) };
+            return fail("glEGLImageTargetTexture2DOES is not available");
+        };
+        let textures = gl.gen_textures(1);
+        let texture = *textures.first()?;
+        gl.bind_texture(gl::TEXTURE_2D, texture);
+        // SAFETY: the GL context is current (the caller made it so), the
+        // texture is bound to TEXTURE_2D and `image` is a live EGLImage.
+        unsafe { image_target_texture(gl::TEXTURE_2D, image as *const c_void) };
+        gl.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+        gl.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+        gl.bind_texture(gl::TEXTURE_2D, 0);
+
+        let fbos = gl.gen_framebuffers(1);
+        let fbo = *fbos.first()?;
+        gl.bind_framebuffer(gl::FRAMEBUFFER, fbo);
+        gl.framebuffer_texture_2d(
+            gl::FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::TEXTURE_2D,
+            texture,
+            0,
+        );
+        let status = gl.check_frame_buffer_status(gl::FRAMEBUFFER);
+        gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
+        if status != gl::FRAMEBUFFER_COMPLETE {
+            gl.delete_framebuffers(&fbos);
+            gl.delete_textures(&textures);
+            // SAFETY: the image was created above and nothing uses it now.
+            unsafe { (egl_funcs.destroy_image)(display, image) };
+            return fail(&format!(
+                "FBO on modifier 0x{modifier:016x} is not framebuffer-complete (status 0x{status:x})"
+            ));
+        }
+
+        let buffer_id = NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed);
+        log::info!(
+            "Stage 2 cache: built GBM ring buffer {}x{} (id={buffer_id}, modifier=0x{modifier:016x}, stride={stride}, offset={offset})",
+            size.width,
+            size.height
+        );
+        Some(ExportBuffer {
+            buffer_id,
+            gl_texture: texture,
+            gl_fbo: fbo,
+            dma_buf_fd,
+            egl_image: image,
+            readers: Arc::new(()),
+            fourcc: DRM_FORMAT_ABGR8888,
+            modifier,
+            stride,
+            offset,
+            gbm_bo: bo,
         })
     }
 
@@ -1450,10 +1829,11 @@ mod dma_buf_export {
         egl_funcs: &EglFuncs,
     ) -> Option<ExportBuffer> {
         // Create the private intermediate texture: RGBA8, linear filtering,
-        // wrap clamp-to-edge. The format/modifier we get out of the EGL
-        // export query is determined by the driver but for GL_RGBA8 + linear
-        // tiling on NVIDIA / Mesa it is consistently DRM_FORMAT_ABGR8888
-        // (0x34324241) + DRM_FORMAT_MOD_LINEAR (0).
+        // wrap clamp-to-edge. The format is DRM_FORMAT_ABGR8888 (0x34324241);
+        // the modifier is the driver's choice and cannot be asked for. NVIDIA
+        // picks a compressed block-linear one (0x0300000000e08014 on a 3060)
+        // that its own Vulkan driver does not import, which is why the GBM
+        // path exists; this one is the fallback.
         let textures = gl.gen_textures(1);
         let texture = *textures.first()?;
         gl.bind_texture(gl::TEXTURE_2D, texture);
@@ -1598,6 +1978,7 @@ mod dma_buf_export {
             modifier,
             stride: stride as u32,
             offset: offset as u32,
+            gbm_bo: std::ptr::null_mut(),
         })
     }
 
@@ -1664,15 +2045,22 @@ mod dma_buf_export {
         size: PhysicalSize<u32>,
         source_fbo: u32,
         gl: &Rc<dyn Gl>,
+        importable: Option<&[u64]>,
     ) -> Result<DmaBufHandle, DmaBufExportError> {
-        // Invalidate cache if the window resized.
+        // Invalidate the cache if the window resized or the consumer now
+        // imports other modifiers.
         if let Some(c) = cache_slot.as_ref() {
-            if c.width != size.width || c.height != size.height {
+            if c.width != size.width ||
+                c.height != size.height ||
+                c.importable.as_deref() != importable
+            {
                 *cache_slot = None;
             }
         }
         if cache_slot.is_none() {
-            *cache_slot = Some(build_cache(size, gl).ok_or(DmaBufExportError::Unavailable)?);
+            *cache_slot = Some(
+                build_cache(size, gl, importable).ok_or(DmaBufExportError::Unavailable)?,
+            );
         }
         let cache = cache_slot.as_mut().ok_or(DmaBufExportError::Unavailable)?;
 

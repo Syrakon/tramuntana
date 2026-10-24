@@ -24,8 +24,9 @@
 //! Linux/FreeBSD-only. The non-Linux build of `gpui_wgpu` excludes this
 //! module entirely.
 //!
-//! Currently unused — the render pipeline (`ExternalSpritePipeline`) that
-//! consumes the resulting `wgpu::Texture` is Stage 2b.4.
+//! The device must be opened through [`request_device_with_dma_buf`]: wgpu-hal
+//! does not enable `VK_EXT_image_drm_format_modifier` itself, and the import
+//! refuses to run without it.
 
 #![cfg(any(target_os = "linux", target_os = "freebsd"))]
 #![allow(unsafe_code)]
@@ -34,6 +35,75 @@ use std::os::fd::{AsRawFd, IntoRawFd};
 
 use ash::vk;
 use gpui::external_texture::{ExternalFence, ExternalTextureDescriptor};
+
+/// Open `adapter`'s device with `VK_EXT_image_drm_format_modifier` enabled,
+/// which wgpu-hal never enables on its own. The import below creates its
+/// image with `DRM_FORMAT_MODIFIER_EXT` tiling, and that tiling is only valid
+/// on a device with the extension on.
+///
+/// Returns `None`, with the cause logged, when the adapter is not Vulkan or
+/// cannot enable the extension. The caller then opens the device the usual
+/// way, and every import refuses cleanly instead of relying on the driver
+/// tolerating invalid usage.
+pub(crate) fn request_device_with_dma_buf(
+    adapter: &wgpu::Adapter,
+    descriptor: &wgpu::DeviceDescriptor<'_>,
+) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let modifier_extension = ash::ext::image_drm_format_modifier::NAME;
+    let open_device = {
+        // SAFETY: the hal adapter is only used inside this block, to open a
+        // device from it; nothing it hands out outlives the guard.
+        let hal_adapter = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }?;
+        let capabilities = hal_adapter.physical_device_capabilities();
+        if !capabilities.supports_extension(modifier_extension) {
+            log::info!(
+                "{} not supported by this adapter; dma-buf frames will not be imported",
+                modifier_extension.to_string_lossy()
+            );
+            return None;
+        }
+        // The extension depends on VK_KHR_image_format_list,
+        // VK_KHR_bind_memory2 and VK_KHR_sampler_ycbcr_conversion, all core
+        // from Vulkan 1.2. Older devices are not worth a separate path.
+        if capabilities.properties().api_version < vk::API_VERSION_1_2 {
+            log::info!("Vulkan device older than 1.2; dma-buf frames will not be imported");
+            return None;
+        }
+        let add_extension: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> =
+            Box::new(move |args| {
+                if !args.extensions.contains(&modifier_extension) {
+                    args.extensions.push(modifier_extension);
+                }
+            });
+        // SAFETY: the callback only adds an extension the physical device
+        // reports as supported, with its dependencies core in the device's
+        // API version (both checked above). It removes nothing.
+        let opened = unsafe {
+            hal_adapter.open_with_callback(
+                descriptor.required_features,
+                &descriptor.required_limits,
+                &descriptor.memory_hints,
+                Some(add_extension),
+            )
+        };
+        match opened {
+            Ok(open_device) => open_device,
+            Err(err) => {
+                log::warn!("opening the Vulkan device with dma-buf import failed: {err:?}");
+                return None;
+            }
+        }
+    };
+    // SAFETY: `open_device` was opened from this same adapter, with exactly
+    // the features `descriptor` asks for.
+    match unsafe { adapter.create_device_from_hal(open_device, descriptor) } {
+        Ok(pair) => Some(pair),
+        Err(err) => {
+            log::warn!("wrapping the Vulkan device with dma-buf import failed: {err}");
+            None
+        }
+    }
+}
 
 /// Import an external GPU texture descriptor (currently only the
 /// `DmaBuf` variant) into a `wgpu::Texture` backed by the same physical
@@ -141,6 +211,102 @@ pub fn wait_external_fence(fence: ExternalFence) {
     }
 }
 
+/// The single-plane DRM modifiers `device` can import a dma-buf of
+/// `vk_format` with and sample from, in the driver's order. Empty when the
+/// device is not Vulkan or was opened without
+/// `VK_EXT_image_drm_format_modifier`.
+pub fn sampleable_modifiers(device: &wgpu::Device, vk_format: vk::Format) -> Vec<u64> {
+    // SAFETY: the hal device is only used inside this function.
+    let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+        return Vec::new();
+    };
+    if !hal_device
+        .enabled_device_extensions()
+        .contains(&ash::ext::image_drm_format_modifier::NAME)
+    {
+        return Vec::new();
+    }
+    let instance = hal_device.shared_instance().raw_instance();
+    let phys_dev = hal_device.raw_physical_device();
+
+    // Two calls: the first gives the count, the second fills the list.
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    // SAFETY: `properties` chains `list`, which has no output array yet, so
+    // the driver only writes the count.
+    unsafe {
+        instance.get_physical_device_format_properties2(phys_dev, vk_format, &mut properties)
+    };
+    let mut entries =
+        vec![vk::DrmFormatModifierPropertiesEXT::default(); list.drm_format_modifier_count as usize];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut entries);
+    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    // SAFETY: `entries` holds exactly the count the first call returned, and
+    // outlives the call.
+    unsafe {
+        instance.get_physical_device_format_properties2(phys_dev, vk_format, &mut properties)
+    };
+    let filled = list.drm_format_modifier_count as usize;
+
+    entries[..filled.min(entries.len())]
+        .iter()
+        .filter(|entry| {
+            entry.drm_format_modifier_plane_count == 1
+                && entry
+                    .drm_format_modifier_tiling_features
+                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+        })
+        .map(|entry| entry.drm_format_modifier)
+        .filter(|&modifier| import_extent(instance, phys_dev, vk_format, modifier).is_ok())
+        .collect()
+}
+
+/// The largest image of `vk_format` with `modifier` that `phys_dev` can
+/// import from a dma-buf and sample, or why it cannot.
+fn import_extent(
+    instance: &ash::Instance,
+    phys_dev: vk::PhysicalDevice,
+    vk_format: vk::Format,
+    modifier: u64,
+) -> Result<vk::Extent3D, String> {
+    let mut external_format_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut modifier_format_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(vk_format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(vk::ImageUsageFlags::SAMPLED)
+        .push_next(&mut external_format_info)
+        .push_next(&mut modifier_format_info);
+    let mut external_properties = vk::ExternalImageFormatProperties::default();
+    let mut format_properties =
+        vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+    // SAFETY: both structure chains are built above and live until the call
+    // returns; `phys_dev` belongs to `instance`.
+    unsafe {
+        instance.get_physical_device_image_format_properties2(
+            phys_dev,
+            &format_info,
+            &mut format_properties,
+        )
+    }
+    .map_err(|err| format!("the device cannot sample it: {err:?}"))?;
+    // Read before `external_properties`, which the chain borrows until here.
+    let max_extent = format_properties.image_format_properties.max_extent;
+    if !external_properties
+        .external_memory_properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    {
+        return Err("not importable from a dma-buf".to_owned());
+    }
+    Ok(max_extent)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn import_dma_buf(
     device: &wgpu::Device,
@@ -175,6 +341,57 @@ fn import_dma_buf(
     let raw_device = hal_device.raw_device();
     let phys_dev = hal_device.raw_physical_device();
     let instance = hal_device.shared_instance().raw_instance();
+
+    if !hal_device
+        .enabled_device_extensions()
+        .contains(&ash::ext::image_drm_format_modifier::NAME)
+    {
+        log::warn!(
+            "import_dma_buf: the device was opened without VK_EXT_image_drm_format_modifier; \
+             refusing the import (see request_device_with_dma_buf)"
+        );
+        return None;
+    }
+
+    // Ask before creating: a modifier the device does not know is invalid
+    // usage in vkCreateImage, not an error it reports.
+    let max_extent = match import_extent(instance, phys_dev, vk_format, modifier) {
+        Ok(extent) => extent,
+        Err(cause) => {
+            log::warn!(
+                "import_dma_buf: fourcc 0x{fourcc:08x} with modifier 0x{modifier:016x}: {cause} \
+                 (this device imports {:x?})",
+                sampleable_modifiers(device, vk_format)
+            );
+            return None;
+        }
+    };
+    if width > max_extent.width || height > max_extent.height {
+        log::warn!(
+            "import_dma_buf: {width}x{height} is over the {}x{} this device imports with \
+             modifier 0x{modifier:016x}",
+            max_extent.width,
+            max_extent.height
+        );
+        return None;
+    }
+
+    // The memory types this particular dma-buf can be imported into.
+    let external_memory_fd = ash::khr::external_memory_fd::Device::new(instance, raw_device);
+    let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+    // SAFETY: `fd` is a valid dma-buf fd, kept open by the `OwnedFd` for the
+    // whole call; the call only reads it.
+    let fd_properties_result = unsafe {
+        external_memory_fd.get_memory_fd_properties(
+            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            fd.as_raw_fd(),
+            &mut fd_properties,
+        )
+    };
+    if let Err(err) = fd_properties_result {
+        log::warn!("import_dma_buf: vkGetMemoryFdPropertiesKHR failed: {err:?}");
+        return None;
+    }
 
     // Build VkImageCreateInfo with the two extension structs chained.
     let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
@@ -222,14 +439,17 @@ fn import_dma_buf(
     // of the fd on a successful call, so we hand off via IntoRawFd.
     let mem_reqs = unsafe { raw_device.get_image_memory_requirements(vk_image) };
     let mem_props = unsafe { instance.get_physical_device_memory_properties(phys_dev) };
+    let memory_type_bits = mem_reqs.memory_type_bits & fd_properties.memory_type_bits;
     let mem_type_index = match (0..mem_props.memory_type_count).find(|&i| {
-        mem_reqs.memory_type_bits & (1 << i) != 0
+        memory_type_bits & (1 << i) != 0
     }) {
         Some(i) => i,
         None => {
             log::warn!(
-                "import_dma_buf: no Vulkan memory type compatible with dma-buf (bits={:b})",
-                mem_reqs.memory_type_bits
+                "import_dma_buf: no Vulkan memory type fits both the image and the dma-buf \
+                 (image bits={:b}, dma-buf bits={:b})",
+                mem_reqs.memory_type_bits,
+                fd_properties.memory_type_bits
             );
             unsafe {
                 raw_device.destroy_image(vk_image, None);

@@ -27,6 +27,7 @@ gleam = { workspace = true }
 glow = { workspace = true }
 image = { workspace = true }
 khronos-egl = { workspace = true }
+libloading = { workspace = true }
 log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }

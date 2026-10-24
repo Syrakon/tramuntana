@@ -14,9 +14,31 @@
 //! end-to-end architecture.
 
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::{DevicePixels, Size};
+
+static IMPORTABLE_ABGR8888_MODIFIERS: RwLock<Option<Arc<[u64]>>> = RwLock::new(None);
+
+/// The DRM format modifiers the compositor can import a
+/// `DRM_FORMAT_ABGR8888` dma-buf with. A producer allocates its buffers with
+/// one of these; a buffer with any other modifier will not be drawn. `None`
+/// until the compositor's GPU device exists; an empty list means it imports
+/// no dma-buf at all.
+pub fn importable_abgr8888_modifiers() -> Option<Arc<[u64]>> {
+    IMPORTABLE_ABGR8888_MODIFIERS
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Set by the renderer each time it opens its GPU device. See
+/// [`importable_abgr8888_modifiers`].
+pub fn set_importable_abgr8888_modifiers(modifiers: Option<Arc<[u64]>>) {
+    *IMPORTABLE_ABGR8888_MODIFIERS
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = modifiers;
+}
 
 /// Trait implemented by embedders that want to hand a GPU-resident texture
 /// directly to gpui's compositor. The framework owns nothing — it queries

@@ -158,19 +158,40 @@ impl WgpuContext {
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("gpui_device"),
-                required_features,
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits())
-                    .using_alignment(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
+        let descriptor = wgpu::DeviceDescriptor {
+            label: Some("gpui_device"),
+            required_features,
+            required_limits: wgpu::Limits::downlevel_defaults()
+                .using_resolution(adapter.limits())
+                .using_alignment(adapter.limits()),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        };
+        // Vulkan needs an extension wgpu does not enable to import dma-buf
+        // frames; open the device ourselves where we can.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        let opened =
+            crate::external_texture_import::request_device_with_dma_buf(adapter, &descriptor);
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        let opened = None;
+        let (device, queue) = match opened {
+            Some(pair) => pair,
+            None => adapter
+                .request_device(&descriptor)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?,
+        };
+        // Tell dma-buf producers which buffers this device can import; empty
+        // when it was opened without the extension.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        gpui::external_texture::set_importable_abgr8888_modifiers(Some(
+            crate::external_texture_import::sampleable_modifiers(
+                &device,
+                ash::vk::Format::R8G8B8A8_UNORM,
+            )
+            .into(),
+        ));
 
         Ok((
             device,

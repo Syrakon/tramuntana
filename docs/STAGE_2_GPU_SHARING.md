@@ -222,9 +222,38 @@ driver. Known sharp edges:
 3. **Wayland vs X11**: under Wayland with NVIDIA driver < 555, dma-buf
    feedback is incomplete. Verify driver version when launching;
    fall back to Stage 1 if the export probe fails.
-4. **Modifier mismatch**: if Servo's GL texture is stored with a
-   vendor-specific modifier and wgpu's Vulkan import does not advertise
-   support for that modifier, the import fails. Fallback path needed.
+4. **Modifier mismatch**: this one happens. NVIDIA GL stores an RGBA8
+   texture with modifier `0x0300000000e08014` (block-linear, compressed),
+   and NVIDIA Vulkan imports only `0x0300000000606010`–`…15` and `LINEAR`.
+   Until 2026-10 the import ran anyway, as invalid usage that the driver
+   tolerated. See "Modifier negotiation" below.
+
+### Modifier negotiation
+
+The consumer says what it can import, and the producer allocates with that:
+
+- wgpu-hal never enables `VK_EXT_image_drm_format_modifier`, though the
+  import needs it for `DRM_FORMAT_MODIFIER_EXT` tiling.
+  `external_texture_import::request_device_with_dma_buf` opens the device
+  through `open_with_callback` with the extension added. When it cannot,
+  the device opens as before and every import is refused.
+- After opening the device, `gpui_wgpu` publishes the single-plane
+  `R8G8B8A8_UNORM` modifiers it can import from a dma-buf and sample
+  (`sampleable_modifiers`) through
+  `gpui::external_texture::set_importable_abgr8888_modifiers`. The list is
+  empty when the extension is off.
+- rumb passes that list to `export_framebuffer_dma_buf(importable)`. The
+  export ring is then allocated with GBM (`gbm_bo_create_with_modifiers2`),
+  on the DRM node of the current EGL display (`EGL_EXT_device_drm`), and
+  imported into GL with `EGL_LINUX_DMA_BUF_EXT` and the modifier.
+  `libgbm.so.1` is loaded at run time.
+- Without GBM, the ring falls back to exported GL textures. A ring whose
+  modifier is not in the list is refused (`Unavailable`), so rumb takes the
+  CPU path rather than handing gpui a buffer it cannot draw. `None` (the
+  consumer cannot say) keeps the old behaviour.
+- `import_dma_buf` still checks every import with
+  `vkGetPhysicalDeviceImageFormatProperties2` (modifier, size, importable)
+  and picks the memory type with `vkGetMemoryFdPropertiesKHR`.
 
 ### Buffer reuse: read leases
 
