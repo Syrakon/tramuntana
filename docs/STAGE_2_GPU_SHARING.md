@@ -237,13 +237,23 @@ The consumer says what it can import, and the producer allocates with that:
   `external_texture_import::request_device_with_dma_buf` opens the device
   through `open_with_callback` with the extension added. When it cannot,
   the device opens as before and every import is refused.
-- After opening the device, `gpui_wgpu` publishes the single-plane
-  `R8G8B8A8_UNORM` modifiers it can import from a dma-buf and sample
-  (`sampleable_modifiers`) through
-  `gpui::external_texture::set_importable_abgr8888_modifiers`. The list is
-  empty when the extension is off.
-- rumb passes that list to `export_framebuffer_dma_buf(importable)`. The
-  export ring is then allocated with GBM (`gbm_bo_create_with_modifiers2`),
+- After opening the device, `gpui_wgpu` publishes a
+  `gpui::external_texture::DmaBufImportTarget` through
+  `set_dma_buf_import_target`. It holds the single-plane `R8G8B8A8_UNORM`
+  modifiers the device can import from a dma-buf and sample
+  (`sampleable_modifiers`), empty when the extension is off, and the DRM
+  nodes of its GPU (`drm_nodes`, from `VK_EXT_physical_device_drm`), empty
+  when the driver lacks that extension.
+- rumb passes both to `export_framebuffer_dma_buf(Some(DmaBufImporter))`.
+  The producer first checks that the DRM node of the current EGL display
+  (`EGL_EXT_device_drm`) is one of the consumer's nodes. On a machine with
+  two GPUs, Servo's GL and gpui's Vulkan can open different ones; a buffer
+  from the other GPU does not import, or imports through a copy across the
+  bus, so the export is `Unavailable` and the tab takes the CPU path. When
+  either side cannot name its node, the check passes and the import check
+  below still guards the frame. gpui does not pick its adapter by the EGL
+  node: it opens its device before Servo creates its GL context.
+- The export ring is then allocated with GBM (`gbm_bo_create_with_modifiers2`),
   on the DRM node of the current EGL display (`EGL_EXT_device_drm`), and
   imported into GL with `EGL_LINUX_DMA_BUF_EXT` and the modifier.
   `libgbm.so.1` is loaded at run time.
@@ -251,6 +261,9 @@ The consumer says what it can import, and the producer allocates with that:
   modifier is not in the list is refused (`Unavailable`), so rumb takes the
   CPU path rather than handing gpui a buffer it cannot draw. `None` (the
   consumer cannot say) keeps the old behaviour.
+- A ring that cannot be built is not retried on every frame, which would
+  open GBM and allocate each time. The context remembers the size and
+  importer the build failed for, and tries again only when one changes.
 - `import_dma_buf` still checks every import with
   `vkGetPhysicalDeviceImageFormatProperties2` (modifier, size, importable)
   and picks the memory type with `vkGetMemoryFdPropertiesKHR`.

@@ -262,6 +262,53 @@ pub fn sampleable_modifiers(device: &wgpu::Device, vk_format: vk::Format) -> Vec
         .collect()
 }
 
+/// The DRM nodes of `device`'s GPU as `(major, minor)`: the primary node,
+/// then the render node when there is one. A dma-buf producer compares them
+/// with its own GPU, since a buffer from another GPU does not import. Empty
+/// when the device is not Vulkan or the driver lacks
+/// `VK_EXT_physical_device_drm`.
+pub fn drm_nodes(device: &wgpu::Device) -> Vec<(u32, u32)> {
+    // SAFETY: the hal device is only used inside this function.
+    let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+        return Vec::new();
+    };
+    let instance = hal_device.shared_instance().raw_instance();
+    let phys_dev = hal_device.raw_physical_device();
+    // SAFETY: `phys_dev` belongs to `instance`.
+    let extensions =
+        match unsafe { instance.enumerate_device_extension_properties(phys_dev) } {
+            Ok(extensions) => extensions,
+            Err(err) => {
+                log::warn!("listing the Vulkan device extensions failed: {err}");
+                return Vec::new();
+            }
+        };
+    let supported = extensions.iter().any(|extension| {
+        extension.extension_name_as_c_str() == Ok(ash::ext::physical_device_drm::NAME)
+    });
+    if !supported {
+        log::info!(
+            "{} not supported; dma-buf producers cannot check they share the GPU",
+            ash::ext::physical_device_drm::NAME.to_string_lossy()
+        );
+        return Vec::new();
+    }
+    let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+    // SAFETY: the device supports the extension (checked above), so the
+    // driver fills the chained `drm`, which outlives the call.
+    unsafe { instance.get_physical_device_properties2(phys_dev, &mut properties) };
+    let mut nodes = Vec::with_capacity(2);
+    // Vulkan reports node numbers as signed integers; DRM numbers fit in u32.
+    if drm.has_primary == vk::TRUE {
+        nodes.push((drm.primary_major as u32, drm.primary_minor as u32));
+    }
+    if drm.has_render == vk::TRUE {
+        nodes.push((drm.render_major as u32, drm.render_minor as u32));
+    }
+    nodes
+}
+
 /// The largest image of `vk_format` with `modifier` that `phys_dev` can
 /// import from a dma-buf and sample, or why it cannot.
 fn import_extent(

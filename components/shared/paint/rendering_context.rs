@@ -458,6 +458,18 @@ pub enum DmaBufExportError {
     Unavailable,
 }
 
+/// What the consumer of an exported dma-buf can import. See
+/// [`WindowRenderingContext::export_framebuffer_dma_buf`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaBufImporter<'a> {
+    /// The DRM nodes of the consumer's GPU as `(major, minor)`. A buffer
+    /// rendered on another GPU is not exported. Empty when the consumer
+    /// cannot say which GPU it is on.
+    pub drm_nodes: &'a [(u32, u32)],
+    /// The DRM modifiers the consumer imports `DRM_FORMAT_ABGR8888` with.
+    pub abgr8888_modifiers: &'a [u64],
+}
+
 /// A [`RenderingContext`] that uses the `surfman` library to render to a
 /// `raw-window-handle` identified window. `surfman` will attempt to create an
 /// OpenGL context and surface for this window. This is a simple implementation
@@ -477,7 +489,7 @@ pub struct WindowRenderingContext {
     /// fd. Each call to `export_framebuffer_dma_buf` blits surfman's FBO
     /// onto our private texture (GPU-to-GPU) and dups the cached fd. See
     /// `docs/STAGE_2_GPU_SHARING.md`.
-    dma_buf_cache: RefCell<Option<dma_buf_export::Cache>>,
+    dma_buf_cache: RefCell<dma_buf_export::CacheSlot>,
 }
 
 impl WindowRenderingContext {
@@ -534,7 +546,7 @@ impl WindowRenderingContext {
         Ok(Self {
             size: Cell::new(size),
             surfman_context,
-            dma_buf_cache: RefCell::new(None),
+            dma_buf_cache: RefCell::default(),
         })
     }
 
@@ -568,7 +580,7 @@ impl WindowRenderingContext {
         Ok(Self {
             size: Cell::new(size),
             surfman_context,
-            dma_buf_cache: RefCell::new(None),
+            dma_buf_cache: RefCell::default(),
         })
     }
 
@@ -705,13 +717,14 @@ impl WindowRenderingContext {
     /// See `docs/STAGE_2_GPU_SHARING.md` for the full producer/consumer
     /// design.
     ///
-    /// `importable` lists the DRM modifiers the consumer can import
-    /// `DRM_FORMAT_ABGR8888` with. When given, the export buffers are
-    /// allocated with one of them, and the export is `Unavailable` when none
-    /// works; `None` lets the driver pick, for a consumer that cannot say.
+    /// `importer` says what the consumer can import. When given, the export
+    /// buffers are allocated with one of its modifiers, and the export is
+    /// `Unavailable` when none works or GL renders on another GPU; `None`
+    /// lets the driver pick, for a consumer that cannot say. A ring that
+    /// cannot be built is not retried until the size or `importer` changes.
     pub fn export_framebuffer_dma_buf(
         &self,
-        importable: Option<&[u64]>,
+        importer: Option<DmaBufImporter<'_>>,
     ) -> Result<DmaBufHandle, DmaBufExportError> {
         let size = self.size.get();
 
@@ -742,7 +755,7 @@ impl WindowRenderingContext {
             size,
             source_fbo,
             &self.surfman_context.gleam_gl,
-            importable,
+            importer,
         )
     }
 }
@@ -955,7 +968,7 @@ pub struct OffscreenRenderingContext {
     /// Stage 2 dma-buf export cache for this context's FBO (tramuntana). Sized
     /// to `size`; rebuilt when the offscreen FBO is resized. Mirrors the cache
     /// on [`WindowRenderingContext`] but sources from our own framebuffer.
-    dma_buf_cache: RefCell<Option<dma_buf_export::Cache>>,
+    dma_buf_cache: RefCell<dma_buf_export::CacheSlot>,
 }
 
 type RenderToParentCallback = Box<dyn Fn(&glow::Context, Rect<i32>) + Send + Sync>;
@@ -972,7 +985,7 @@ impl OffscreenRenderingContext {
             parent_context,
             size: Cell::new(size),
             framebuffer,
-            dma_buf_cache: RefCell::new(None),
+            dma_buf_cache: RefCell::default(),
         }
     }
 
@@ -983,13 +996,14 @@ impl OffscreenRenderingContext {
     /// `RenderingContext::resize` impl for this type just swaps the FBO),
     /// unlike the surfman window surface. See `docs/STAGE_2_GPU_SHARING.md`.
     ///
-    /// `importable` lists the DRM modifiers the consumer can import
-    /// `DRM_FORMAT_ABGR8888` with. When given, the export buffers are
-    /// allocated with one of them, and the export is `Unavailable` when none
-    /// works; `None` lets the driver pick, for a consumer that cannot say.
+    /// `importer` says what the consumer can import. When given, the export
+    /// buffers are allocated with one of its modifiers, and the export is
+    /// `Unavailable` when none works or GL renders on another GPU; `None`
+    /// lets the driver pick, for a consumer that cannot say. A ring that
+    /// cannot be built is not retried until the size or `importer` changes.
     pub fn export_framebuffer_dma_buf(
         &self,
-        importable: Option<&[u64]>,
+        importer: Option<DmaBufImporter<'_>>,
     ) -> Result<DmaBufHandle, DmaBufExportError> {
         // Make our GL/EGL context current so the EGL export queries see the
         // right display/context.
@@ -999,7 +1013,7 @@ impl OffscreenRenderingContext {
         let source_fbo = self.framebuffer.borrow().framebuffer_id;
         let gl = self.parent_context.gleam_gl_api();
         let mut cache = self.dma_buf_cache.borrow_mut();
-        dma_buf_export::blit_and_export(&mut cache, self.size.get(), source_fbo, &gl, importable)
+        dma_buf_export::blit_and_export(&mut cache, self.size.get(), source_fbo, &gl, importer)
     }
 
     pub fn parent_context(&self) -> &WindowRenderingContext {
@@ -1213,7 +1227,8 @@ mod dma_buf_export {
     use std::ffi::{CStr, c_char, c_void};
     use std::fs::{File, OpenOptions};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::path::PathBuf;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1224,7 +1239,7 @@ mod dma_buf_export {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{DmaBufExportError, DmaBufHandle, DmaBufLease};
+    use super::{DmaBufExportError, DmaBufHandle, DmaBufImporter, DmaBufLease};
 
     /// `EGL_GL_TEXTURE_2D_KHR` from `EGL_KHR_gl_texture_2D_image`.
     const EGL_GL_TEXTURE_2D_KHR: egl::Enum = 0x30B1;
@@ -1352,7 +1367,7 @@ mod dma_buf_export {
         /// the cause logged, when libgbm, the EGL device extensions or the
         /// node are missing.
         fn open(egl_instance: &egl::Instance<egl::Static>, display: egl::EGLDisplay) -> Option<Self> {
-            let node = Self::node_path(egl_instance, display)?;
+            let node = drm_node_path(egl_instance, display)?;
             let node = match OpenOptions::new().read(true).write(true).open(&node) {
                 Ok(file) => file,
                 Err(error) => {
@@ -1397,36 +1412,73 @@ mod dma_buf_export {
             }
             Some(gbm)
         }
+    }
 
-        /// The DRM render node (else the primary node) the EGL display is on.
-        fn node_path(
-            egl_instance: &egl::Instance<egl::Static>,
-            display: egl::EGLDisplay,
-        ) -> Option<PathBuf> {
-            // SAFETY: each type is the signature of the entry point named.
-            let query_display: EglQueryDisplayAttribExt =
-                unsafe { load(egl_instance, "eglQueryDisplayAttribEXT")? };
-            let query_device: EglQueryDeviceStringExt =
-                unsafe { load(egl_instance, "eglQueryDeviceStringEXT")? };
-            let mut device: egl::Attrib = 0;
-            // SAFETY: `display` is the current, initialised display and
-            // `device` a valid out pointer.
-            if unsafe { query_display(display, EGL_DEVICE_EXT, &mut device) } != EGL_TRUE {
-                log::warn!("Stage 2 GBM: eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed");
-                return None;
-            }
-            for name in [EGL_DRM_RENDER_NODE_FILE_EXT, EGL_DRM_DEVICE_FILE_EXT] {
-                // SAFETY: `device` came from the query above. The returned
-                // string, when not null, is owned by EGL and stays valid.
-                let path = unsafe { query_device(device as *mut c_void, name) };
-                if !path.is_null() {
-                    let path = unsafe { CStr::from_ptr(path) };
-                    return Some(PathBuf::from(path.to_string_lossy().into_owned()));
-                }
-            }
-            log::warn!("Stage 2 GBM: the EGL device names no DRM node");
-            None
+    /// The DRM render node (else the primary node) the EGL display is on.
+    fn drm_node_path(
+        egl_instance: &egl::Instance<egl::Static>,
+        display: egl::EGLDisplay,
+    ) -> Option<PathBuf> {
+        // SAFETY: each type is the signature of the entry point named.
+        let query_display: EglQueryDisplayAttribExt =
+            unsafe { load(egl_instance, "eglQueryDisplayAttribEXT")? };
+        let query_device: EglQueryDeviceStringExt =
+            unsafe { load(egl_instance, "eglQueryDeviceStringEXT")? };
+        let mut device: egl::Attrib = 0;
+        // SAFETY: `display` is the current, initialised display and
+        // `device` a valid out pointer.
+        if unsafe { query_display(display, EGL_DEVICE_EXT, &mut device) } != EGL_TRUE {
+            log::warn!("Stage 2 export: eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed");
+            return None;
         }
+        for name in [EGL_DRM_RENDER_NODE_FILE_EXT, EGL_DRM_DEVICE_FILE_EXT] {
+            // SAFETY: `device` came from the query above. The returned
+            // string, when not null, is owned by EGL and stays valid.
+            let path = unsafe { query_device(device as *mut c_void, name) };
+            if !path.is_null() {
+                let path = unsafe { CStr::from_ptr(path) };
+                return Some(PathBuf::from(path.to_string_lossy().into_owned()));
+            }
+        }
+        log::warn!("Stage 2 export: the EGL device names no DRM node");
+        None
+    }
+
+    /// Whether the EGL display renders on one of `consumer_nodes`, the DRM
+    /// nodes of the consumer's GPU. A buffer from another GPU does not
+    /// import, or imports through a copy across the bus. True when either
+    /// side cannot say which GPU it is on: the consumer still checks every
+    /// import.
+    fn on_consumer_gpu(
+        egl_instance: &egl::Instance<egl::Static>,
+        display: egl::EGLDisplay,
+        consumer_nodes: &[(u32, u32)],
+    ) -> bool {
+        if consumer_nodes.is_empty() {
+            return true;
+        }
+        let Some(path) = drm_node_path(egl_instance, display) else {
+            return true;
+        };
+        let device = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.rdev() as libc::dev_t,
+            Err(error) => {
+                log::warn!("Stage 2 export: cannot stat {path:?}: {error}");
+                return true;
+            },
+        };
+        let node = (libc::major(device), libc::minor(device));
+        if consumer_nodes.contains(&node) {
+            return true;
+        }
+        log::warn!(
+            "Stage 2 cache: GL renders on {} ({}:{}) but the consumer's GPU is on {consumer_nodes:?}; \
+             no dma-buf export",
+            Path::new(&path).display(),
+            node.0,
+            node.1
+        );
+        false
     }
 
     impl Drop for Gbm {
@@ -1519,13 +1571,9 @@ mod dma_buf_export {
         /// EGL extension entry points. Loaded once, reused across frames and
         /// shared by every buffer in the ring.
         egl_funcs: EglFuncs,
-        /// Ring dimensions. All buffers match; used for the resize check and to
-        /// stamp emitted [`DmaBufHandle`]s.
-        width: u32,
-        height: u32,
-        /// The modifiers the consumer said it imports when the ring was
-        /// built; a different list rebuilds it.
-        importable: Option<Vec<u64>>,
+        /// What the ring was built for. Its size stamps emitted
+        /// [`DmaBufHandle`]s.
+        key: RingKey,
         /// Allocator of the ring's buffers, when they came from GBM. `Drop`
         /// destroys the buffers before this field drops.
         gbm: Option<Gbm>,
@@ -1560,6 +1608,52 @@ mod dma_buf_export {
         // context teardown.
     }
 
+    /// What an export ring is built for; a change rebuilds it.
+    #[derive(Clone, Debug)]
+    pub(super) struct RingKey {
+        /// Ring dimensions. All buffers match.
+        width: u32,
+        height: u32,
+        /// The consumer's [`DmaBufImporter`]: its DRM nodes and modifiers.
+        importer: Option<(Vec<(u32, u32)>, Vec<u64>)>,
+    }
+
+    impl RingKey {
+        fn new(size: PhysicalSize<u32>, importer: Option<DmaBufImporter<'_>>) -> Self {
+            Self {
+                width: size.width,
+                height: size.height,
+                importer: importer
+                    .map(|importer| (importer.drm_nodes.to_vec(), importer.abgr8888_modifiers.to_vec())),
+            }
+        }
+
+        fn matches(&self, size: PhysicalSize<u32>, importer: Option<DmaBufImporter<'_>>) -> bool {
+            self.width == size.width &&
+                self.height == size.height &&
+                match (&self.importer, importer) {
+                    (None, None) => true,
+                    (Some((nodes, modifiers)), Some(importer)) => {
+                        nodes[..] == *importer.drm_nodes &&
+                            modifiers[..] == *importer.abgr8888_modifiers
+                    },
+                    _ => false,
+                }
+        }
+    }
+
+    /// The export ring of a rendering context, built on the first export.
+    #[derive(Default)]
+    pub(super) enum CacheSlot {
+        #[default]
+        Empty,
+        Ready(Cache),
+        /// The last build failed for this key. Exports are `Unavailable`
+        /// without retrying, which would allocate on every frame, until the
+        /// size or the consumer changes.
+        Failed(RingKey),
+    }
+
     impl Drop for Cache {
         fn drop(&mut self) {
             destroy_export_buffers(
@@ -1586,18 +1680,25 @@ mod dma_buf_export {
         Some(unsafe { std::mem::transmute_copy::<extern "system" fn(), T>(&raw) })
     }
 
-    /// Build the export ring. With `importable` (the modifiers the consumer
-    /// imports, see [`blit_and_export`]) the buffers come from GBM with one of
-    /// those modifiers, else from exported GL textures; a ring the consumer
-    /// cannot import is refused, so the caller falls back to the CPU path.
+    /// Build the export ring. With an `importer` the buffers come from GBM
+    /// with one of its modifiers, else from exported GL textures; a ring the
+    /// consumer cannot import, or one on another GPU, is refused, so the
+    /// caller falls back to the CPU path.
     fn build_cache(
-        size: PhysicalSize<u32>,
+        key: RingKey,
         gl: &Rc<dyn Gl>,
-        importable: Option<&[u64]>,
+        importer: Option<DmaBufImporter<'_>>,
     ) -> Option<Cache> {
+        let size = PhysicalSize::new(key.width, key.height);
         let egl_instance = egl::Instance::new(egl::Static);
         let display = egl_instance.get_current_display()?;
         let context = egl_instance.get_current_context()?;
+        if let Some(importer) = importer {
+            if !on_consumer_gpu(&egl_instance, display.as_ptr(), importer.drm_nodes) {
+                return None;
+            }
+        }
+        let importable = importer.map(|importer| importer.abgr8888_modifiers);
 
         let egl_funcs = EglFuncs {
             create_image: unsafe { load(&egl_instance, "eglCreateImageKHR")? },
@@ -1662,9 +1763,7 @@ mod dma_buf_export {
             busy_since: None,
             egl_display: display.as_ptr(),
             egl_funcs,
-            width: size.width,
-            height: size.height,
-            importable: importable.map(<[u64]>::to_vec),
+            key,
             gbm,
         })
     }
@@ -2041,28 +2140,34 @@ mod dma_buf_export {
     }
 
     pub(super) fn blit_and_export(
-        cache_slot: &mut Option<Cache>,
+        cache_slot: &mut CacheSlot,
         size: PhysicalSize<u32>,
         source_fbo: u32,
         gl: &Rc<dyn Gl>,
-        importable: Option<&[u64]>,
+        importer: Option<DmaBufImporter<'_>>,
     ) -> Result<DmaBufHandle, DmaBufExportError> {
-        // Invalidate the cache if the window resized or the consumer now
-        // imports other modifiers.
-        if let Some(c) = cache_slot.as_ref() {
-            if c.width != size.width ||
-                c.height != size.height ||
-                c.importable.as_deref() != importable
-            {
-                *cache_slot = None;
-            }
+        // Rebuild the ring if the window resized or the consumer changed. A
+        // failed build is retried only then.
+        let current = match cache_slot {
+            CacheSlot::Empty => false,
+            CacheSlot::Ready(cache) => cache.key.matches(size, importer),
+            CacheSlot::Failed(key) if key.matches(size, importer) => {
+                return Err(DmaBufExportError::Unavailable);
+            },
+            CacheSlot::Failed(_) => false,
+        };
+        if !current {
+            // Free the old ring before allocating its replacement.
+            *cache_slot = CacheSlot::Empty;
+            let key = RingKey::new(size, importer);
+            *cache_slot = match build_cache(key.clone(), gl, importer) {
+                Some(cache) => CacheSlot::Ready(cache),
+                None => CacheSlot::Failed(key),
+            };
         }
-        if cache_slot.is_none() {
-            *cache_slot = Some(
-                build_cache(size, gl, importable).ok_or(DmaBufExportError::Unavailable)?,
-            );
-        }
-        let cache = cache_slot.as_mut().ok_or(DmaBufExportError::Unavailable)?;
+        let CacheSlot::Ready(cache) = cache_slot else {
+            return Err(DmaBufExportError::Unavailable);
+        };
 
         // Copy the slot's scalar fields out so the immutable borrow ends before
         // `make_fence_fd` and the fd dup re-borrow `cache`.
@@ -2107,8 +2212,8 @@ mod dma_buf_export {
         Ok(DmaBufHandle {
             buffer_id,
             fd,
-            width: cache.width,
-            height: cache.height,
+            width: cache.key.width,
+            height: cache.key.height,
             fourcc,
             stride,
             offset,

@@ -18,26 +18,37 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::{DevicePixels, Size};
 
-static IMPORTABLE_ABGR8888_MODIFIERS: RwLock<Option<Arc<[u64]>>> = RwLock::new(None);
+/// What the compositor's GPU device can import as a `DRM_FORMAT_ABGR8888`
+/// dma-buf. A producer allocates its buffers on the same GPU and with one of
+/// the modifiers; any other buffer will not be drawn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DmaBufImportTarget {
+    /// The DRM nodes of the device as `(major, minor)`: its primary node and,
+    /// when it has one, its render node. Empty when the device cannot say
+    /// which GPU it is.
+    pub drm_nodes: Arc<[(u32, u32)]>,
+    /// The DRM format modifiers the device imports. Empty when it imports no
+    /// dma-buf at all.
+    pub abgr8888_modifiers: Arc<[u64]>,
+}
 
-/// The DRM format modifiers the compositor can import a
-/// `DRM_FORMAT_ABGR8888` dma-buf with. A producer allocates its buffers with
-/// one of these; a buffer with any other modifier will not be drawn. `None`
-/// until the compositor's GPU device exists; an empty list means it imports
-/// no dma-buf at all.
-pub fn importable_abgr8888_modifiers() -> Option<Arc<[u64]>> {
-    IMPORTABLE_ABGR8888_MODIFIERS
+static DMA_BUF_IMPORT_TARGET: RwLock<Option<DmaBufImportTarget>> = RwLock::new(None);
+
+/// See [`DmaBufImportTarget`]. `None` until the compositor's GPU device
+/// exists.
+pub fn dma_buf_import_target() -> Option<DmaBufImportTarget> {
+    DMA_BUF_IMPORT_TARGET
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .clone()
 }
 
 /// Set by the renderer each time it opens its GPU device. See
-/// [`importable_abgr8888_modifiers`].
-pub fn set_importable_abgr8888_modifiers(modifiers: Option<Arc<[u64]>>) {
-    *IMPORTABLE_ABGR8888_MODIFIERS
+/// [`dma_buf_import_target`].
+pub fn set_dma_buf_import_target(target: Option<DmaBufImportTarget>) {
+    *DMA_BUF_IMPORT_TARGET
         .write()
-        .unwrap_or_else(PoisonError::into_inner) = modifiers;
+        .unwrap_or_else(PoisonError::into_inner) = target;
 }
 
 /// Trait implemented by embedders that want to hand a GPU-resident texture

@@ -182,15 +182,19 @@ impl WgpuContext {
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?,
         };
-        // Tell dma-buf producers which buffers this device can import; empty
-        // when it was opened without the extension.
+        // Tell dma-buf producers which GPU this device is on and which
+        // buffers it can import; no modifiers when it was opened without the
+        // extension.
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        gpui::external_texture::set_importable_abgr8888_modifiers(Some(
-            crate::external_texture_import::sampleable_modifiers(
-                &device,
-                ash::vk::Format::R8G8B8A8_UNORM,
-            )
-            .into(),
+        gpui::external_texture::set_dma_buf_import_target(Some(
+            gpui::external_texture::DmaBufImportTarget {
+                drm_nodes: crate::external_texture_import::drm_nodes(&device).into(),
+                abgr8888_modifiers: crate::external_texture_import::sampleable_modifiers(
+                    &device,
+                    ash::vk::Format::R8G8B8A8_UNORM,
+                )
+                .into(),
+            },
         ));
 
         Ok((
