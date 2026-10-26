@@ -293,6 +293,36 @@ Vulkan validation is on in debug builds (`InstanceFlags::from_env_or_default`;
 validation layer (`vulkan-validation-layers`) installed; without it wgpu
 skips it silently.
 
+wgpu-hal drops or downgrades some layer messages before they reach the
+log. To see everything, have the layer write its own file:
+`VK_KHRONOS_VALIDATION_DEBUG_ACTION=VK_DBG_LAYER_ACTION_LOG_MSG
+VK_KHRONOS_VALIDATION_LOG_FILENAME=<file>`, plus
+`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` and
+`VK_KHRONOS_VALIDATION_VALIDATE_BEST_PRACTICES=true`. The layer reports
+each message at most 10 times unless
+`VK_KHRONOS_VALIDATION_DUPLICATE_MESSAGE_LIMIT` is raised.
+
+### Queue family ownership
+
+A dma-buf the producer wrote belongs to `VK_QUEUE_FAMILY_FOREIGN_EXT`
+(`VK_QUEUE_FAMILY_EXTERNAL` when the device lacks
+`VK_EXT_queue_family_foreign`), in `GENERAL` layout. gpui must acquire it
+before sampling and hand it back afterwards. A plain transition from
+`UNDEFINED`, which is what wgpu does for any texture it did not create,
+lets the driver discard the contents.
+
+- `gpui_wgpu` uses its own copy of wgpu-hal
+  (`tramuntana/third_party/wgpu-hal`, patched in through rumb's
+  `Cargo.toml`). `Texture::set_external_queue_family` marks an imported
+  image, and its first barrier then acquires it from that family, out of
+  `GENERAL`, instead of discarding it.
+- After the frame's encoder, `release_external_textures` records the
+  release (`SHADER_READ_ONLY_OPTIMAL` to `GENERAL`, back to the foreign
+  family) in a command buffer of its own: wgpu does not allow raw commands
+  in an encoder that took wgpu commands. Both go in the same submit.
+- wgpu still sees a released texture as sampled and would not acquire it
+  again, so every frame imports its buffers anew; nothing is cached.
+
 ### Buffer reuse: read leases
 
 The export ring has two buffers. The producer must not blit into one while
@@ -377,7 +407,9 @@ the export breaks on, and for testing that path.
    is a bottleneck, add a small cache keyed by `(width, height,
    fourcc, modifier, stride, offset)` so successive identical
    descriptors reuse the imported `wgpu::Texture`. First
-   implementation: no cache, measure, then decide.
+   implementation: no cache, measure, then decide. A per-buffer cache
+   was later tried and removed: each import is acquired from and released
+   to the producer's queue family once (see "Queue family ownership").
 
 3. **Color format and channel order** — detect at startup via a
    round-trip probe. Render a 4-pixel test pattern (red, green, blue,

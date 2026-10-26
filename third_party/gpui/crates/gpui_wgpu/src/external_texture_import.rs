@@ -69,14 +69,23 @@ pub(crate) fn request_device_with_dma_buf(
             log::info!("Vulkan device older than 1.2; dma-buf frames will not be imported");
             return None;
         }
+        // Lets an imported image be acquired from the producer's queue family
+        // as VK_QUEUE_FAMILY_FOREIGN_EXT, the family a dma-buf written outside
+        // Vulkan belongs to. Without it imports fall back to
+        // VK_QUEUE_FAMILY_EXTERNAL (see `external_queue_family`).
+        let foreign_extension = ash::ext::queue_family_foreign::NAME;
+        let foreign_supported = capabilities.supports_extension(foreign_extension);
         let add_extension: Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>> =
             Box::new(move |args| {
                 if !args.extensions.contains(&modifier_extension) {
                     args.extensions.push(modifier_extension);
                 }
+                if foreign_supported && !args.extensions.contains(&foreign_extension) {
+                    args.extensions.push(foreign_extension);
+                }
             });
-        // SAFETY: the callback only adds an extension the physical device
-        // reports as supported, with its dependencies core in the device's
+        // SAFETY: the callback only adds extensions the physical device
+        // reports as supported, with their dependencies core in the device's
         // API version (both checked above). It removes nothing.
         let opened = unsafe {
             hal_adapter.open_with_callback(
@@ -307,6 +316,89 @@ pub fn drm_nodes(device: &wgpu::Device) -> Vec<(u32, u32)> {
         nodes.push((drm.render_major as u32, drm.render_minor as u32));
     }
     nodes
+}
+
+/// The queue family a dma-buf belongs to while the producer has it:
+/// VK_QUEUE_FAMILY_FOREIGN_EXT when the device has the extension, which is
+/// the family for memory written outside Vulkan, else
+/// VK_QUEUE_FAMILY_EXTERNAL.
+fn external_queue_family(hal_device: &wgpu::hal::vulkan::Device) -> u32 {
+    if hal_device
+        .enabled_device_extensions()
+        .contains(&ash::ext::queue_family_foreign::NAME)
+    {
+        vk::QUEUE_FAMILY_FOREIGN_EXT
+    } else {
+        vk::QUEUE_FAMILY_EXTERNAL
+    }
+}
+
+/// Hand imported `textures` back to the producer after the frame's last use
+/// of them: from SHADER_READ_ONLY_OPTIMAL, where the frame sampled them, to
+/// GENERAL, and from the device's queue family to [`external_queue_family`].
+/// Pairs with the acquire wgpu-hal records on each import's first use. wgpu
+/// still sees the textures as sampled afterwards, so none of them may be used
+/// again: each frame imports its buffers anew.
+///
+/// The barrier is recorded through the raw API, which wgpu does not allow in
+/// an encoder that also took wgpu commands, so it comes back as a command
+/// buffer of its own, to submit right after the frame's.
+pub fn release_external_textures(
+    device: &wgpu::Device,
+    textures: &[wgpu::Texture],
+) -> Option<wgpu::CommandBuffer> {
+    if textures.is_empty() {
+        return None;
+    }
+    // SAFETY: the hal device is only read here, for handles and the queue
+    // family; nothing outlives the guard.
+    let hal_device = unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }?;
+    let family = hal_device.queue_family_index();
+    let external_family = external_queue_family(&hal_device);
+    let range = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1);
+    let barriers: Vec<_> = textures
+        .iter()
+        .filter_map(|texture| {
+            // SAFETY: only the image handle is read.
+            let hal_texture = unsafe { texture.as_hal::<wgpu::hal::api::Vulkan>() }?;
+            Some(
+                vk::ImageMemoryBarrier::default()
+                    .image(unsafe { hal_texture.raw_handle() })
+                    .subresource_range(range)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(family)
+                    .dst_queue_family_index(external_family),
+            )
+        })
+        .collect();
+    let raw_device = hal_device.raw_device();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("external_texture_release"),
+    });
+    // SAFETY: the encoder records nothing but this barrier, and it is
+    // submitted after the frame that sampled the images.
+    unsafe {
+        encoder.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|hal_encoder| {
+            let Some(hal_encoder) = hal_encoder else {
+                return;
+            };
+            raw_device.cmd_pipeline_barrier(
+                hal_encoder.raw_handle(),
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
+        });
+    }
+    Some(encoder.finish())
 }
 
 /// How an imported image is used: sampled, and copied from too while
@@ -667,7 +759,7 @@ fn import_dma_buf(
         memory_flags: wgpu::hal::MemoryFlags::empty(),
         view_formats: vec![],
     };
-    let hal_texture = unsafe {
+    let mut hal_texture = unsafe {
         hal_device.texture_from_raw(
             vk_image,
             &hal_desc,
@@ -675,6 +767,10 @@ fn import_dma_buf(
             wgpu::hal::vulkan::TextureMemory::Dedicated(vk_memory),
         )
     };
+    // SAFETY: the producer leaves the dma-buf in GENERAL layout, owned by
+    // its own queue family, and the renderer hands the image back with
+    // `release_external_textures` after the frame that samples it.
+    unsafe { hal_texture.set_external_queue_family(external_queue_family(hal_device)) };
 
     let wgpu_desc = wgpu::TextureDescriptor {
         label: Some("rumb-external-dma-buf"),
