@@ -14,6 +14,7 @@
 //! end-to-end architecture.
 
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::{DevicePixels, Size};
@@ -49,6 +50,25 @@ pub fn set_dma_buf_import_target(target: Option<DmaBufImportTarget>) {
     *DMA_BUF_IMPORT_TARGET
         .write()
         .unwrap_or_else(PoisonError::into_inner) = target;
+}
+
+static FRAME_STAMP_CHECKS: AtomicBool = AtomicBool::new(false);
+
+/// Debug mode for the dma-buf bridge. While on, the compositor reads back the
+/// frame stamp of each new external frame and logs an error when it is not
+/// the one [`ExternalGpuTexture::frame_stamp`] announces: a stale, torn or
+/// unsynchronised frame. Each check blocks until the GPU copy is done.
+///
+/// Turn it on before the GPU device opens: the compositor only imports
+/// buffers it can copy from while it is on, and decides which it can import
+/// when the device opens.
+pub fn set_frame_stamp_checks(enabled: bool) {
+    FRAME_STAMP_CHECKS.store(enabled, Ordering::Relaxed);
+}
+
+/// See [`set_frame_stamp_checks`].
+pub fn frame_stamp_checks() -> bool {
+    FRAME_STAMP_CHECKS.load(Ordering::Relaxed)
 }
 
 /// Trait implemented by embedders that want to hand a GPU-resident texture
@@ -91,6 +111,14 @@ pub trait ExternalGpuTexture: Send + Sync {
     /// samples the buffer, so the producer can tell when writing into it again
     /// is safe. `None` (the default) for producers that do not track readers.
     fn read_lease(&self) -> Option<ExternalReadLease> {
+        None
+    }
+
+    /// The frame counter the producer stamped into the buffer
+    /// [`Self::buffer_id`] names, for [`frame_stamp_checks`]. The first and
+    /// the last texel in memory order each hold it as little-endian RGBA8
+    /// bytes. `None` (the default) for producers that do not stamp.
+    fn frame_stamp(&self) -> Option<u32> {
         None
     }
 }

@@ -268,6 +268,31 @@ The consumer says what it can import, and the producer allocates with that:
   `vkGetPhysicalDeviceImageFormatProperties2` (modifier, size, importable)
   and picks the memory type with `vkGetMemoryFdPropertiesKHR`.
 
+### Debug checks: frame stamps and Vulkan validation
+
+`RUMB_FRAME_STAMPS=1` checks that gpui draws the frame Servo says it
+exported:
+
+- rumb turns on `paint_api::set_dma_buf_frame_stamps` and
+  `gpui::external_texture::set_frame_stamp_checks` before gpui opens its
+  device.
+- After each blit, the producer writes a frame counter over the first and
+  the last texel of the buffer, as little-endian RGBA8 bytes (a
+  scissored `glClear`), and hands it out as `DmaBufHandle::frame_stamp`.
+  The counter is per ring and never 0.
+- For each new frame, after the fence wait, `gpui_wgpu` copies those two
+  texels to a buffer, waits for the copy, and logs an error when either is
+  not the announced stamp (`check_frame_stamp`). A stale buffer, a missing
+  wait or a torn write shows up there. Imported images are created with
+  `TRANSFER_SRC` usage only while the checks are on.
+- Each check stalls the frame on the GPU, and the stamp is visible as one
+  pixel in two corners of the page: debug only.
+
+Vulkan validation is on in debug builds (`InstanceFlags::from_env_or_default`;
+`WGPU_VALIDATION=1` turns it on in release). It needs the Khronos
+validation layer (`vulkan-validation-layers`) installed; without it wgpu
+skips it silently.
+
 ### Buffer reuse: read leases
 
 The export ring has two buffers. The producer must not blit into one while

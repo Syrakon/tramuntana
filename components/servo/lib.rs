@@ -78,6 +78,7 @@ pub use paint::{ViewportScrollExtent, WebRenderDebugOption};
 pub use paint_api::rendering_context::{
     DmaBufExportError, DmaBufHandle, DmaBufImporter, DmaBufLease, OffscreenRenderingContext,
     RenderingContext, SoftwareRenderingContext, WindowRenderingContext,
+    set_dma_buf_frame_stamps,
 };
 // Expose our profile traits for servoshell, so we can instrument code there, but don't
 // add it as an official API.

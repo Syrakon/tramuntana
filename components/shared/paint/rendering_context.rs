@@ -9,6 +9,7 @@ use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dpi::PhysicalSize;
 use embedder_traits::RefreshDriver;
@@ -438,6 +439,20 @@ pub struct DmaBufHandle {
     /// consumer keeps a clone until the GPU has finished every frame that
     /// samples the buffer.
     pub lease: DmaBufLease,
+    /// The frame counter stamped into the buffer while
+    /// [`set_dma_buf_frame_stamps`] is on; `None` otherwise. The first and the
+    /// last texel in memory order each hold it as little-endian RGBA8 bytes.
+    pub frame_stamp: Option<u32>,
+}
+
+static DMA_BUF_FRAME_STAMPS: AtomicBool = AtomicBool::new(false);
+
+/// Debug mode for the dma-buf export. While on, each export writes a frame
+/// counter over two texels of the buffer (see [`DmaBufHandle::frame_stamp`])
+/// so the consumer can read it back and catch a stale, torn or unsynchronised
+/// frame. The stamp is visible: one pixel in two corners of the page.
+pub fn set_dma_buf_frame_stamps(enabled: bool) {
+    DMA_BUF_FRAME_STAMPS.store(enabled, Ordering::Relaxed);
 }
 
 /// See [`DmaBufHandle::lease`]. Cheap to clone; carries no data. Only held:
@@ -1239,7 +1254,9 @@ mod dma_buf_export {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{DmaBufExportError, DmaBufHandle, DmaBufImporter, DmaBufLease};
+    use super::{
+        DMA_BUF_FRAME_STAMPS, DmaBufExportError, DmaBufHandle, DmaBufImporter, DmaBufLease,
+    };
 
     /// `EGL_GL_TEXTURE_2D_KHR` from `EGL_KHR_gl_texture_2D_image`.
     const EGL_GL_TEXTURE_2D_KHR: egl::Enum = 0x30B1;
@@ -1574,6 +1591,8 @@ mod dma_buf_export {
         /// What the ring was built for. Its size stamps emitted
         /// [`DmaBufHandle`]s.
         key: RingKey,
+        /// The last frame stamp written; see [`DmaBufHandle::frame_stamp`].
+        frame_counter: u32,
         /// Allocator of the ring's buffers, when they came from GBM. `Drop`
         /// destroys the buffers before this field drops.
         gbm: Option<Gbm>,
@@ -1764,6 +1783,7 @@ mod dma_buf_export {
             egl_display: display.as_ptr(),
             egl_funcs,
             key,
+            frame_counter: 0,
             gbm,
         })
     }
@@ -2139,6 +2159,46 @@ mod dma_buf_export {
         Some(idx)
     }
 
+    /// Write `stamp` over the first and the last texel of `fbo`'s colour
+    /// buffer, as little-endian RGBA8 bytes. Leaves the scissor, clear colour
+    /// and colour mask as it found them.
+    fn write_frame_stamp(gl: &Rc<dyn Gl>, fbo: u32, size: PhysicalSize<u32>, stamp: u32) {
+        let mut scissor_box = [0; 4];
+        let mut clear_color = [0.0; 4];
+        let mut color_mask = [0; 4];
+        // SAFETY: each slice holds exactly the 4 values its query writes.
+        unsafe {
+            gl.get_integer_v(gl::SCISSOR_BOX, &mut scissor_box);
+            gl.get_float_v(gl::COLOR_CLEAR_VALUE, &mut clear_color);
+            gl.get_boolean_v(gl::COLOR_WRITEMASK, &mut color_mask);
+        }
+        let scissor_was_on = gl.is_enabled(gl::SCISSOR_TEST) != gl::FALSE;
+
+        // k / 255 converts back to exactly k in an 8-bit unorm buffer.
+        let [r, g, b, a] = stamp.to_le_bytes().map(|byte| f32::from(byte) / 255.0);
+        gl.bind_framebuffer(gl::DRAW_FRAMEBUFFER, fbo);
+        gl.enable(gl::SCISSOR_TEST);
+        gl.color_mask(true, true, true, true);
+        gl.clear_color(r, g, b, a);
+        let last = (size.width as i32 - 1, size.height as i32 - 1);
+        for (x, y) in [(0, 0), last] {
+            gl.scissor(x, y, 1, 1);
+            gl.clear(gl::COLOR_BUFFER_BIT);
+        }
+
+        gl.scissor(scissor_box[0], scissor_box[1], scissor_box[2], scissor_box[3]);
+        gl.clear_color(clear_color[0], clear_color[1], clear_color[2], clear_color[3]);
+        gl.color_mask(
+            color_mask[0] != gl::FALSE,
+            color_mask[1] != gl::FALSE,
+            color_mask[2] != gl::FALSE,
+            color_mask[3] != gl::FALSE,
+        );
+        if !scissor_was_on {
+            gl.disable(gl::SCISSOR_TEST);
+        }
+    }
+
     pub(super) fn blit_and_export(
         cache_slot: &mut CacheSlot,
         size: PhysicalSize<u32>,
@@ -2196,6 +2256,12 @@ mod dma_buf_export {
             gl::COLOR_BUFFER_BIT,
             gl::NEAREST,
         );
+        let frame_stamp = DMA_BUF_FRAME_STAMPS.load(Ordering::Relaxed).then(|| {
+            // Never 0, which is what a buffer nobody wrote holds.
+            cache.frame_counter = cache.frame_counter.checked_add(1).unwrap_or(1);
+            write_frame_stamp(gl, gl_fbo, size, cache.frame_counter);
+            cache.frame_counter
+        });
         // Restore default binding so subsequent surfman ops aren't surprised.
         gl.bind_framebuffer(gl::FRAMEBUFFER, 0);
         gl.flush();
@@ -2222,6 +2288,7 @@ mod dma_buf_export {
             lease: DmaBufLease {
                 _readers: cache.buffers[idx].readers.clone(),
             },
+            frame_stamp,
         })
     }
 }

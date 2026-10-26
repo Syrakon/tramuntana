@@ -1654,6 +1654,21 @@ impl WgpuRenderer {
                     None => continue, // import_external_texture logs the cause
                 };
 
+                // Debug mode: read back the stamp of each new frame before
+                // drawing it.
+                if rewritten
+                    && gpui::external_texture::frame_stamp_checks()
+                    && let Some(stamp) = sprite.handle.frame_stamp()
+                {
+                    crate::external_texture_import::check_frame_stamp(
+                        &resources.device,
+                        &resources.queue,
+                        &texture,
+                        buffer_id,
+                        stamp,
+                    );
+                }
+
                 // Held until the GPU has finished this frame, so the producer
                 // does not write into the buffer while the draw below reads it.
                 if let Some(lease) = sprite.handle.read_lease() {

@@ -209,7 +209,10 @@ impl WgpuContext {
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            flags: wgpu::InstanceFlags::default(),
+            // Validation is on in debug builds; `WGPU_VALIDATION=1` turns it
+            // on in release too, `WGPU_VALIDATION=0` off. It needs the
+            // Khronos validation layer installed.
+            flags: wgpu::InstanceFlags::from_env_or_default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: Some(display),

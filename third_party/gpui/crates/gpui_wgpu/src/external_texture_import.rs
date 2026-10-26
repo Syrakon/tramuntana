@@ -309,6 +309,111 @@ pub fn drm_nodes(device: &wgpu::Device) -> Vec<(u32, u32)> {
     nodes
 }
 
+/// How an imported image is used: sampled, and copied from too while
+/// [`gpui::external_texture::frame_stamp_checks`] reads its frame stamps back.
+fn image_usage() -> vk::ImageUsageFlags {
+    if gpui::external_texture::frame_stamp_checks() {
+        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
+    } else {
+        vk::ImageUsageFlags::SAMPLED
+    }
+}
+
+/// Read back the frame stamp of `texture`, imported from buffer `buffer_id`,
+/// and log an error when it is not `expected`. See
+/// [`gpui::external_texture::ExternalGpuTexture::frame_stamp`] for where the
+/// producer writes it. Blocks until the GPU copy is done: debug mode only.
+pub fn check_frame_stamp(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    buffer_id: u64,
+    expected: u32,
+) {
+    // One texel per copy, each at an offset the copy alignment allows.
+    const SLOT: u64 = wgpu::COPY_BUFFER_ALIGNMENT * 64;
+    let size = texture.size();
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("frame_stamp_readback"),
+        size: SLOT * 2,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("frame_stamp_check"),
+    });
+    let corners = [(0, 0), (size.width - 1, size.height - 1)];
+    for (slot, (x, y)) in corners.into_iter().enumerate() {
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: slot as u64 * SLOT,
+                    bytes_per_row: None,
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let submission = queue.submit([encoder.finish()]);
+    let slice = readback.slice(..);
+    let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        // The receiver only goes away once the check has given up.
+        if mapped_tx.send(result).is_err() {
+            log::debug!("frame stamp check: the copy was mapped after the check gave up");
+        }
+    });
+    if let Err(err) = device.poll(wgpu::PollType::Wait {
+        submission_index: Some(submission),
+        timeout: None,
+    }) {
+        log::warn!("frame stamp check of buffer {buffer_id}: waiting for the copy failed: {err}");
+        return;
+    }
+    match mapped_rx.try_recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            log::warn!("frame stamp check of buffer {buffer_id}: mapping the copy failed: {err}");
+            return;
+        }
+        Err(err) => {
+            log::warn!("frame stamp check of buffer {buffer_id}: the copy was not mapped: {err}");
+            return;
+        }
+    }
+    let found = {
+        let bytes = slice.get_mapped_range();
+        let texel = |slot: usize| {
+            let at = slot * SLOT as usize;
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        [texel(0), texel(1)]
+    };
+    readback.unmap();
+    if found == [expected; 2] {
+        log::trace!("frame stamp {expected} of buffer {buffer_id} checked");
+    } else {
+        log::error!(
+            "frame stamp mismatch on buffer {buffer_id}: expected {expected}, the first texel \
+             holds {} and the last {}",
+            found[0],
+            found[1]
+        );
+    }
+}
+
 /// The largest image of `vk_format` with `modifier` that `phys_dev` can
 /// import from a dma-buf and sample, or why it cannot.
 fn import_extent(
@@ -326,7 +431,7 @@ fn import_extent(
         .format(vk_format)
         .ty(vk::ImageType::TYPE_2D)
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(vk::ImageUsageFlags::SAMPLED)
+        .usage(image_usage())
         .push_next(&mut external_format_info)
         .push_next(&mut modifier_format_info);
     let mut external_properties = vk::ExternalImageFormatProperties::default();
@@ -468,7 +573,7 @@ fn import_dma_buf(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(vk::ImageUsageFlags::SAMPLED)
+        .usage(image_usage())
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut external_memory_info)
@@ -554,7 +659,11 @@ fn import_dma_buf(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu_format,
-        usage: wgpu::wgt::TextureUses::RESOURCE,
+        usage: if gpui::external_texture::frame_stamp_checks() {
+            wgpu::wgt::TextureUses::RESOURCE | wgpu::wgt::TextureUses::COPY_SRC
+        } else {
+            wgpu::wgt::TextureUses::RESOURCE
+        },
         memory_flags: wgpu::hal::MemoryFlags::empty(),
         view_formats: vec![],
     };
@@ -578,7 +687,11 @@ fn import_dma_buf(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu_format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: if gpui::external_texture::frame_stamp_checks() {
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC
+        } else {
+            wgpu::TextureUsages::TEXTURE_BINDING
+        },
         view_formats: &[],
     };
     let texture = unsafe {
