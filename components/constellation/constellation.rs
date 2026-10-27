@@ -2310,7 +2310,82 @@ where
                 );
                 true
             },
+            // A page reports its own title and media session.
+            ScriptToConstellationMessage::TitleChanged(pipeline_id, _) |
+            ScriptToConstellationMessage::MediaSessionEvent(pipeline_id, _) => {
+                if *pipeline_id != source_pipeline_id {
+                    return refuse(&format!("to speak for {pipeline_id}"));
+                }
+                true
+            },
+            // A page removes only the frames it holds itself. One already gone has nothing
+            // left to remove.
+            ScriptToConstellationMessage::RemoveIFrame(browsing_context_id, _) => {
+                match self.browsing_contexts.get(browsing_context_id) {
+                    Some(browsing_context)
+                        if browsing_context.parent_pipeline_id != Some(source_pipeline_id) =>
+                    {
+                        refuse(&format!("to remove {browsing_context_id}, not its frame"))
+                    },
+                    _ => true,
+                }
+            },
+            // A frame passes the keyboard scroll it cannot use on to its own parent.
+            ScriptToConstellationMessage::ForwardKeyboardScroll(pipeline_id, _) => {
+                let parent_pipeline_id = self
+                    .browsing_contexts
+                    .get(&pipeline.browsing_context_id)
+                    .and_then(|browsing_context| browsing_context.parent_pipeline_id);
+                if parent_pipeline_id != Some(*pipeline_id) {
+                    return refuse(&format!("to scroll {pipeline_id}, not its parent"));
+                }
+                true
+            },
+            // A page reaches the window proxies of its browsing context group only: the
+            // frames of its tab, and of the tabs opened from it or that opened it.
+            ScriptToConstellationMessage::FocusRemoteBrowsingContext(browsing_context_id, _) |
+            ScriptToConstellationMessage::GetChildBrowsingContextId(browsing_context_id, ..) => {
+                match self.browsing_contexts.get(browsing_context_id) {
+                    Some(browsing_context)
+                        if !self.share_browsing_context_group(
+                            webview_id,
+                            browsing_context.webview_id,
+                        ) =>
+                    {
+                        refuse(&format!("to reach {browsing_context_id} of another group"))
+                    },
+                    _ => true,
+                }
+            },
+            ScriptToConstellationMessage::GetDocumentOrigin(pipeline_id, _) |
+            ScriptToConstellationMessage::GetDocumentOriginDetails(pipeline_id, _) => {
+                match self.pipelines.get(pipeline_id) {
+                    Some(target)
+                        if !self.share_browsing_context_group(webview_id, target.webview_id) =>
+                    {
+                        refuse(&format!("to ask the origin of {pipeline_id} of another group"))
+                    },
+                    _ => true,
+                }
+            },
             _ => true,
+        }
+    }
+
+    /// Whether the pages of `webview_id` and `other_webview_id` share a browsing context
+    /// group, and so can hold window proxies of each other.
+    #[cfg(feature = "multiprocess")]
+    fn share_browsing_context_group(
+        &self,
+        webview_id: WebViewId,
+        other_webview_id: WebViewId,
+    ) -> bool {
+        match (
+            self.browsing_context_group_for_webview_id(&webview_id),
+            self.browsing_context_group_for_webview_id(&other_webview_id),
+        ) {
+            (Some(group), Some(other_group)) => Rc::ptr_eq(&group, &other_group),
+            _ => false,
         }
     }
 
