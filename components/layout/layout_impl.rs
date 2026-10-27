@@ -8,7 +8,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use accesskit::{ActionRequest, Node};
 use app_units::Au;
@@ -85,6 +85,7 @@ use webrender_api::units::{DevicePixel, LayoutVector2D};
 
 use crate::accessibility::{AccessibilityContext, AccessibilityDamageMap, AccessibilityTree};
 use crate::context::{CachedImageOrError, ImageResolver, LayoutContext};
+use crate::counters::CounterValues;
 use crate::display_list::{DisplayListBuilder, HitTest, PaintTimingHandler, StackingContextTree};
 use crate::dom::NodeExt;
 use crate::query::{
@@ -194,6 +195,9 @@ pub struct LayoutThread {
 
     /// The box tree.
     box_tree: RefCell<Option<Arc<BoxTree>>>,
+
+    /// The CSS counter values the box tree was built with.
+    counter_values: RefCell<Arc<CounterValues>>,
 
     /// The fragment tree.
     fragment_tree: RefCell<Option<Rc<FragmentTree>>>,
@@ -899,6 +903,7 @@ impl LayoutThread {
             need_new_display_list: Cell::new(false),
             need_new_stacking_context_tree: Cell::new(false),
             box_tree: Default::default(),
+            counter_values: Default::default(),
             fragment_tree: Default::default(),
             stacking_context_tree: Default::default(),
             paint_api: config.paint_api,
@@ -1337,6 +1342,7 @@ impl LayoutThread {
             parallelism_job_count_minimum: pref!(layout_parallelism_job_count_minimum) as usize,
             parallelism_job_size_minimum: pref!(layout_parallelism_job_size_minimum) as usize,
             device_size: reflow_request.viewport_details.device_size.cast_unit(),
+            counter_values: OnceLock::new(),
         };
 
         let restyle = reflow_request
@@ -1379,7 +1385,33 @@ impl LayoutThread {
             LayoutDamage::empty()
         };
 
+        // Counter values depend on everything before them in tree order, so a change
+        // in one place can change the values of nodes whose boxes are not rebuilt. In
+        // that case drop the boxes of those nodes and their ancestors, and rebuild the box
+        // tree from the root, which reuses the boxes of the untouched subtrees. Values
+        // only change along with damage that rebuilds boxes, so skip the walk otherwise.
+        let (counter_values, stale_counter_nodes) =
+            if recalc_style_traversal.has_box_damage() || self.box_tree.borrow().is_none() {
+                let _span = profile_traits::trace_span!("Counters").entered();
+                let (counter_values, stale_counter_nodes) =
+                    CounterValues::compute(root_node, &self.counter_values.borrow());
+                (Arc::new(counter_values), stale_counter_nodes)
+            } else {
+                (self.counter_values.borrow().clone(), Vec::new())
+            };
+        *self.counter_values.borrow_mut() = counter_values.clone();
+        layout_context
+            .counter_values
+            .get_or_init(|| counter_values);
+
+        let counter_values_changed = !stale_counter_nodes.is_empty();
+        for node in stale_counter_nodes {
+            node.unset_all_boxes();
+        }
         let mut box_tree = self.box_tree.borrow_mut();
+        if counter_values_changed {
+            *box_tree = None;
+        }
         let mut layout_roots = Vec::new();
         let damage = {
             let box_tree = &mut *box_tree;
@@ -1399,6 +1431,12 @@ impl LayoutThread {
             } else {
                 compute_damage_and_build_box_tree()
             }
+        };
+
+        let damage = if counter_values_changed {
+            damage | LayoutDamage::Relayout
+        } else {
+            damage
         };
 
         if damage.contains(LayoutDamage::RebuildStackingContextTree) {

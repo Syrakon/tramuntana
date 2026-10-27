@@ -390,10 +390,25 @@ pub(crate) fn generate_pseudo_element_content(
                             };
                             maybe_quote.map(PseudoElementContentItem::Text)
                         },
-                        ContentItem::Counter(_, style) | ContentItem::Counters(_, _, style) => {
-                            // TODO: Add support for counters, this assumes a value of 0.
+                        ContentItem::Counter(name, style) => {
+                            let values =
+                                context.counter_values(&pseudo_element_info.node, &name.0);
                             Some(PseudoElementContentItem::Text(
-                                generate_counter_representation(style).to_string(),
+                                generate_counter_representation(
+                                    style,
+                                    values.last().copied().unwrap_or_default(),
+                                ),
+                            ))
+                        },
+                        ContentItem::Counters(name, separator, style) => {
+                            let values =
+                                context.counter_values(&pseudo_element_info.node, &name.0);
+                            let representations: Vec<String> = values
+                                .iter()
+                                .map(|value| generate_counter_representation(style, *value))
+                                .collect();
+                            Some(PseudoElementContentItem::Text(
+                                representations.join(separator),
                             ))
                         },
                         ContentItem::NoOpenQuote | ContentItem::NoCloseQuote => None,

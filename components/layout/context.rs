@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use embedder_traits::UntrustedNodeAddress;
 use euclid::Size2D;
@@ -26,9 +26,12 @@ use style::dom::OpaqueNode;
 use style::values::computed::color::Color;
 use style::values::computed::image::{Gradient, Image};
 use style_traits::DevicePixel;
+use stylo_atoms::Atom;
 use uuid::Uuid;
 use webrender_api::ImageKey;
 use webrender_api::units::{DeviceIntSize, DeviceSize};
+
+use crate::counters::CounterValues;
 
 pub(crate) type CachedImageOrError = Result<CachedImage, ResolveImageError>;
 
@@ -62,9 +65,19 @@ pub(crate) struct LayoutContext<'a> {
 
     /// The device dimensions on which this layout is running, in device pixels.
     pub device_size: Size2D<f32, DevicePixel>,
+
+    /// The CSS counter values, computed after styling and before box tree construction.
+    pub counter_values: OnceLock<Arc<CounterValues>>,
 }
 
 impl LayoutContext<'_> {
+    /// The values of counter `name` as seen by the pseudo-element `node`, outermost first.
+    pub(crate) fn counter_values(&self, node: &ServoLayoutNode<'_>, name: &Atom) -> &[i32] {
+        self.counter_values
+            .get()
+            .map_or(&[0], |values| values.get(node, name))
+    }
+
     pub(crate) fn should_parallelize(&self, number_of_jobs: usize) -> bool {
         self.allow_parallel_layout && number_of_jobs >= self.parallelism_job_count_minimum
     }

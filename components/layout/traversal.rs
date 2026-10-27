@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use layout_api::{
     DangerousStyleElement, DangerousStyleNode, LayoutDamage, LayoutElement, LayoutNode,
@@ -20,15 +21,27 @@ use crate::layout_root::LayoutRoot;
 
 pub struct RecalcStyle<'a> {
     context: &'a LayoutContext<'a>,
+    /// Whether any styled element got damage that rebuilds its boxes.
+    has_box_damage: AtomicBool,
 }
 
 impl<'a> RecalcStyle<'a> {
     pub(crate) fn new(context: &'a LayoutContext<'a>) -> Self {
-        RecalcStyle { context }
+        RecalcStyle {
+            context,
+            has_box_damage: AtomicBool::new(false),
+        }
     }
 
     pub(crate) fn context(&self) -> &LayoutContext<'a> {
         self.context
+    }
+
+    /// Whether this traversal left damage that will rebuild some boxes. Without it, no
+    /// box is built and nothing that depends on the whole tree, such as CSS counters,
+    /// needs to be recomputed.
+    pub(crate) fn has_box_damage(&self) -> bool {
+        self.has_box_damage.load(Ordering::Relaxed)
     }
 }
 
@@ -65,6 +78,10 @@ where
             &mut element_data,
             note_child,
         );
+
+        if LayoutDamage::from(element_data.damage).intersects(LayoutDamage::BoxDamage) {
+            self.has_box_damage.store(true, Ordering::Relaxed);
+        }
     }
 
     #[inline]

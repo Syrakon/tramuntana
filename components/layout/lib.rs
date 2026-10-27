@@ -10,6 +10,7 @@
 mod accessibility;
 mod cell;
 mod context;
+mod counters;
 mod display_list;
 mod dom;
 mod dom_traversal;
