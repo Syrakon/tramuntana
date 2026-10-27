@@ -9253,6 +9253,8 @@ dependencies = [
  "glow",
  "image",
  "khronos-egl",
+ "libc",
+ "libloading 0.8.9",
  "log",
  "malloc_size_of_derive",
  "parking_lot",
