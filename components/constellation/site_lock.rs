@@ -14,6 +14,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crossbeam_channel::Sender;
+use embedder_traits::{EmbedderMsg, EventLoopWaker, ScriptToEmbedderChan};
 use log::{debug, warn};
 use net_traits::fetch::headers::{is_forbidden_method, is_forbidden_request_header};
 use net_traits::filemanager_thread::FileManagerThreadMsg;
@@ -21,9 +23,11 @@ use net_traits::pub_domains::{is_same_site, reg_suffix};
 use net_traits::request::{CredentialsMode, Origin, RequestBuilder, RequestMode};
 use net_traits::{CookieSource, CoreResourceMsg, ResourceThreads};
 use parking_lot::Mutex;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::generic_channel::{self, GenericSender};
-use servo_base::id::{HistoryStateId, PipelineNamespaceId, PipelineNamespaceRequest};
+use servo_base::id::{
+    HistoryStateId, PipelineId, PipelineNamespaceId, PipelineNamespaceRequest, WebViewId,
+};
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
 use storage_traits::cache_storage::CacheStorageThreadMessage;
@@ -547,16 +551,98 @@ fn allows_cache_storage_message(
     }
 }
 
+/// A pipeline the constellation runs in a content process.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HostedPipeline {
+    pub(crate) webview_id: WebViewId,
+    /// Whether it is the top-level document of its webview.
+    pub(crate) top_level: bool,
+}
+
+/// The pipelines a content process runs, kept up to date by the constellation as it makes
+/// and closes them.
+pub(crate) type HostedPipelines = Arc<Mutex<FxHashMap<PipelineId, HostedPipeline>>>;
+
+/// A channel to the embedder for a content process locked to `lock` that runs the
+/// `hosted` pipelines.
+pub(crate) fn lock_embedder_messages(
+    lock: SiteLock,
+    hosted: HostedPipelines,
+    embedder_chan: Sender<EmbedderMsg>,
+    waker: Box<dyn EventLoopWaker>,
+) -> ScriptToEmbedderChan {
+    ScriptToEmbedderChan::new_filtered(embedder_chan, waker, move |message| {
+        let allowed = allows_embedder_message(&lock, &hosted.lock(), message);
+        if !allowed {
+            warn!("Site lock: refused embedder message {message:?} of a process of {lock}");
+        }
+        allowed
+    })
+}
+
+/// Whether a content process locked to `lock` that runs the `hosted` pipelines may send
+/// `message` to the embedder. The embedder believes the webview a message names, and the
+/// origin when it names one: a process may speak only of the webviews it runs pages of,
+/// and only for its own site.
+fn allows_embedder_message(
+    lock: &SiteLock,
+    hosted: &FxHashMap<PipelineId, HostedPipeline>,
+    message: &EmbedderMsg,
+) -> bool {
+    let hosts = |webview_id: &WebViewId| {
+        hosted
+            .values()
+            .any(|pipeline| pipeline.webview_id == *webview_id)
+    };
+    let hosts_top_level = |webview_id: &WebViewId| {
+        hosted
+            .values()
+            .any(|pipeline| pipeline.top_level && pipeline.webview_id == *webview_id)
+    };
+    let is_own_site = |url: &str| {
+        ServoUrl::parse(url).is_ok_and(|url| url.origin().is_tuple() && lock.allows_url(&url))
+    };
+    match message {
+        // What the webview shows as its own comes from its top-level document only.
+        EmbedderMsg::ChangePageTitle(webview_id, _) |
+        EmbedderMsg::NewFavicon(webview_id, _) |
+        EmbedderMsg::NotifyLoadStatusChanged(webview_id, _) |
+        EmbedderMsg::MoveTo(webview_id, _) |
+        EmbedderMsg::ResizeTo(webview_id, _) => hosts_top_level(webview_id),
+        // The embedder makes or uses a passkey of the origin named, which only a top-level
+        // document asks for.
+        EmbedderMsg::RequestPasskey(webview_id, origin, ..) => {
+            hosts_top_level(webview_id) && is_own_site(origin)
+        },
+        // The embedded site is the one that gets its cookies wherever it is embedded.
+        EmbedderMsg::RequestStorageAccess(webview_id, sites, _) => {
+            hosts(webview_id) && is_own_site(&sites.embedded_site)
+        },
+        EmbedderMsg::AllowProtocolHandlerRequest(webview_id, registration, _) => {
+            hosts(webview_id) && lock.allows_url(&registration.url)
+        },
+        EmbedderMsg::ShowEmbedderControl(control_id, ..) |
+        EmbedderMsg::HideEmbedderControl(control_id) => hosted
+            .get(&control_id.pipeline_id)
+            .is_some_and(|pipeline| pipeline.webview_id == control_id.webview_id),
+        // Only the devtools server speaks of itself.
+        EmbedderMsg::OnDevtoolsStarted(..) | EmbedderMsg::RequestDevtoolsConnection(_) => false,
+        _ => message.webview_id().is_none_or(|webview_id| hosts(&webview_id)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use embedder_traits::{EmbedderControlId, PasskeyOperation, StorageAccessSites};
     use http::{HeaderName, HeaderValue, Method};
     use net_traits::FetchChannels;
     use net_traits::blob_url_store::UrlWithBlobClaim;
     use net_traits::cookie_partition::CookieContext;
     use net_traits::request::{InsecureRequestsPolicy, Referrer, RequestClient};
     use net_traits::response::ResponseInit;
+    use servo_base::Epoch;
     use servo_base::generic_channel::GenericCallback;
-    use servo_base::id::Index;
+    use servo_base::id::{BrowsingContextId, Index, TEST_NAMESPACE};
     // Registers the reader of the public suffix list the site checks need.
     use servo_default_resources as _;
 
@@ -895,5 +981,129 @@ mod tests {
             true,
         ));
         assert!(!lock.allows_core_resource_message(&grant));
+    }
+
+    fn browsing_context(index: u32) -> BrowsingContextId {
+        BrowsingContextId {
+            namespace_id: TEST_NAMESPACE,
+            index: Index::new(index).expect("non-zero index"),
+        }
+    }
+
+    fn pipeline(index: u32) -> PipelineId {
+        PipelineId {
+            namespace_id: TEST_NAMESPACE,
+            index: Index::new(index).expect("non-zero index"),
+        }
+    }
+
+    /// A process of example.com running the top-level page of one webview and a frame in
+    /// another, beside a webview it runs nothing of.
+    fn example_process() -> (
+        SiteLock,
+        FxHashMap<PipelineId, HostedPipeline>,
+        [WebViewId; 3],
+    ) {
+        let lock = SiteLock::new(Some(Host::Domain("example.com".to_owned())), false);
+        let own = WebViewId::mock_for_testing(browsing_context(1));
+        let framed = WebViewId::mock_for_testing(browsing_context(2));
+        let other = WebViewId::mock_for_testing(browsing_context(3));
+        let mut hosted = FxHashMap::default();
+        hosted.insert(
+            pipeline(1),
+            HostedPipeline {
+                webview_id: own,
+                top_level: true,
+            },
+        );
+        hosted.insert(
+            pipeline(2),
+            HostedPipeline {
+                webview_id: framed,
+                top_level: false,
+            },
+        );
+        (lock, hosted, [own, framed, other])
+    }
+
+    #[test]
+    fn a_process_speaks_only_of_the_webviews_it_runs_pages_of() {
+        let (lock, hosted, [own, framed, other]) = example_process();
+        let allows = |message| allows_embedder_message(&lock, &hosted, &message);
+        let status = |webview_id| EmbedderMsg::Status(webview_id, None);
+        assert!(allows(status(own)));
+        assert!(allows(status(framed)));
+        assert!(!allows(status(other)));
+
+        let control = |webview_id, pipeline_id| {
+            EmbedderMsg::HideEmbedderControl(EmbedderControlId {
+                webview_id,
+                pipeline_id,
+                index: Epoch(1),
+            })
+        };
+        assert!(allows(control(own, pipeline(1))));
+        assert!(!allows(control(own, pipeline(2))));
+        assert!(!allows(control(own, pipeline(3))));
+    }
+
+    #[test]
+    fn only_a_top_level_page_names_its_webview() {
+        let (lock, hosted, [own, framed, _]) = example_process();
+        let allows = |message| allows_embedder_message(&lock, &hosted, &message);
+        let title = |webview_id| EmbedderMsg::ChangePageTitle(webview_id, None);
+        assert!(allows(title(own)));
+        assert!(!allows(title(framed)));
+    }
+
+    #[test]
+    fn a_passkey_is_asked_for_this_site_only() {
+        let (lock, hosted, [own, framed, _]) = example_process();
+        let allows = |message| allows_embedder_message(&lock, &hosted, &message);
+        let passkey = |webview_id, origin: &str| {
+            EmbedderMsg::RequestPasskey(
+                webview_id,
+                origin.to_owned(),
+                PasskeyOperation::Get {
+                    rp_id: None,
+                    challenge: vec![],
+                    allow: vec![],
+                },
+                GenericCallback::new(|_| {}).expect("callback"),
+            )
+        };
+        assert!(allows(passkey(own, "https://login.example.com")));
+        assert!(!allows(passkey(own, "https://bank.example")));
+        assert!(!allows(passkey(own, "null")));
+        assert!(!allows(passkey(framed, "https://example.com")));
+
+        let sandboxed = SiteLock::new(Some(Host::Domain("example.com".to_owned())), true);
+        let allows_sandboxed = |message| allows_embedder_message(&sandboxed, &hosted, &message);
+        assert!(!allows_sandboxed(passkey(own, "https://example.com")));
+    }
+
+    #[test]
+    fn storage_access_is_asked_for_this_site_only() {
+        let (lock, hosted, [_, framed, _]) = example_process();
+        let allows = |message| allows_embedder_message(&lock, &hosted, &message);
+        let ask = |embedded_site: &str| {
+            EmbedderMsg::RequestStorageAccess(
+                framed,
+                StorageAccessSites {
+                    embedded_site: embedded_site.to_owned(),
+                    top_level_site: "https://news.example".to_owned(),
+                },
+                GenericCallback::new(|_| {}).expect("callback"),
+            )
+        };
+        assert!(allows(ask("https://example.com")));
+        assert!(!allows(ask("https://tracker.example")));
+    }
+
+    #[test]
+    fn a_process_never_speaks_for_the_devtools_server() {
+        let (lock, hosted, _) = example_process();
+        let started = EmbedderMsg::OnDevtoolsStarted(Ok(6080), String::new());
+        assert!(!allows_embedder_message(&lock, &hosted, &started));
     }
 }

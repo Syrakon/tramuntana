@@ -94,6 +94,12 @@ pub struct Pipeline {
     has_active_document: bool,
 }
 
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        self.event_loop.release_pipeline(self.id);
+    }
+}
+
 impl Pipeline {
     /// Possibly starts a script thread, in a new process if requested.
     pub(crate) fn spawn<STF: ScriptThreadFactory, SWF: ServiceWorkerManagerFactory>(
@@ -136,6 +142,11 @@ impl Pipeline {
         webview_hidden: bool,
         load_data: LoadData,
     ) -> Self {
+        event_loop.host_pipeline(
+            id,
+            webview_id,
+            browsing_context_id == BrowsingContextId::from(webview_id),
+        );
         let pipeline = Self {
             id,
             browsing_context_id,

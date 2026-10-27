@@ -10,15 +10,20 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use background_hang_monitor_api::{BackgroundHangMonitorControlMsg, HangAlert};
+use background_hang_monitor_api::BackgroundHangMonitorControlMsg;
+#[cfg(feature = "multiprocess")]
+use background_hang_monitor_api::HangAlert;
 use embedder_traits::ScriptToEmbedderChan;
 use layout_api::ScriptThreadFactory;
 use log::error;
 use media::WindowGLContext;
 use script_traits::{InitialScriptState, ScriptThreadMessage};
+#[cfg(feature = "multiprocess")]
 use serde::{Deserialize, Serialize};
-use servo_base::generic_channel::{GenericReceiver, GenericSender, SendError};
-use servo_base::id::{ScriptEventLoopId, WebViewId};
+#[cfg(feature = "multiprocess")]
+use servo_base::generic_channel::GenericReceiver;
+use servo_base::generic_channel::{GenericSender, SendError};
+use servo_base::id::{PipelineId, ScriptEventLoopId, WebViewId};
 use servo_url::Host;
 #[cfg(feature = "multiprocess")]
 use servo_config::opts::{self, Opts};
@@ -28,7 +33,7 @@ use servo_constellation_traits::ServiceWorkerManagerFactory;
 
 use crate::Constellation;
 #[cfg(feature = "multiprocess")]
-use crate::site_lock::SiteLock;
+use crate::site_lock::{HostedPipeline, HostedPipelines, SiteLock};
 
 /// <https://html.spec.whatwg.org/multipage/#event-loop>
 pub struct EventLoop {
@@ -42,6 +47,10 @@ pub struct EventLoop {
     /// runs in this process.
     #[cfg(feature = "multiprocess")]
     site_lock: Option<SiteLock>,
+    /// The pipelines the content process running this event loop may send embedder
+    /// messages about.
+    #[cfg(feature = "multiprocess")]
+    hosted_pipelines: HostedPipelines,
     dont_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -180,6 +189,8 @@ impl EventLoop {
             background_hang_monitor_sender: None,
             #[cfg(feature = "multiprocess")]
             site_lock: None,
+            #[cfg(feature = "multiprocess")]
+            hosted_pipelines: HostedPipelines::default(),
             dont_send_or_sync: PhantomData,
         }
     }
@@ -222,6 +233,13 @@ impl EventLoop {
         .ok_or(SendError::Disconnected)?;
         initial_script_state.resource_threads = resource_threads;
         initial_script_state.storage_threads = storage_threads;
+        let hosted_pipelines = HostedPipelines::default();
+        initial_script_state.script_to_embedder_sender = crate::site_lock::lock_embedder_messages(
+            site_lock.clone(),
+            hosted_pipelines.clone(),
+            constellation.embedder_proxy.sender.clone(),
+            constellation.embedder_proxy.event_loop_waker.clone(),
+        );
 
         let (background_hand_monitor_sender, backgrond_hand_monitor_receiver) =
             servo_base::generic_channel::channel().expect("Sampler chan");
@@ -250,6 +268,7 @@ impl EventLoop {
             id,
             background_hang_monitor_sender: Some(background_hand_monitor_sender),
             site_lock: Some(site_lock),
+            hosted_pipelines,
             dont_send_or_sync: PhantomData,
         })
     }
@@ -263,6 +282,33 @@ impl EventLoop {
     #[cfg(feature = "multiprocess")]
     pub(crate) fn site_lock(&self) -> Option<&SiteLock> {
         self.site_lock.as_ref()
+    }
+
+    /// Record that `pipeline_id`, of `webview_id`, now runs in this event loop.
+    pub(crate) fn host_pipeline(
+        &self,
+        pipeline_id: PipelineId,
+        webview_id: WebViewId,
+        top_level: bool,
+    ) {
+        #[cfg(feature = "multiprocess")]
+        self.hosted_pipelines.lock().insert(
+            pipeline_id,
+            HostedPipeline {
+                webview_id,
+                top_level,
+            },
+        );
+        #[cfg(not(feature = "multiprocess"))]
+        let _ = (pipeline_id, webview_id, top_level);
+    }
+
+    /// Record that `pipeline_id` no longer runs in this event loop.
+    pub(crate) fn release_pipeline(&self, pipeline_id: PipelineId) {
+        #[cfg(feature = "multiprocess")]
+        self.hosted_pipelines.lock().remove(&pipeline_id);
+        #[cfg(not(feature = "multiprocess"))]
+        let _ = pipeline_id;
     }
 
     /// Send a message to the event loop.

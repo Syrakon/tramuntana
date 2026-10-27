@@ -5476,6 +5476,10 @@ impl Document {
     }
 
     pub(crate) fn notify_embedder_favicon(&self) {
+        // The icon of a webview is that of its top-level document, as is its title.
+        if !self.window().is_top_level() {
+            return;
+        }
         if let Some(ref image) = *self.favicon.borrow() {
             self.send_to_embedder(EmbedderMsg::NewFavicon(self.webview_id(), image.clone()));
         }

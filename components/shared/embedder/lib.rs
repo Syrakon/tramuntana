@@ -631,6 +631,47 @@ impl Debug for EmbedderMsg {
     }
 }
 
+impl EmbedderMsg {
+    /// The webview this message is about, if any. The constellation lets a content process
+    /// send only messages about the webviews it runs pages of, so a new message that names
+    /// a webview has to say so here.
+    pub fn webview_id(&self) -> Option<WebViewId> {
+        match self {
+            EmbedderMsg::Status(webview_id, ..) |
+            EmbedderMsg::ChangePageTitle(webview_id, ..) |
+            EmbedderMsg::MoveTo(webview_id, ..) |
+            EmbedderMsg::ResizeTo(webview_id, ..) |
+            EmbedderMsg::ShowSimpleDialog(webview_id, ..) |
+            EmbedderMsg::AllowProtocolHandlerRequest(webview_id, ..) |
+            EmbedderMsg::AllowUnload(webview_id, ..) |
+            EmbedderMsg::ClearClipboard(webview_id) |
+            EmbedderMsg::GetClipboardText(webview_id, ..) |
+            EmbedderMsg::SetClipboardText(webview_id, ..) |
+            EmbedderMsg::SetCursor(webview_id, ..) |
+            EmbedderMsg::NewFavicon(webview_id, ..) |
+            EmbedderMsg::GetWindowRect(webview_id, ..) |
+            EmbedderMsg::GetScreenMetrics(webview_id, ..) |
+            EmbedderMsg::NotifyFullscreenStateChanged(webview_id, ..) |
+            EmbedderMsg::NotifyLoadStatusChanged(webview_id, ..) |
+            EmbedderMsg::GetSelectedBluetoothDevice(webview_id, ..) |
+            EmbedderMsg::PromptPermission(webview_id, ..) |
+            EmbedderMsg::RequestWakeLockPermission(webview_id, ..) |
+            EmbedderMsg::RequestStorageAccess(webview_id, ..) |
+            EmbedderMsg::RequestPasskey(webview_id, ..) |
+            EmbedderMsg::InputEventsHandled(webview_id, ..) |
+            EmbedderMsg::AccessibilityTreeUpdate(webview_id, ..) => Some(*webview_id),
+            #[cfg(feature = "gamepad")]
+            EmbedderMsg::PlayGamepadHapticEffect(webview_id, ..) |
+            EmbedderMsg::StopGamepadHapticEffect(webview_id, ..) => Some(*webview_id),
+            EmbedderMsg::ShowNotification(webview_id, ..) |
+            EmbedderMsg::ShowConsoleApiMessage(webview_id, ..) => *webview_id,
+            EmbedderMsg::ShowEmbedderControl(control_id, ..) |
+            EmbedderMsg::HideEmbedderControl(control_id) => Some(control_id.webview_id),
+            EmbedderMsg::OnDevtoolsStarted(..) | EmbedderMsg::RequestDevtoolsConnection(..) => None,
+        }
+    }
+}
+
 /// <https://w3c.github.io/mediasession/#mediametadata>
 #[derive(Clone, Debug, Deserialize, Serialize, MallocSizeOf)]
 pub struct MediaMetadata {
@@ -1214,6 +1255,15 @@ impl ScriptToEmbedderChan {
         embedder_chan: Sender<EmbedderMsg>,
         waker: Box<dyn EventLoopWaker>,
     ) -> ScriptToEmbedderChan {
+        Self::new_filtered(embedder_chan, waker, |_| true)
+    }
+
+    /// Create a new Channel whose messages reach the Embedder only when `allows` says so
+    pub fn new_filtered<F: Fn(&EmbedderMsg) -> bool + Send + 'static>(
+        embedder_chan: Sender<EmbedderMsg>,
+        waker: Box<dyn EventLoopWaker>,
+        allows: F,
+    ) -> ScriptToEmbedderChan {
         let embedder_callback = GenericCallback::new(move |embedder_msg| {
             let msg = match embedder_msg {
                 Ok(embedder_msg) => embedder_msg,
@@ -1222,6 +1272,9 @@ impl ScriptToEmbedderChan {
                     return;
                 },
             };
+            if !allows(&msg) {
+                return;
+            }
             let _ = embedder_chan.send(msg);
             waker.wake();
         })
