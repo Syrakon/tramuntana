@@ -124,7 +124,7 @@ pub fn import_external_texture(
 ) -> Option<wgpu::Texture> {
     match descriptor {
         ExternalTextureDescriptor::DmaBuf {
-            // buffer_id keys the compositor's import cache (see wgpu_renderer);
+            // buffer_id keys the renderer's import cache (see wgpu_renderer);
             // the importer itself doesn't need it.
             buffer_id: _,
             fd,
@@ -336,9 +336,8 @@ fn external_queue_family(hal_device: &wgpu::hal::vulkan::Device) -> u32 {
 /// Hand imported `textures` back to the producer after the frame's last use
 /// of them: from SHADER_READ_ONLY_OPTIMAL, where the frame sampled them, to
 /// GENERAL, and from the device's queue family to [`external_queue_family`].
-/// Pairs with the acquire wgpu-hal records on each import's first use. wgpu
-/// still sees the textures as sampled afterwards, so none of them may be used
-/// again: each frame imports its buffers anew.
+/// Pairs with the acquire wgpu-hal records on an import's first use, and with
+/// [`acquire_external_textures`] on every later one.
 ///
 /// The barrier is recorded through the raw API, which wgpu does not allow in
 /// an encoder that also took wgpu commands, so it comes back as a command
@@ -346,6 +345,36 @@ fn external_queue_family(hal_device: &wgpu::hal::vulkan::Device) -> u32 {
 pub fn release_external_textures(
     device: &wgpu::Device,
     textures: &[wgpu::Texture],
+) -> Option<wgpu::CommandBuffer> {
+    transfer_ownership(device, textures, Transfer::Release)
+}
+
+/// Take back from the producer `textures` imported on an earlier frame and
+/// handed back by [`release_external_textures`] since: from GENERAL to
+/// SHADER_READ_ONLY_OPTIMAL, and from [`external_queue_family`] to the
+/// device's queue family. wgpu still sees such a texture as sampled, the
+/// state it left it in, so after this barrier its view of the image is true
+/// again and the texture can be used like any other.
+///
+/// Submit the command buffer before anything that uses the textures; queue
+/// submission order makes the barrier wait for the earlier release.
+pub fn acquire_external_textures(
+    device: &wgpu::Device,
+    textures: &[wgpu::Texture],
+) -> Option<wgpu::CommandBuffer> {
+    transfer_ownership(device, textures, Transfer::Acquire)
+}
+
+#[derive(Clone, Copy)]
+enum Transfer {
+    Acquire,
+    Release,
+}
+
+fn transfer_ownership(
+    device: &wgpu::Device,
+    textures: &[wgpu::Texture],
+    transfer: Transfer,
 ) -> Option<wgpu::CommandBuffer> {
     if textures.is_empty() {
         return None;
@@ -359,29 +388,57 @@ pub fn release_external_textures(
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
         .layer_count(1);
+    // The producer's side of each transfer is outside this queue, so the
+    // stages and accesses that face it are empty: only this queue's side
+    // orders anything.
+    let (src_stage, dst_stage) = match transfer {
+        Transfer::Acquire => (
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        ),
+        Transfer::Release => (
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+        ),
+    };
     let barriers: Vec<_> = textures
         .iter()
         .filter_map(|texture| {
             // SAFETY: only the image handle is read.
             let hal_texture = unsafe { texture.as_hal::<wgpu::hal::api::Vulkan>() }?;
-            Some(
-                vk::ImageMemoryBarrier::default()
-                    .image(unsafe { hal_texture.raw_handle() })
-                    .subresource_range(range)
+            let barrier = vk::ImageMemoryBarrier::default()
+                .image(unsafe { hal_texture.raw_handle() })
+                .subresource_range(range);
+            Some(match transfer {
+                // A copy that reads the image back, the frame stamp check's,
+                // has wgpu move it out of the sampled layout first, and that
+                // barrier waits for the fragment shader stage, so it waits
+                // for this one too.
+                Transfer::Acquire => barrier
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(external_family)
+                    .dst_queue_family_index(family),
+                Transfer::Release => barrier
                     .src_access_mask(vk::AccessFlags::SHADER_READ)
                     .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .new_layout(vk::ImageLayout::GENERAL)
                     .src_queue_family_index(family)
                     .dst_queue_family_index(external_family),
-            )
+            })
         })
         .collect();
     let raw_device = hal_device.raw_device();
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("external_texture_release"),
+        label: Some(match transfer {
+            Transfer::Acquire => "external_texture_acquire",
+            Transfer::Release => "external_texture_release",
+        }),
     });
-    // SAFETY: the encoder records nothing but this barrier, and it is
-    // submitted after the frame that sampled the images.
+    // SAFETY: the encoder records nothing but this barrier. A release is
+    // submitted after the frame that sampled the images, an acquire before
+    // anything that uses them.
     unsafe {
         encoder.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|hal_encoder| {
             let Some(hal_encoder) = hal_encoder else {
@@ -389,8 +446,8 @@ pub fn release_external_textures(
             };
             raw_device.cmd_pipeline_barrier(
                 hal_encoder.raw_handle(),
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                src_stage,
+                dst_stage,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -415,13 +472,15 @@ fn image_usage() -> vk::ImageUsageFlags {
 /// and log an error when it is not `expected`. See
 /// [`gpui::external_texture::ExternalGpuTexture::frame_stamp`] for where the
 /// producer writes it. Blocks until the GPU copy is done: debug mode only.
+/// Returns false only when the stamp read back differs; a check that could
+/// not run returns true, as nothing is known to be wrong.
 pub fn check_frame_stamp(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
     buffer_id: u64,
     expected: u32,
-) {
+) -> bool {
     // One texel per copy, each at an offset the copy alignment allows.
     const SLOT: u64 = wgpu::COPY_BUFFER_ALIGNMENT * 64;
     let size = texture.size();
@@ -472,17 +531,17 @@ pub fn check_frame_stamp(
         timeout: None,
     }) {
         log::warn!("frame stamp check of buffer {buffer_id}: waiting for the copy failed: {err}");
-        return;
+        return true;
     }
     match mapped_rx.try_recv() {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             log::warn!("frame stamp check of buffer {buffer_id}: mapping the copy failed: {err}");
-            return;
+            return true;
         }
         Err(err) => {
             log::warn!("frame stamp check of buffer {buffer_id}: the copy was not mapped: {err}");
-            return;
+            return true;
         }
     }
     let found = {
@@ -496,6 +555,7 @@ pub fn check_frame_stamp(
     readback.unmap();
     if found == [expected; 2] {
         log::trace!("frame stamp {expected} of buffer {buffer_id} checked");
+        true
     } else {
         log::error!(
             "frame stamp mismatch on buffer {buffer_id}: expected {expected}, the first texel \
@@ -503,6 +563,7 @@ pub fn check_frame_stamp(
             found[0],
             found[1]
         );
+        false
     }
 }
 
@@ -706,10 +767,15 @@ fn import_dma_buf(
     let mut import_info = vk::ImportMemoryFdInfoKHR::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
         .fd(raw_fd);
+    // The memory belongs to this one image. Drivers may require saying so for
+    // imported memory (`requiresDedicatedAllocation`), and it is valid for
+    // any image.
+    let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(vk_image);
     let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_reqs.size)
         .memory_type_index(mem_type_index)
-        .push_next(&mut import_info);
+        .push_next(&mut import_info)
+        .push_next(&mut dedicated_info);
 
     let vk_memory = match unsafe { raw_device.allocate_memory(&alloc_info, None) } {
         Ok(memory) => memory,

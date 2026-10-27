@@ -69,6 +69,95 @@ struct PathRasterizationVertex {
     bounds: Bounds<ScaledPixels>,
 }
 
+/// Frames an imported dma-buf stays in [`ExternalTextureCache`] without being
+/// drawn. The producer's export ring alternates two or three buffers, which
+/// this covers; past it the buffer belongs to a resize's old ring or a tab
+/// out of sight, and dropping the import frees what it holds.
+const EXTERNAL_TEXTURE_MAX_IDLE_FRAMES: u64 = 8;
+
+/// Imported dma-buf textures, keyed by the producer's `buffer_id`, which
+/// names one buffer for its whole life. Importing costs about half a
+/// millisecond of driver calls per buffer on NVIDIA; with the cache each
+/// buffer is imported once. Ownership still moves every frame: the frame
+/// that draws a buffer acquires it from its producer first and releases it
+/// at the end, as [`crate::external_texture_import`] describes.
+#[derive(Default)]
+struct ExternalTextureCache {
+    entries: Vec<ExternalTextureEntry>,
+    /// Counts submitted frames; the frame being encoded is `frame`.
+    frame: u64,
+    /// The textures the frame being encoded draws, to release at its end.
+    drawn: Vec<wgpu::Texture>,
+}
+
+struct ExternalTextureEntry {
+    buffer_id: u64,
+    texture: wgpu::Texture,
+    /// The last frame that drew the texture.
+    drawn_in: u64,
+}
+
+/// What [`ExternalTextureCache::texture`] found.
+enum ExternalTextureUse {
+    /// The texture is owned by the producer; acquire it before using it.
+    Released(wgpu::Texture),
+    /// Imported in this frame, or already acquired by it.
+    Ready(wgpu::Texture),
+}
+
+impl ExternalTextureCache {
+    /// The texture of `buffer_id` for the frame being encoded, imported by
+    /// `import` if no earlier frame did. `None` only if `import` fails.
+    fn texture(
+        &mut self,
+        buffer_id: u64,
+        import: impl FnOnce() -> Option<wgpu::Texture>,
+    ) -> Option<ExternalTextureUse> {
+        let frame = self.frame;
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.buffer_id == buffer_id) {
+            let texture = entry.texture.clone();
+            if entry.drawn_in == frame {
+                return Some(ExternalTextureUse::Ready(texture));
+            }
+            entry.drawn_in = frame;
+            self.drawn.push(texture.clone());
+            return Some(ExternalTextureUse::Released(texture));
+        }
+        let texture = import()?;
+        self.entries.push(ExternalTextureEntry {
+            buffer_id,
+            texture: texture.clone(),
+            drawn_in: frame,
+        });
+        self.drawn.push(texture.clone());
+        Some(ExternalTextureUse::Ready(texture))
+    }
+
+    /// Ends the frame being encoded: returns the textures it drew, which
+    /// the caller releases in the frame's submission, and drops the imports
+    /// left idle too long.
+    fn finish_frame(&mut self) -> Vec<wgpu::Texture> {
+        let frame = self.frame;
+        self.entries
+            .retain(|e| frame - e.drawn_in < EXTERNAL_TEXTURE_MAX_IDLE_FRAMES);
+        self.frame += 1;
+        std::mem::take(&mut self.drawn)
+    }
+
+    /// Drops the import of `buffer_id`, so the next frame that draws it
+    /// imports it again. The frame being encoded still releases it.
+    fn forget(&mut self, buffer_id: u64) {
+        self.entries.retain(|e| e.buffer_id != buffer_id);
+    }
+
+    /// Drops every import, for a frame that is not submitted after all: its
+    /// acquires have no release, so no texture is in a known state anymore.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.drawn.clear();
+    }
+}
+
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
     pub transparent: bool,
@@ -132,12 +221,10 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
-    /// Stage 2: the dma-buf textures the frame being encoded imported. Handed
-    /// back to their producer at the end of the frame's encoder
-    /// (`release_external_textures`), then dropped, so the next frame imports
-    /// them again. `RefCell` because `draw_external_sprites` runs behind
-    /// `&self` (the render pass borrows `self`).
-    external_frame_textures: RefCell<Vec<wgpu::Texture>>,
+    /// Stage 2: imported dma-buf textures. `RefCell` because
+    /// `draw_external_sprites` runs behind `&self` (the render pass borrows
+    /// `self`).
+    external_textures: RefCell<ExternalTextureCache>,
     /// Read leases of the external buffers the frame being encoded samples.
     /// Moved into an `on_submitted_work_done` callback at submit, so each is
     /// dropped — telling its producer the buffer may be written again — only
@@ -500,7 +587,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
-            external_frame_textures: RefCell::new(Vec::new()),
+            external_textures: RefCell::new(ExternalTextureCache::default()),
             external_read_leases: RefCell::new(Vec::new()),
         };
 
@@ -1168,6 +1255,7 @@ impl WgpuRenderer {
             } else if self.failed_frame_count > 5 {
                 if let Some(res) = self.resources.as_mut() {
                     res.invalidate_intermediate_textures();
+                    res.external_textures.get_mut().clear();
                 }
                 self.atlas.clear();
                 self.needs_redraw = true;
@@ -1387,15 +1475,16 @@ impl WgpuRenderer {
                 }
             }
 
-            let external_textures = self.resources().external_frame_textures.take();
             if overflow {
+                // The frame is encoded again with a bigger buffer; the
+                // textures it acquired stay acquired for the next attempt.
                 drop(encoder);
-                drop(external_textures);
                 if self.instance_buffer_capacity >= self.max_buffer_size {
                     log::error!(
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
+                    self.resources().external_textures.borrow_mut().clear();
                     frame.present();
                     return true;
                 }
@@ -1404,6 +1493,7 @@ impl WgpuRenderer {
             }
 
             let resources = self.resources();
+            let external_textures = resources.external_textures.borrow_mut().finish_frame();
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             let release = crate::external_texture_import::release_external_textures(
                 &resources.device,
@@ -1414,7 +1504,6 @@ impl WgpuRenderer {
             resources
                 .queue
                 .submit(std::iter::once(encoder.finish()).chain(release));
-            // wgpu keeps the imports alive until the GPU is done with them.
             drop(external_textures);
             let leases = resources.external_read_leases.take();
             if !leases.is_empty() {
@@ -1583,34 +1672,53 @@ impl WgpuRenderer {
                     crate::external_texture_import::wait_external_fence(fence);
                 }
 
-                // Import the buffer for this frame only. Its first use acquires
-                // it from the producer's queue family and the end of the
-                // frame hands it back, so an import is never reused: wgpu
-                // would sample it without acquiring it again. A kept import
-                // could also go on showing what the buffer held before a
-                // producer write, a black page after a resize on NVIDIA.
-                let Some(texture) = sprite.handle.descriptor().and_then(|descriptor| {
-                    crate::external_texture_import::import_external_texture(
-                        &resources.device,
-                        descriptor,
-                    )
-                }) else {
-                    continue; // import_external_texture logs the cause
+                // An import's first use acquires the buffer from the producer's
+                // queue family inside wgpu (see wgpu-hal's
+                // `set_external_queue_family`); a kept import is acquired here,
+                // in a submission ahead of every use of it this frame, the
+                // frame stamp check's included. Either way the end of the
+                // frame hands it back.
+                let found = resources
+                    .external_textures
+                    .borrow_mut()
+                    .texture(buffer_id, || {
+                        crate::external_texture_import::import_external_texture(
+                            &resources.device,
+                            sprite.handle.descriptor()?,
+                        )
+                    });
+                let texture = match found {
+                    Some(ExternalTextureUse::Ready(texture)) => texture,
+                    Some(ExternalTextureUse::Released(texture)) => {
+                        let acquire = crate::external_texture_import::acquire_external_textures(
+                            &resources.device,
+                            std::slice::from_ref(&texture),
+                        );
+                        resources.queue.submit(acquire);
+                        texture
+                    },
+                    None => continue, // import_external_texture logs the cause
                 };
 
                 // Debug mode: read back the stamp of each new frame before
-                // drawing it.
+                // drawing it. An import that reads wrong is dropped, so the
+                // next frame tells a bad import from bad producer memory.
                 if rewritten
                     && gpui::external_texture::frame_stamp_checks()
                     && let Some(stamp) = sprite.handle.frame_stamp()
-                {
-                    crate::external_texture_import::check_frame_stamp(
+                    && !crate::external_texture_import::check_frame_stamp(
                         &resources.device,
                         &resources.queue,
                         &texture,
                         buffer_id,
                         stamp,
+                    )
+                {
+                    log::error!(
+                        "frame stamp check: dropping the import of buffer {buffer_id}; the next \
+                         frame that draws it imports it again"
                     );
+                    resources.external_textures.borrow_mut().forget(buffer_id);
                 }
 
                 // Held until the GPU has finished this frame, so the producer
@@ -1670,7 +1778,6 @@ impl WgpuRenderer {
                 pass.set_bind_group(0, &resources.globals_bind_group, &[]);
                 pass.set_bind_group(1, &bind_group, &[]);
                 pass.draw(0..4, 0..1);
-                resources.external_frame_textures.borrow_mut().push(texture);
             }
             true
         }

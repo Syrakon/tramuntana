@@ -320,8 +320,20 @@ lets the driver discard the contents.
   release (`SHADER_READ_ONLY_OPTIMAL` to `GENERAL`, back to the foreign
   family) in a command buffer of its own: wgpu does not allow raw commands
   in an encoder that took wgpu commands. Both go in the same submit.
-- wgpu still sees a released texture as sampled and would not acquire it
-  again, so every frame imports its buffers anew; nothing is cached.
+- Imports are cached by `buffer_id` (`ExternalTextureCache` in
+  `wgpu_renderer.rs`): an import costs about 0.5 ms of driver calls on
+  NVIDIA (mostly `vkAllocateMemory`, `vkGetMemoryFdPropertiesKHR` and
+  `vkBindImageMemory`). wgpu still sees a released texture as sampled and
+  would not acquire it again, so a later frame that draws a cached import
+  first submits `acquire_external_textures` (`GENERAL` to
+  `SHADER_READ_ONLY_OPTIMAL`, from the foreign family) on its own, ahead of
+  every use of it that frame. An import not drawn for 8 frames is dropped.
+- The import allocates its memory with `VkMemoryDedicatedAllocateInfo`
+  naming the image. Without it, on NVIDIA, a cached import breaks the next
+  ring: after a resize the new ring's buffers read as zeros for as long as
+  imports of the old ring are alive (8 frames headless, the whole run under
+  Hyprland). Freeing the old ring only after its imports are dropped does not
+  help; the dedicated allocation does.
 
 ### Buffer reuse: read leases
 
