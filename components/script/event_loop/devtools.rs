@@ -788,6 +788,7 @@ pub(crate) fn handle_modify_rule(
     documents: &DocumentCollection,
     pipeline: PipelineId,
     node_id: &str,
+    matched_rule: Option<MatchedRule>,
     modifications: Vec<RuleModification>,
 ) {
     let Some(document) = documents.find_document(pipeline) else {
@@ -803,18 +804,42 @@ pub(crate) fn handle_modify_rule(
         );
     };
 
-    let Some(elem) = node.downcast::<HTMLElement>() else {
-        return warn!("node id {} is not an HTML element; its style stays", node_id);
+    // A rule of one of the page's stylesheets, found as `getApplied` listed
+    // it; or else the element's own style attribute.
+    let style = match matched_rule {
+        Some(rule) => {
+            let owner = node.stylesheet_list_owner();
+            let Some(stylesheet) = owner.stylesheet_at(cx, rule.stylesheet_index) else {
+                return warn!("stylesheet {} is gone; its rule stays", rule.stylesheet_index);
+            };
+            let Ok(list) = stylesheet.GetCssRules(cx) else {
+                return warn!("the rules of stylesheet {} cannot be read", rule.stylesheet_index);
+            };
+            let Some(style_rule) = find_rule_by_block_id(cx, &list, rule.block_id) else {
+                return warn!("rule {:?} is gone from its stylesheet", rule.selector);
+            };
+            style_rule.Style(cx)
+        },
+        None => {
+            let Some(elem) = node.downcast::<HTMLElement>() else {
+                return warn!("node id {} is not an HTML element; its style stays", node_id);
+            };
+            elem.Style(cx)
+        },
     };
-    let style = elem.Style(cx);
 
+    // An empty value removes the property, as `setProperty` does in CSSOM.
     for modification in modifications {
-        let _ = style.SetProperty(
+        let name = modification.name.clone();
+        let set = style.SetProperty(
             cx,
             modification.name.into(),
             modification.value.into(),
             modification.priority.into(),
         );
+        if let Err(error) = set {
+            warn!("devtools could not set {name}: {error:?}");
+        }
     }
 }
 

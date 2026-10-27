@@ -149,6 +149,7 @@ impl Actor for StyleRuleActor {
                     .send(ModifyRule(
                         browsing_context_actor.pipeline_id(),
                         registry.actor_to_script(self.node_name.clone()),
+                        self.selector.clone(),
                         modifications,
                     ))
                     .map_err(|_| ActorError::Internal)?;

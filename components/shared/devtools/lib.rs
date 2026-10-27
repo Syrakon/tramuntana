@@ -444,8 +444,9 @@ pub enum DevtoolScriptControlMsg {
     ),
     /// Update a given node's attributes with a list of modifications.
     ModifyAttribute(PipelineId, String, Vec<AttrModification>),
-    /// Update a given node's style rules with a list of modifications.
-    ModifyRule(PipelineId, String, Vec<RuleModification>),
+    /// Update a given node's style rules with a list of modifications: the
+    /// stylesheet rule given, or the node's style attribute when `None`.
+    ModifyRule(PipelineId, String, Option<MatchedRule>, Vec<RuleModification>),
     /// Request live console messages for a given pipeline (true if desired, false otherwise).
     WantsLiveNotifications(PipelineId, bool),
     /// Request live notifications for a given set of timeline events for a given pipeline.

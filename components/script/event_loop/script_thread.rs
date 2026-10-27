@@ -2197,13 +2197,14 @@ impl ScriptThread {
                     modifications,
                 )
             },
-            DevtoolScriptControlMsg::ModifyRule(id, node_id, modifications) => {
+            DevtoolScriptControlMsg::ModifyRule(id, node_id, matched_rule, modifications) => {
                 devtools::handle_modify_rule(
                     cx,
                     &self.devtools_state,
                     &documents,
                     id,
                     &node_id,
+                    matched_rule,
                     modifications,
                 )
             },
