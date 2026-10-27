@@ -20,7 +20,6 @@ use script_bindings::root::Dom;
 use servo_base::generic_channel::GenericSender;
 use servo_base::id::PipelineId;
 use servo_config::pref;
-use style::attr::AttrValue;
 use style::stylesheets::Origin;
 
 use crate::conversions::Convert;
@@ -561,9 +560,11 @@ pub(crate) fn handle_get_computed_style(
     };
 
     let window = node.owner_window();
-    let elem = node
-        .downcast::<Element>()
-        .expect("This should be an element");
+    // A text node or a comment has no computed style: answer nothing rather
+    // than take the page down.
+    let Some(elem) = node.downcast::<Element>() else {
+        return reply.send(None).unwrap();
+    };
     let computed_style = window.GetComputedStyle(cx, elem, None);
 
     let msg = (0..computed_style.Length())
@@ -592,9 +593,10 @@ pub(crate) fn handle_get_layout(
         Some(found_node) => found_node,
     };
 
-    let element = node
-        .downcast::<Element>()
-        .expect("should be getting layout of element");
+    // A text node or a comment has no layout of its own.
+    let Some(element) = node.downcast::<Element>() else {
+        return reply.send(None).unwrap();
+    };
 
     let rect = element.GetBoundingClientRect(cx);
     let width = rect.Width() as f32;
@@ -750,20 +752,32 @@ pub(crate) fn handle_modify_attribute(
         Some(found_node) => found_node,
     };
 
-    let elem = node
-        .downcast::<Element>()
-        .expect("should be getting layout of element");
+    let Some(elem) = node.downcast::<Element>() else {
+        return warn!("node id {} is not an element; its attributes stay", node_id);
+    };
 
     for modification in modifications {
+        let name = modification.attribute_name.to_ascii_lowercase();
+        // `set_attribute` takes a plain local name: no prefix, nothing a
+        // name cannot hold.
+        let plain = !name.is_empty() &&
+            !name
+                .chars()
+                .any(|c| c.is_whitespace() || ":\"'>/=".contains(c));
+        if !plain {
+            warn!("devtools asked to set the attribute {:?}, not a plain name", name);
+            continue;
+        }
+        let name = LocalName::from(name);
         match modification.new_value {
             Some(string) => {
-                elem.set_attribute(
-                    cx,
-                    &LocalName::from(modification.attribute_name),
-                    AttrValue::String(string),
-                );
+                // Parsed as the attribute expects: `class` as a token list,
+                // `id` as an atom, `style` as declarations. A plain string
+                // there panics the next time selectors or styles read it.
+                let value = elem.parse_attribute(&ns!(), &name, DOMString::from(string));
+                elem.set_attribute(cx, &name, value);
             },
-            None => elem.RemoveAttribute(cx, DOMString::from(modification.attribute_name)),
+            None => elem.RemoveAttribute(cx, DOMString::from(&*name)),
         }
     }
 }
@@ -789,9 +803,9 @@ pub(crate) fn handle_modify_rule(
         );
     };
 
-    let elem = node
-        .downcast::<HTMLElement>()
-        .expect("This should be an HTMLElement");
+    let Some(elem) = node.downcast::<HTMLElement>() else {
+        return warn!("node id {} is not an HTML element; its style stays", node_id);
+    };
     let style = elem.Style(cx);
 
     for modification in modifications {
