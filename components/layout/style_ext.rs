@@ -1368,6 +1368,9 @@ impl From<stylo::Display> for Display {
                 is_list_item: packed.is_list_item(),
             },
             stylo::DisplayInside::Flex => DisplayInside::Flex,
+            // The style adjuster turns `-webkit-box` into a flexbox or, when it clamps
+            // lines, into a flow root; this is only reached by styles it did not see.
+            stylo::DisplayInside::WebkitBox => DisplayInside::Flex,
             stylo::DisplayInside::Grid => DisplayInside::Grid,
             stylo::DisplayInside::GridLanes => unreachable!("Should be disabled behind a pref"),
             stylo::DisplayInside::Table => DisplayInside::Table,

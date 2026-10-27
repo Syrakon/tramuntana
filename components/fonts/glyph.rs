@@ -743,6 +743,43 @@ impl ShapedTextSlice {
         new.split_off_count(self.trailing_white_space.removable.count);
         Arc::new(new)
     }
+
+    /// Produce a new [`ShapedTextSlice`] that holds the glyphs of `self`, in logical order,
+    /// whose advances fit in `max_advance`. Used to cut a line for `text-overflow`.
+    pub fn truncated_to_advance(&self, max_advance: Au) -> Arc<Self> {
+        let glyphs = if self.shaped_text.is_rtl {
+            Either::Left(self.glyphs().rev())
+        } else {
+            Either::Right(self.glyphs())
+        };
+        let mut advance = Au::zero();
+        let mut kept = 0;
+        for glyph in glyphs {
+            if advance + glyph.advance() > max_advance {
+                break;
+            }
+            advance += glyph.advance();
+            kept += 1;
+        }
+        let mut new = self.clone();
+        new.split_off_count(self.glyph_count() - kept);
+        Arc::new(new)
+    }
+
+    /// Produce a [`ShapedTextSlice`] that covers the whole of `shaped_text`, with no
+    /// trailing white space. Used for text that layout makes up, such as the
+    /// `text-overflow` ellipsis.
+    pub fn whole(shaped_text: Arc<ShapedText>) -> Option<Arc<Self>> {
+        let character_count = shaped_text.character_count();
+        ShapedTextSlicer::new(shaped_text).slice_until_character_offset(
+            character_count,
+            TrailingWhiteSpace {
+                hangable: Utf32CodeUnits(0),
+                removable: Utf32CodeUnits(0),
+            },
+            false,
+        )
+    }
 }
 
 /// A data structure used to efficiently slice up a [`ShapedText`] into [`ShapedTextSlice`]s.

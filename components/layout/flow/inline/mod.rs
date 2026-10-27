@@ -89,7 +89,7 @@ use app_units::{Au, MAX_AU};
 use atomic_refcell::AtomicRef;
 use bitflags::bitflags;
 use construct::InlineFormattingContextBuilder;
-use fonts::{FontMetrics, FontRef, ShapedTextSlice};
+use fonts::{FontMetrics, FontRef, ShapedTextSlice, ShapingOptions};
 use icu_locale_core::LanguageIdentifier;
 use icu_properties::props::{EnumeratedProperty, LineBreak as ICULineBreak};
 use icu_segmenter::options::{LineBreakOptions, LineBreakStrictness, LineBreakWordOption};
@@ -114,8 +114,8 @@ use style::values::computed::BaselineShift;
 use style::values::generics::box_::BaselineShiftKeyword;
 use style::values::generics::font::LineHeight;
 use style::values::specified::box_::BaselineSource;
-use style::values::specified::text::TextAlignKeyword;
-use style::values::specified::{AlignmentBaseline, TextAlignLast, TextJustify};
+use style::values::specified::text::{TextAlignKeyword, TextOverflowSide};
+use style::values::specified::{AlignmentBaseline, Overflow, TextAlignLast, TextJustify};
 use text_run::{TextRun, get_font_for_first_font_for_style};
 use unicode_bidi::{BidiInfo, Level};
 
@@ -1052,6 +1052,14 @@ struct InlineFormattingContextLayout<'layout_data> {
     /// Whether block-level boxes inside this inline formatting context should ignore their
     /// margins for the purpose of stretching in the block axis.
     ignore_block_margins_for_stretch: LogicalSides1D<bool>,
+
+    /// For a block container with `line-clamp`, the number of lines that can still be laid
+    /// out before the clamp point.
+    lines_before_clamp: Option<u32>,
+
+    /// The block end of the line at the clamp point, once that line is laid out: the block
+    /// size of the content of a block container with `line-clamp`.
+    clamp_block_end: Option<Au>,
 }
 
 impl InlineFormattingContextLayout<'_> {
@@ -1234,11 +1242,19 @@ impl InlineFormattingContextLayout<'_> {
 
         self.possibly_push_empty_text_run_to_line_for_text_caret();
 
+        // A line clamp falls after this line when it is the last line allowed and more
+        // content follows it.
+        let at_clamp_point = !self.current_line.for_block_level &&
+            !self.current_line.is_phantom() &&
+            self.lines_before_clamp == Some(1) &&
+            !last_line_or_forced_line_break;
+
         // Add space for any cloneable padding, border, and margin ends that will
         // be drawn for this line.
         if !self.current_line.for_block_level {
             self.current_line.inline_position +=
                 self.current_line.cloneable_inline_box_pbm_size.end;
+            self.apply_text_overflow_to_current_line(hanging_white_space, at_clamp_point);
         }
 
         let (inline_start_position, justification_adjustment) = self
@@ -1322,6 +1338,15 @@ impl InlineFormattingContextLayout<'_> {
             self.placement_state.current_block_direction_position = block_end_position;
         }
 
+        if !is_phantom_line && !line_to_layout.for_block_level {
+            if let Some(lines) = self.lines_before_clamp.as_mut() {
+                if *lines == 1 && at_clamp_point {
+                    self.clamp_block_end.get_or_insert(block_end_position);
+                }
+                *lines = lines.saturating_sub(1);
+            }
+        }
+
         if line_to_layout.has_floats_waiting_to_be_placed {
             place_pending_floats(self, &line_to_layout.line_items);
         }
@@ -1393,6 +1418,193 @@ impl InlineFormattingContextLayout<'_> {
                 fragments,
                 true, /* is_line_box */
             )));
+    }
+
+    /// Apply `text-overflow` to the inline-end side of the line under construction. When
+    /// the line overflows a block container whose overflow is not `visible`, drop the
+    /// content that does not fit and, for `ellipsis` or a string, end the line with that
+    /// marker. Content is dropped glyph by glyph; an atomic inline that does not fit is
+    /// dropped whole.
+    ///
+    /// The line at a `line-clamp` clamp point, `at_clamp_point`, always ends with an
+    /// ellipsis, whether it overflows or not.
+    ///
+    /// Only left-to-right content is handled: for right-to-left content the logical order
+    /// of the line items is not the visual one.
+    ///
+    /// <https://drafts.csswg.org/css-overflow-4/#text-overflow>
+    /// <https://drafts.csswg.org/css-overflow-4/#webkit-line-clamp>
+    fn apply_text_overflow_to_current_line(&mut self, hanging_white_space: Au, at_clamp_point: bool) {
+        let style = self.containing_block().style.clone();
+        let marker = if at_clamp_point {
+            Some("\u{2026}")
+        } else {
+            match &style.get_text().text_overflow.second {
+                TextOverflowSide::Clip => None,
+                TextOverflowSide::Ellipsis => Some("\u{2026}"),
+                TextOverflowSide::String(string) => Some(&***string),
+            }
+        };
+        if marker.is_none() ||
+            self.ifc.has_right_to_left_content ||
+            !style.writing_mode.is_bidi_ltr()
+        {
+            return;
+        }
+        let box_style = style.get_box();
+        let inline_overflow = if style.writing_mode.is_horizontal() {
+            box_style.overflow_x
+        } else {
+            box_style.overflow_y
+        };
+        if inline_overflow == Overflow::Visible && !at_clamp_point {
+            return;
+        }
+
+        let available = self.available_line_space();
+        let line_end = self.current_line.inline_position - hanging_white_space;
+        if line_end <= available && !at_clamp_point {
+            return;
+        }
+
+        let item_advance = |item: &LineItem| match item {
+            LineItem::InlineStartBoxPaddingBorderMargin(state) => {
+                state.pbm.padding.inline_start +
+                    state.pbm.border.inline_start +
+                    state.pbm.margin.inline_start.auto_is(Au::zero)
+            },
+            LineItem::InlineEndBoxPaddingBorderMargin(state) => {
+                state.pbm.padding.inline_end +
+                    state.pbm.border.inline_end +
+                    state.pbm.margin.inline_end.auto_is(Au::zero)
+            },
+            LineItem::TextRun(_, text) => text.text.iter().map(|slice| slice.total_advance()).sum(),
+            LineItem::Atomic(_, atomic) => atomic.size.inline,
+            LineItem::Tab { advance, .. } => *advance,
+            LineItem::AbsolutelyPositioned(..) |
+            LineItem::Float(..) |
+            LineItem::BlockLevel(..) => Au::zero(),
+        };
+        let line_items = &mut self.current_line.line_items;
+        // What the line holds besides its items: `text-indent` and cloned box decorations.
+        let items_advance: Au = line_items.iter().map(item_advance).sum();
+        let offset = self.current_line.inline_position - items_advance;
+
+        // The marker is shaped with the first font of the block container, and painted with
+        // the style of the last text run that is kept, or of the first one if none is.
+        let marker_run = match line_items.iter().find_map(|item| match item {
+            LineItem::TextRun(identifier, text) => Some((*identifier, text)),
+            _ => None,
+        }) {
+            Some((identifier, text)) => (
+                identifier,
+                text.text_fragment_run_data.clone(),
+                text.base_fragment_info,
+                text.character_range_in_dom_node.start,
+            ),
+            None => return,
+        };
+        let marker_item = marker.and_then(|marker| {
+            let font = get_font_for_first_font_for_style(&style, &self.layout_context.font_context)?;
+            let info = FontAndScriptInfo::simple_for_font(font.clone());
+            let shaped = font.shape_text(marker, &ShapingOptions::from(&info));
+            let slice = ShapedTextSlice::whole(shaped)?;
+            Some((info, slice))
+        });
+        let marker_advance = marker_item
+            .as_ref()
+            .map_or(Au::zero(), |(_, slice)| slice.total_advance());
+        let content_limit = available - offset - marker_advance;
+
+        let mut position = Au::zero();
+        let mut cut = None;
+        for (index, item) in line_items.iter_mut().enumerate() {
+            let advance = item_advance(item);
+            if position + advance <= content_limit {
+                position += advance;
+                continue;
+            }
+            if let LineItem::TextRun(_, text) = item {
+                let mut kept = Vec::new();
+                for slice in text.text.drain(..) {
+                    let room = content_limit - position;
+                    if slice.total_advance() <= room {
+                        position += slice.total_advance();
+                        kept.push(slice);
+                        continue;
+                    }
+                    let truncated = slice.truncated_to_advance(room.max(Au::zero()));
+                    position += truncated.total_advance();
+                    if truncated.glyph_count() > 0 {
+                        kept.push(truncated);
+                    }
+                    break;
+                }
+                text.text = kept;
+                cut = Some(index + 1);
+            } else {
+                cut = Some(index);
+            }
+            break;
+        }
+        let cut = match cut {
+            Some(cut) => cut,
+            // Everything fits: only the clamp point adds the marker then.
+            None if at_clamp_point => line_items
+                .iter()
+                .rposition(LineItem::is_in_flow_content)
+                .map_or(0, |index| index + 1),
+            None => return,
+        };
+
+        // After the cut keep only what is not in-flow content, and the ends of the inline
+        // boxes that are open, so that the line still closes them.
+        let dropped: Vec<LineItem> = line_items.drain(cut..).collect();
+        let started_in_tail: Vec<InlineBoxIdentifier> = dropped
+            .iter()
+            .filter_map(|item| match item {
+                LineItem::InlineStartBoxPaddingBorderMargin(state) => Some(state.identifier),
+                _ => None,
+            })
+            .collect();
+        let mut tail: Vec<LineItem> = dropped
+            .into_iter()
+            .filter(|item| match item {
+                LineItem::InlineEndBoxPaddingBorderMargin(state) => {
+                    !started_in_tail.contains(&state.identifier)
+                },
+                LineItem::InlineStartBoxPaddingBorderMargin(_) | LineItem::Tab { .. } => false,
+                _ => !item.is_in_flow_content(),
+            })
+            .collect();
+
+        let last_kept_run = line_items.iter().rev().find_map(|item| match item {
+            LineItem::TextRun(identifier, text) => Some((
+                *identifier,
+                text.text_fragment_run_data.clone(),
+                text.base_fragment_info,
+                text.character_range_in_dom_node.end,
+            )),
+            _ => None,
+        });
+        let (identifier, run_data, base_fragment_info, character_index) =
+            last_kept_run.unwrap_or(marker_run);
+        if let Some((info, slice)) = marker_item {
+            line_items.push(LineItem::TextRun(
+                identifier,
+                TextRunLineItem {
+                    text_fragment_run_data: run_data,
+                    info,
+                    base_fragment_info,
+                    text: vec![slice],
+                    character_range_in_dom_node: character_index..character_index,
+                    is_empty_for_text_cursor: false,
+                },
+            ));
+        }
+        line_items.append(&mut tail);
+        let items_advance: Au = line_items.iter().map(item_advance).sum();
+        self.current_line.inline_position = offset + items_advance;
     }
 
     fn available_line_space(&self) -> Au {
@@ -2311,6 +2523,13 @@ impl InlineFormattingContext {
             white_space_collapse: style_text.white_space_collapse,
             text_wrap_mode: style_text.text_wrap_mode,
             ignore_block_margins_for_stretch,
+            lines_before_clamp: style
+                .get_box()
+                .line_clamp
+                .max_lines
+                .lines_value()
+                .map(|lines| lines.0.max(1) as u32),
+            clamp_block_end: None,
         };
 
         for item in self.inline_items.iter() {
@@ -2354,8 +2573,11 @@ impl InlineFormattingContext {
         }
 
         layout.finish_last_line();
-        let (content_block_size, collapsible_margins_in_children, baselines) =
+        let (mut content_block_size, collapsible_margins_in_children, baselines) =
             layout.placement_state.finish();
+        if let Some(clamp_block_end) = layout.clamp_block_end {
+            content_block_size = content_block_size.min(clamp_block_end);
+        }
 
         IndependentFormattingContextLayoutResult {
             fragments: layout.fragments,

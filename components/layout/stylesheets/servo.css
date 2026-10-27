@@ -317,12 +317,9 @@ input[type="checkbox"] {
   display: inline-block;
   position: relative;
 
+  /* Only a default size: pages set their own, as they do in other engines. */
   width: 14px;
   height: 14px;
-  max-width: 14px;
-  max-height: 14px;
-  min-width: 14px;
-  min-height: 14px;
 
   border-radius: 2px;
 
