@@ -38,6 +38,10 @@ pub struct EventLoop {
     /// on the other side of the process boundary. When running in the same process, the
     /// BackgroundHangMonitor is shared among all [`EventLoop`]s so this will be `None`.
     background_hang_monitor_sender: Option<GenericSender<BackgroundHangMonitorControlMsg>>,
+    /// The site a content process running this event loop is locked to, or `None` when it
+    /// runs in this process.
+    #[cfg(feature = "multiprocess")]
+    site_lock: Option<SiteLock>,
     dont_send_or_sync: PhantomData<Rc<()>>,
 }
 
@@ -174,6 +178,8 @@ impl EventLoop {
             script_chan,
             id,
             background_hang_monitor_sender: None,
+            #[cfg(feature = "multiprocess")]
+            site_lock: None,
             dont_send_or_sync: PhantomData,
         }
     }
@@ -208,7 +214,7 @@ impl EventLoop {
         )
         .ok_or(SendError::Disconnected)?;
         let (resource_threads, storage_threads) = crate::site_lock::lock_threads(
-            site_lock,
+            site_lock.clone(),
             owned_namespaces,
             &initial_script_state.resource_threads,
             &initial_script_state.storage_threads,
@@ -243,12 +249,20 @@ impl EventLoop {
             script_chan,
             id,
             background_hang_monitor_sender: Some(background_hand_monitor_sender),
+            site_lock: Some(site_lock),
             dont_send_or_sync: PhantomData,
         })
     }
 
     pub(crate) fn id(&self) -> ScriptEventLoopId {
         self.id
+    }
+
+    /// The site the content process running this event loop is locked to, or `None` when
+    /// it runs in this process.
+    #[cfg(feature = "multiprocess")]
+    pub(crate) fn site_lock(&self) -> Option<&SiteLock> {
+        self.site_lock.as_ref()
     }
 
     /// Send a message to the event loop.

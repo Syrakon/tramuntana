@@ -1650,6 +1650,8 @@ where
     ) {
         let (sending_event_loop, webview_id, source_pipeline_id, content) = message;
         trace_script_msg!(content, "{source_pipeline_id}: {content:?}");
+        #[cfg(feature = "multiprocess")]
+        let mut content = content;
 
         if let Some(sending_event_loop) = sending_event_loop {
             if !self.event_loop_may_speak_for(
@@ -1658,6 +1660,10 @@ where
                 source_pipeline_id,
                 &content,
             ) {
+                return;
+            }
+            #[cfg(feature = "multiprocess")]
+            if !self.content_process_claims_hold(webview_id, source_pipeline_id, &mut content) {
                 return;
             }
         }
@@ -2206,6 +2212,157 @@ where
                 false
             },
         }
+    }
+
+    /// Whether what a content process claims in `content`, sent for its own
+    /// `source_pipeline_id`, is true of that process: the source and the origin a message
+    /// names, and the parent of a frame it loads. A load that carries a document of its own
+    /// (the result of a `javascript:` URL, a `srcdoc`) loses it unless the document would
+    /// run in the sending process: given to another site's process, it would run there as
+    /// a page of that site.
+    #[cfg(feature = "multiprocess")]
+    fn content_process_claims_hold(
+        &self,
+        webview_id: WebViewId,
+        source_pipeline_id: PipelineId,
+        content: &mut ScriptToConstellationMessage,
+    ) -> bool {
+        let Some(pipeline) = self.pipelines.get(&source_pipeline_id) else {
+            return false;
+        };
+        let event_loop = pipeline.event_loop.id();
+        let Some(lock) = pipeline.event_loop.site_lock() else {
+            return true;
+        };
+        let message: &'static str = (&*content).into();
+        let refuse = |claim: &str| {
+            warn!(
+                "Content process of {event_loop:?} ({lock}) claimed {claim} for \
+                 {source_pipeline_id}; dropped {message}"
+            );
+            false
+        };
+        match content {
+            ScriptToConstellationMessage::PostMessage {
+                source,
+                source_origin,
+                ..
+            } => {
+                if *source != source_pipeline_id {
+                    return refuse(&format!("to post as {source}"));
+                }
+                if !lock.allows_origin(source_origin) {
+                    return refuse(&format!("to post as {source_origin:?}"));
+                }
+                true
+            },
+            ScriptToConstellationMessage::ForwardDOMMessage(dom_message, scope_url) => {
+                if dom_message.pipeline_id != source_pipeline_id {
+                    return refuse(&format!("to post as {}", dom_message.pipeline_id));
+                }
+                if !lock.allows_origin(&dom_message.origin) || !lock.allows_url(scope_url) {
+                    return refuse(&format!(
+                        "to post as {:?} to the service worker of {scope_url}",
+                        dom_message.origin
+                    ));
+                }
+                true
+            },
+            ScriptToConstellationMessage::LoadUrl(load_data, ..) => {
+                let parent_pipeline_id = self
+                    .browsing_contexts
+                    .get(&pipeline.browsing_context_id)
+                    .and_then(|browsing_context| browsing_context.parent_pipeline_id);
+                self.keep_documents_in_sending_process(
+                    event_loop,
+                    webview_id,
+                    parent_pipeline_id,
+                    load_data,
+                );
+                true
+            },
+            ScriptToConstellationMessage::ScriptLoadedURLInIFrame(load_info) |
+            ScriptToConstellationMessage::ScriptNewIFrame(load_info) => {
+                let info = &load_info.info;
+                if info.parent_pipeline_id != source_pipeline_id || info.webview_id != webview_id
+                {
+                    return refuse(&format!(
+                        "to load a frame of {} in {}",
+                        info.parent_pipeline_id, info.webview_id
+                    ));
+                }
+                let parent_is_private = self
+                    .browsing_contexts
+                    .get(&pipeline.browsing_context_id)
+                    .is_some_and(|browsing_context| browsing_context.is_private);
+                if info.is_private != parent_is_private {
+                    return refuse("a frame of another privacy than its parent");
+                }
+                self.keep_documents_in_sending_process(
+                    event_loop,
+                    webview_id,
+                    Some(source_pipeline_id),
+                    &mut load_info.load_data,
+                );
+                true
+            },
+            _ => true,
+        }
+    }
+
+    /// Drop from `load_data`, sent by a content process running `event_loop`, the creator
+    /// it names when that process does not run it, and the document it carries unless the
+    /// new pipeline would run in that same event loop.
+    #[cfg(feature = "multiprocess")]
+    fn keep_documents_in_sending_process(
+        &self,
+        event_loop: ScriptEventLoopId,
+        webview_id: WebViewId,
+        parent_pipeline_id: Option<PipelineId>,
+        load_data: &mut LoadData,
+    ) {
+        let runs_in_sender =
+            |pipeline_id: &PipelineId| {
+                self.pipelines
+                    .get(pipeline_id)
+                    .is_some_and(|pipeline| pipeline.event_loop.id() == event_loop)
+            };
+        if load_data
+            .creator_pipeline_id
+            .is_some_and(|creator| !runs_in_sender(&creator))
+        {
+            warn!("Content process of {event_loop:?} named a creator it does not run");
+            load_data.creator_pipeline_id = None;
+        }
+        let sandboxed = load_data
+            .creation_sandboxing_flag_set
+            .contains(SandboxingFlagSet::SANDBOXED_ORIGIN_BROWSING_CONTEXT_FLAG);
+        let site = if sandboxed {
+            None
+        } else {
+            registered_domain_name(&load_data.url)
+        };
+        let lands_in_sender = self
+            .get_event_loop_for_new_pipeline(load_data, webview_id, parent_pipeline_id, &site)
+            .is_some_and(|new_event_loop| new_event_loop.id() == event_loop);
+        if lands_in_sender {
+            return;
+        }
+        let carries_a_document = load_data.js_eval_result.is_some() ||
+            !load_data.srcdoc.is_empty() ||
+            load_data.crash.is_some();
+        if carries_a_document {
+            warn!(
+                "Content process of {event_loop:?} sent a document to {}, which runs elsewhere; \
+                 dropped the document",
+                load_data.url
+            );
+        }
+        load_data.js_eval_result = None;
+        load_data.srcdoc = String::new();
+        load_data.crash = None;
+        load_data.about_base_url = None;
+        load_data.policy_container = None;
     }
 
     fn check_origin_against_pipeline(
