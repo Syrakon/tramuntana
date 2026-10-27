@@ -22,6 +22,7 @@ use servo_url::ServoUrl;
 use style::Zero;
 use style::color::{AbsoluteColor, ColorSpace};
 use style::computed_values::background_blend_mode::SingleComputedValue as BackgroundBlendMode;
+use style::computed_values::background_clip::single_value::T as BackgroundClip;
 use style::computed_values::border_image_outset::T as BorderImageOutset;
 use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::overflow_x::T as ComputedOverflow;
@@ -80,12 +81,14 @@ mod paint_timing_handler;
 mod paint_traversal;
 mod painted_region;
 mod stacking_context;
+mod text_mask;
 
 pub(crate) use hit_test::{ClosestFragmentSearch, HitTest};
 pub(crate) use paint_timing_handler::{
     ContainerTimingRootChain, ContainerTimingRoots, PaintTimingHandler,
 };
 pub(crate) use stacking_context::*;
+pub(crate) use text_mask::TextMasks;
 
 const INSERTION_POINT_LOGICAL_WIDTH: Au = Au(AU_PER_PX);
 
@@ -138,6 +141,9 @@ pub(crate) struct DisplayListBuilder<'a> {
 
     /// Statistics collected about the reflow, in order to write tests for incremental layout.
     reflow_statistics: &'a mut ReflowStatistics,
+
+    /// The masks that `background-clip: text` clips backgrounds to.
+    text_masks: &'a mut TextMasks,
 
     /// Whether the `largest_contentul_paint_enabled` preference is enabled.
     largest_contentful_paint_enabled: bool,
@@ -202,6 +208,7 @@ impl DisplayListBuilder<'_> {
         debug: &DiagnosticsLogging,
         paint_timing_handler: &mut PaintTimingHandler,
         reflow_statistics: &mut ReflowStatistics,
+        text_masks: &mut TextMasks,
         frame_focused: bool,
     ) -> BuiltDisplayList {
         // Build the rest of the display list which inclues all of the WebRender primitives.
@@ -244,6 +251,7 @@ impl DisplayListBuilder<'_> {
             device_pixel_ratio,
             paint_timing_handler,
             reflow_statistics,
+            text_masks,
             largest_contentful_paint_enabled: pref!(largest_contentful_paint_enabled),
             container_timing_enabled: pref!(container_timing_enabled),
             shell_background_color,
@@ -1338,12 +1346,17 @@ impl Fragment {
             }
         }
 
+        // <https://compat.spec.whatwg.org/#the-webkit-text-fill-color>
+        let fill_color = parent_style
+            .get_inherited_text()
+            ._webkit_text_fill_color
+            .resolve_to_absolute(&color);
         builder.wr().push_text(
             &common,
             glyph_bounds,
             &glyphs,
             fragment.font_key,
-            rgba(color),
+            rgba(fill_color),
             None,
         );
 
@@ -1666,6 +1679,7 @@ struct BuilderForBoxFragment<'a> {
     border_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
     padding_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
     content_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
+    text_clip_chain_id: RefCell<Option<ClipChainId>>,
 }
 
 impl<'a> BuilderForBoxFragment<'a> {
@@ -1687,6 +1701,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             border_edge_clip_chain_id: RefCell::new(None),
             padding_edge_clip_chain_id: RefCell::new(None),
             content_edge_clip_chain_id: RefCell::new(None),
+            text_clip_chain_id: RefCell::new(None),
         }
     }
 
@@ -1780,6 +1795,54 @@ impl<'a> BuilderForBoxFragment<'a> {
         maybe_clip
     }
 
+    /// The clip of `background-clip: text`: the glyphs of this box and of its in-flow
+    /// descendants.
+    fn text_clip(&self, builder: &mut DisplayListBuilder, state: &TraversalState) -> ClipChainId {
+        if let Some(clip) = *self.text_clip_chain_id.borrow() {
+            return clip;
+        }
+
+        let mut runs = Vec::new();
+        let border_origin = self.fragment.border_rect().origin;
+        let content_origin = self.fragment.content_rect().origin;
+        collect_text_mask_runs(
+            &self.fragment.children,
+            PhysicalPoint::origin() + (content_origin - border_origin),
+            &mut runs,
+        );
+        let scale = builder.device_pixel_ratio.get();
+        let mask = builder
+            .text_masks
+            .mask(&runs, self.border_rect.size(), scale);
+
+        let clip = match mask {
+            Some(image) => {
+                let parent = match builder.clip_chain_id(state.clip_id) {
+                    ClipChainId::INVALID => None,
+                    parent => Some(parent),
+                };
+                let spatial_id = builder.spatial_id(state.spatial_id);
+                let mask = wr::ImageMask {
+                    image,
+                    rect: self.border_rect,
+                };
+                let clip_id = builder.wr().define_clip_image_mask(
+                    spatial_id,
+                    mask,
+                    &[],
+                    wr::FillRule::Nonzero,
+                );
+                builder.wr().define_clip_chain(parent, [clip_id])
+            },
+            // With no text, nothing of the background shows.
+            None => builder
+                .maybe_create_clip(state, BorderRadius::zero(), LayoutRect::zero(), true)
+                .unwrap_or(ClipChainId::INVALID),
+        };
+        *self.text_clip_chain_id.borrow_mut() = Some(clip);
+        clip
+    }
+
     fn build(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
         if self
             .fragment
@@ -1854,6 +1917,27 @@ impl<'a> BuilderForBoxFragment<'a> {
         painter: &BackgroundPainter,
     ) {
         let b = painter.style.get_background();
+
+        // WebRender only applies image masks to stacking contexts, so the backgrounds clipped to
+        // text are painted in one. This also clips the layers that are not, if any.
+        let clip_to_text = b.background_clip.0.iter().any(|clip| *clip == BackgroundClip::Text);
+        if clip_to_text {
+            let clip_chain_id = self.text_clip(builder, state);
+            let spatial_id = builder.spatial_id(state.spatial_id);
+            builder.wr().push_stacking_context(
+                spatial_id,
+                PrimitiveFlags::empty(),
+                Some(clip_chain_id),
+                TransformStyle::Flat,
+                MixBlendMode::Normal,
+                &[],
+                &[],
+                RasterSpace::Screen,
+                StackingContextFlags::empty(),
+                None,
+            );
+        }
+
         let background_color = painter.style.resolve_color(&b.background_color);
         if background_color.alpha > 0.0 {
             // https://drafts.csswg.org/css-backgrounds/#background-color
@@ -1875,6 +1959,10 @@ impl<'a> BuilderForBoxFragment<'a> {
         }
 
         self.build_background_image(builder, state, painter);
+
+        if clip_to_text {
+            builder.wr().pop_stacking_context();
+        }
     }
 
     fn build_background(&mut self, builder: &mut DisplayListBuilder, state: &TraversalState) {
@@ -2511,6 +2599,56 @@ fn rgba(color: AbsoluteColor) -> wr::ColorF {
 /// - A vector of [`GlyphInstance`] for every glyph in the slices.
 /// - The measure of the largest advance
 /// - A boolean which is true if the slices only contained white space.
+/// Gather the glyphs of `fragments` and of their in-flow descendants for a text mask. `origin`
+/// is the position of the containing block of `fragments` relative to the mask.
+fn collect_text_mask_runs(
+    fragments: &[Fragment],
+    origin: PhysicalPoint<Au>,
+    runs: &mut Vec<text_mask::TextMaskRun>,
+) {
+    for fragment in fragments {
+        match fragment {
+            Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+                if box_fragment
+                    .style()
+                    .get_box()
+                    .position
+                    .is_absolutely_positioned()
+                {
+                    continue;
+                }
+                collect_text_mask_runs(
+                    &box_fragment.children,
+                    origin + box_fragment.content_rect().origin.to_vector(),
+                    runs,
+                );
+            },
+            Fragment::Positioning(positioning_fragment) => collect_text_mask_runs(
+                &positioning_fragment.children,
+                origin + positioning_fragment.base.rect().origin.to_vector(),
+                runs,
+            ),
+            Fragment::Text(text_fragment) => {
+                let mut baseline_origin = origin + text_fragment.base.rect().origin.to_vector();
+                baseline_origin.y += text_fragment.font_metrics.ascent;
+                let (glyphs, _, _) = glyphs(
+                    &text_fragment.glyphs,
+                    baseline_origin,
+                    text_fragment.justification_adjustment,
+                );
+                runs.push(text_mask::TextMaskRun {
+                    font: text_fragment.font.clone(),
+                    glyphs,
+                });
+            },
+            Fragment::LayoutRoot(_) |
+            Fragment::AbsoluteOrFixedPositionedPlaceholder(_) |
+            Fragment::Image(_) |
+            Fragment::IFrame(_) => {},
+        }
+    }
+}
+
 fn glyphs(
     shaped_text_slices: &[Arc<ShapedTextSlice>],
     mut baseline_origin: PhysicalPoint<Au>,

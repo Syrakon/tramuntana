@@ -86,7 +86,9 @@ use webrender_api::units::{DevicePixel, LayoutVector2D};
 use crate::accessibility::{AccessibilityContext, AccessibilityDamageMap, AccessibilityTree};
 use crate::context::{CachedImageOrError, ImageResolver, LayoutContext};
 use crate::counters::CounterValues;
-use crate::display_list::{DisplayListBuilder, HitTest, PaintTimingHandler, StackingContextTree};
+use crate::display_list::{
+    DisplayListBuilder, HitTest, PaintTimingHandler, StackingContextTree, TextMasks,
+};
 use crate::dom::NodeExt;
 use crate::query::{
     BoxAreaInclusion, find_character_offset_in_fragment_descendants, get_the_text_steps,
@@ -227,6 +229,9 @@ pub struct LayoutThread {
 
     /// Handler for all Paint Timings
     paint_timing_handler: RefCell<Option<PaintTimingHandler>>,
+
+    /// The masks of `background-clip: text` that the display lists use.
+    text_masks: RefCell<TextMasks>,
 
     /// The Container Timing records produced by the display list build of the reflow
     /// currently in progress, waiting to be handed to script on the [`ReflowResult`].
@@ -906,6 +911,10 @@ impl LayoutThread {
             counter_values: Default::default(),
             fragment_tree: Default::default(),
             stacking_context_tree: Default::default(),
+            text_masks: RefCell::new(TextMasks::new(
+                config.paint_api.clone(),
+                config.webview_id,
+            )),
             paint_api: config.paint_api,
             stylist: Stylist::new(device, QuirksMode::NoQuirks),
             resolved_images_cache: Default::default(),
@@ -1657,6 +1666,8 @@ impl LayoutThread {
             },
         };
 
+        let mut text_masks = self.text_masks.borrow_mut();
+        text_masks.begin_display_list();
         let built_display_list = DisplayListBuilder::build(
             stacking_context_tree,
             fragment_tree,
@@ -1666,6 +1677,7 @@ impl LayoutThread {
             &self.debug,
             paint_timing_handler,
             reflow_statistics,
+            &mut text_masks,
             reflow_request.frame_focused,
         );
 
@@ -1697,6 +1709,7 @@ impl LayoutThread {
             &stacking_context_tree.paint_info,
             built_display_list,
         );
+        text_masks.release_unused();
 
         let (keys, instance_keys) = self
             .font_context
