@@ -207,7 +207,9 @@ impl DevtoolsInstance {
         } else {
             Err(())
         };
-        let token = format!("{:X}", rng().next_u32());
+        // 128 bits, too many to guess one prompt at a time, written at a fixed width.
+        let mut rng = rng();
+        let token = format!("{:016X}{:016X}", rng.next_u64(), rng.next_u64());
         embedder.send(EmbedderMsg::OnDevtoolsStarted(port, token.clone()));
 
         let listener = match bound {
@@ -984,8 +986,9 @@ impl DevtoolsInstance {
 
 fn allow_devtools_client(stream: &mut TcpStream, embedder: &EmbedderProxy, token: &str) -> bool {
     // By-pass prompt if we receive a valid token.
-    let token = format!("25:{{\"auth_token\":\"{}\"}}", token);
-    let mut buf = [0; 28];
+    let packet = format!("{{\"auth_token\":\"{token}\"}}");
+    let token = format!("{}:{packet}", packet.len());
+    let mut buf = vec![0; token.len()];
     let timeout = std::time::Duration::from_millis(500);
     // This will read but not consume the bytes from the stream.
     stream.set_read_timeout(Some(timeout)).unwrap();
