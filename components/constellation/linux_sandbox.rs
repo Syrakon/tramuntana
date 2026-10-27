@@ -11,11 +11,16 @@
 //!
 //! - Landlock limits the filesystem to what the system, fonts, media and GPU drivers need.
 //!   The user's home, and with it the browser profile (cookies, passwords, history), stays
-//!   out of reach. Writing is limited to devices, a few caches and thread names.
+//!   out of reach. Writing is limited to the GPU and a few other devices, a few caches and
+//!   thread names. Of `/proc`, only this process and a few system-wide files are readable.
+//! - Landlock lets the process connect to the sound server's sockets and the journal only.
+//!   Every other socket of the session (the compositor, the systemd and D-Bus buses, SSH
+//!   and GPG agents, terminals) can run commands or sign as the user.
 //! - Landlock also forbids TCP: the network goes through the main process.
 //! - Landlock scopes forbid signals and abstract Unix sockets outside the sandbox.
 //! - seccomp denies the system calls that widen the kernel attack surface or reach other
-//!   processes (ptrace, namespaces, mounts, bpf, io_uring, keyrings, modules).
+//!   processes (ptrace, namespaces, mounts, bpf, io_uring, keyrings, modules), the socket
+//!   families a page never uses, and faking terminal input.
 //!
 //! The sandbox fails closed: any error is returned, and the caller must not run content.
 
@@ -99,6 +104,8 @@ struct SandboxPaths {
     sockets: Vec<PathBuf>,
     /// Read, and write to the files that exist inside.
     existing_files: Vec<PathBuf>,
+    /// Read, write and control the devices inside.
+    devices: Vec<PathBuf>,
     /// Everything, writing included.
     write: Vec<PathBuf>,
 }
@@ -127,8 +134,21 @@ impl SandboxPaths {
             "/var/lib",
             "/var/cache/fontconfig",
             "/sys",
-            "/proc",
             "/run/udev",
+            // Randomness, and of `/proc` this process (as `/proc/<pid>`, which is what
+            // `/proc/self` names when the rule is made) and the system-wide files the C
+            // library, the allocator and SpiderMonkey read. The rest of `/proc` shows the
+            // command line and state of every other process of the user.
+            "/dev/urandom",
+            "/dev/random",
+            "/proc/self",
+            "/proc/cpuinfo",
+            "/proc/meminfo",
+            "/proc/stat",
+            "/proc/loadavg",
+            "/proc/uptime",
+            "/proc/filesystems",
+            "/proc/sys",
         ]
         .iter()
         .map(PathBuf::from)
@@ -148,17 +168,41 @@ impl SandboxPaths {
         read.extend(resources::sandbox_access_files());
         read.extend(resources::sandbox_access_files_dirs());
 
-        let mut sockets = vec![
-            PathBuf::from("/run/dbus"),
-            PathBuf::from("/run/systemd/journal"),
-        ];
-        sockets.extend(runtime);
+        // The sound server, through PulseAudio or PipeWire, and the journal. Not the whole
+        // runtime directory: it holds the compositor's socket and IPC, the systemd and D-Bus
+        // buses, SSH and GPG agents and terminal IPC, any of which runs commands or signs as
+        // the user. Nor the system bus.
+        let mut sockets = vec![PathBuf::from("/run/systemd/journal")];
+        // libpulse opens its directory before connecting, and finds nothing else in it.
+        sockets.extend(under(&runtime, &["pulse", "pipewire-0"]));
+        if let Some(server) = env::var_os("PULSE_SERVER") {
+            let server = server.to_string_lossy();
+            let path = server.strip_prefix("unix:").unwrap_or(&server);
+            if path.starts_with('/') {
+                sockets.push(PathBuf::from(path));
+            }
+        }
 
         // Threads name themselves through `/proc/self/task/<tid>/comm`. That
         // reaches this process only, which already runs its own code.
         let existing_files = vec![PathBuf::from("/proc/self/task")];
 
-        let mut write = vec![PathBuf::from("/dev")];
+        // The GPU, for the media stack's decoders, and the devices every program writes to.
+        // Not the rest of `/dev`: `/dev/shm` is shared with every process of the user.
+        let mut devices: Vec<PathBuf> = ["/dev/null", "/dev/zero", "/dev/full", "/dev/dri"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        if let Ok(entries) = fs::read_dir("/dev") {
+            devices.extend(
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("nvidia"))
+                    .map(|entry| entry.path()),
+            );
+        }
+
+        let mut write = Vec::new();
         write.extend(under(
             &cache,
             &[
@@ -176,6 +220,7 @@ impl SandboxPaths {
             read,
             sockets,
             existing_files,
+            devices,
             write,
         }
     }
@@ -184,9 +229,6 @@ impl SandboxPaths {
     /// made beforehand.
     fn create_caches(&self) {
         for path in &self.write {
-            if path.starts_with("/dev") {
-                continue;
-            }
             if let Err(error) = fs::create_dir_all(path) {
                 log::warn!(
                     "Content process sandbox: {} stays unwritable: {error}",
@@ -201,7 +243,9 @@ fn restrict_filesystem_and_network(paths: &SandboxPaths) -> Result<(), SandboxEr
     let read = AccessFs::from_read(LANDLOCK_ABI);
     let sockets = read | AccessFs::ResolveUnix;
     let existing_files = read | AccessFs::WriteFile | AccessFs::Truncate;
-    let write = AccessFs::from_all(LANDLOCK_ABI);
+    let devices = read | AccessFs::WriteFile | AccessFs::IoctlDev;
+    // Writing a cache does not need connecting to the sockets someone may have left in it.
+    let write = AccessFs::from_all(LANDLOCK_ABI) & !AccessFs::ResolveUnix;
 
     let status = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
@@ -213,12 +257,20 @@ fn restrict_filesystem_and_network(paths: &SandboxPaths) -> Result<(), SandboxEr
         .add_rules(path_beneath_rules(&paths.read, read))?
         .add_rules(path_beneath_rules(&paths.sockets, sockets))?
         .add_rules(path_beneath_rules(&paths.existing_files, existing_files))?
+        .add_rules(path_beneath_rules(&paths.devices, devices))?
         .add_rules(path_beneath_rules(&paths.write, write))?
         .all_threads(true)?
         .restrict_self()?;
 
     if status.ruleset == RulesetStatus::NotEnforced {
         return Err(SandboxError::LandlockNotEnforced);
+    }
+    if status.ruleset == RulesetStatus::PartiallyEnforced {
+        // Before Linux 7.1 Landlock cannot restrict connecting to a Unix socket, and the
+        // process reaches every socket of the session.
+        log::warn!(
+            "Content process sandbox: this kernel enforces only part of Landlock {LANDLOCK_ABI:?}"
+        );
     }
     if !status.all_threads {
         let threads = thread_count()?;
@@ -287,6 +339,10 @@ const DENIED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_clock_settime,
     libc::SYS_clock_adjtime,
     libc::SYS_adjtimex,
+    libc::SYS_process_madvise,
+    libc::SYS_syslog,
+    libc::SYS_vhangup,
+    libc::SYS_lookup_dcookie,
     #[cfg(target_arch = "x86_64")]
     libc::SYS_iopl,
     #[cfg(target_arch = "x86_64")]
@@ -309,6 +365,28 @@ const NAMESPACE_FLAGS: &[libc::c_int] = &[
     libc::CLONE_NEWCGROUP,
 ];
 
+/// Socket families a page never uses. Several have been the way out of sandboxes before:
+/// raw packets, the kernel crypto API, XDP, and protocol families few systems load.
+const DENIED_SOCKET_FAMILIES: &[libc::c_int] = &[
+    libc::AF_PACKET,
+    libc::AF_KEY,
+    libc::AF_ALG,
+    libc::AF_XDP,
+    libc::AF_VSOCK,
+    libc::AF_BLUETOOTH,
+    libc::AF_TIPC,
+    libc::AF_RDS,
+    libc::AF_CAN,
+    libc::AF_NFC,
+    libc::AF_PPPOX,
+    libc::AF_LLC,
+    libc::AF_X25,
+    libc::AF_AX25,
+    libc::AF_ATMPVC,
+    libc::AF_ATMSVC,
+    libc::AF_IEEE802154,
+];
+
 fn restrict_system_calls() -> Result<(), SandboxError> {
     let seccomp = |error: &dyn fmt::Display| SandboxError::Seccomp(error.to_string());
 
@@ -327,6 +405,41 @@ fn restrict_system_calls() -> Result<(), SandboxError> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| seccomp(&error))?;
     denied.insert(i64::from(libc::SYS_clone), namespace_rules);
+    // The family is the first argument of `socket` and `socketpair`.
+    let family_rules = || {
+        DENIED_SOCKET_FAMILIES
+            .iter()
+            .map(|family| {
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    u64::from(family.unsigned_abs()),
+                )
+                .and_then(|condition| SeccompRule::new(vec![condition]))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    denied.insert(
+        i64::from(libc::SYS_socket),
+        family_rules().map_err(|error| seccomp(&error))?,
+    );
+    denied.insert(
+        i64::from(libc::SYS_socketpair),
+        family_rules().map_err(|error| seccomp(&error))?,
+    );
+    // `TIOCSTI` types into the terminal the process was started from, and so into the
+    // user's shell, on kernels that still allow it. `TIOCLINUX` can do the same on a
+    // virtual console.
+    let terminal_rules = [libc::TIOCSTI, libc::TIOCLINUX]
+        .iter()
+        .map(|request| {
+            SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, *request)
+                .and_then(|condition| SeccompRule::new(vec![condition]))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| seccomp(&error))?;
+    denied.insert(i64::from(libc::SYS_ioctl), terminal_rules);
     let denied = SeccompFilter::new(
         denied,
         SeccompAction::Allow,
