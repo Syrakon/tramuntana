@@ -555,7 +555,8 @@ fn allows_cache_storage_message(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HostedPipeline {
     pub(crate) webview_id: WebViewId,
-    /// Whether it is the top-level document of its webview.
+    /// Whether it is the top-level document of its webview, and not one kept in its session
+    /// history. A new one counts from the start, as it is loaded to be shown.
     pub(crate) top_level: bool,
 }
 

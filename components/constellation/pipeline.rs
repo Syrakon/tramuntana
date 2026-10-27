@@ -202,6 +202,12 @@ impl Pipeline {
 
     /// Notify this pipeline of its activity.
     pub fn set_activity(&self, activity: DocumentActivity) {
+        // A top-level document kept in the session history no longer speaks for its
+        // webview, which shows another one.
+        if self.browsing_context_id == BrowsingContextId::from(self.webview_id) {
+            self.event_loop
+                .show_at_top_level(self.id, activity != DocumentActivity::Inactive);
+        }
         let msg = ScriptThreadMessage::SetDocumentActivity(self.id, activity);
         if let Err(e) = self.event_loop.send(msg) {
             warn!("Sending activity message failed ({}).", e);

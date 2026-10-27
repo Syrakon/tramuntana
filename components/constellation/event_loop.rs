@@ -303,6 +303,17 @@ impl EventLoop {
         let _ = (pipeline_id, webview_id, top_level);
     }
 
+    /// Record whether `pipeline_id`, the top-level document of its webview, is the one the
+    /// webview shows.
+    pub(crate) fn show_at_top_level(&self, pipeline_id: PipelineId, shown: bool) {
+        #[cfg(feature = "multiprocess")]
+        if let Some(pipeline) = self.hosted_pipelines.lock().get_mut(&pipeline_id) {
+            pipeline.top_level = shown;
+        }
+        #[cfg(not(feature = "multiprocess"))]
+        let _ = (pipeline_id, shown);
+    }
+
     /// Record that `pipeline_id` no longer runs in this event loop.
     pub(crate) fn release_pipeline(&self, pipeline_id: PipelineId) {
         #[cfg(feature = "multiprocess")]
