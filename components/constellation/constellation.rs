@@ -126,7 +126,7 @@ use log::{debug, error, info, trace, warn};
 use media::WindowGLContext;
 use net::image_cache::ImageCacheFactoryImpl;
 use net_traits::cookie_partition::CookieContext;
-use net_traits::pub_domains::registered_domain_name;
+use net_traits::pub_domains::{is_same_site, registered_domain_name};
 use net_traits::request::Referrer;
 use net_traits::{self, AsyncRuntime, FetchThread, ReferrerPolicy, ResourceThreads};
 use paint_api::{
@@ -3744,6 +3744,16 @@ where
             warn!("{webview_id}: Storage access asked for sites that are not URLs: {sites:?}");
             return answer(AllowOrDeny::Deny);
         };
+        // The page names the top-level site itself: it has to be the one the webview shows.
+        let shows_top_level_site = self
+            .browsing_contexts
+            .get(&BrowsingContextId::from(webview_id))
+            .and_then(|browsing_context| self.pipelines.get(&browsing_context.pipeline_id))
+            .is_some_and(|pipeline| is_same_site(&pipeline.url.origin(), &top_level.origin()));
+        if !shows_top_level_site {
+            warn!("{webview_id}: Storage access asked under another top-level site: {sites:?}");
+            return answer(AllowOrDeny::Deny);
+        }
         let resource_threads = match self.temporary_session_threads(webview_id) {
             Some((resource_threads, _)) => resource_threads,
             None if self
