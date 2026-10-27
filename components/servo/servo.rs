@@ -649,11 +649,40 @@ impl ServoInner {
             },
             EmbedderMsg::RequestStorageAccess(webview_id, sites, callback) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
+                    // A yes goes to the page through the constellation, which grants the
+                    // access first: the page cannot grant it itself.
+                    let constellation_proxy = self.constellation_proxy.clone();
+                    let granted_sites = sites.clone();
+                    let mut page_callback = Some(callback.clone());
+                    let Ok(answer_callback) = GenericCallback::new(move |answer| {
+                        let Some(page_callback) = page_callback.take() else {
+                            return;
+                        };
+                        match answer {
+                            Ok(AllowOrDeny::Allow) => constellation_proxy.send(
+                                EmbedderToConstellationMessage::GrantStorageAccess(
+                                    webview_id,
+                                    granted_sites.clone(),
+                                    page_callback,
+                                ),
+                            ),
+                            Ok(AllowOrDeny::Deny) | Err(_) => {
+                                if let Err(error) = page_callback.send(AllowOrDeny::Deny) {
+                                    warn!("Could not refuse storage access: {error:?}");
+                                }
+                            },
+                        }
+                    }) else {
+                        if let Err(error) = callback.send(AllowOrDeny::Deny) {
+                            warn!("Could not refuse storage access: {error:?}");
+                        }
+                        return;
+                    };
                     let permission_request = PermissionRequest {
                         requested_feature: PermissionFeature::StorageAccess,
                         storage_access_sites: Some(sites),
                         allow_deny_request: AllowOrDenyRequest::new_from_callback(
-                            callback,
+                            answer_callback,
                             AllowOrDeny::Deny,
                             self.servo_errors.sender(),
                         ),

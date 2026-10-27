@@ -15,7 +15,7 @@ use js::context::JSContext;
 use js::realm::CurrentRealm;
 use log::warn;
 use net_traits::CoreResourceMsg;
-use net_traits::cookie_partition::{CookieContext, top_level_site};
+use net_traits::cookie_partition::top_level_site;
 use servo_base::generic_channel::{self, GenericSend};
 
 use crate::dom::bindings::error::Error;
@@ -135,31 +135,20 @@ impl Document {
         receiver.recv().unwrap_or(false)
     }
 
-    /// The context in which the user answered yes: its site may use its cookies there.
-    fn grant_storage_access(&self, context: CookieContext) {
-        let global = self.global();
-        if global
-            .resource_threads()
-            .send(CoreResourceMsg::GrantStorageAccess(context))
-            .is_err()
-        {
-            warn!("Could not tell the network process about a storage access grant");
-        }
-    }
 }
 
 impl RoutedPromiseListener<crate::DomTypeHolder, AllowOrDeny> for Document {
     /// <https://privacycg.github.io/storage-access/#dom-document-requeststorageaccess>
     fn handle_response(&self, cx: &mut JSContext, response: AllowOrDeny, promise: &RootedPromise) {
-        match (response, self.global().cookie_context()) {
+        match response {
             // If permissionState is "granted", set doc's has storage access to
-            // true and resolve.
-            (AllowOrDeny::Allow, Some(context)) => {
-                self.grant_storage_access(context);
+            // true and resolve. The constellation gave the network process the
+            // grant before this answer was sent.
+            AllowOrDeny::Allow => {
                 promise.resolve_native(cx, &());
             },
             // Otherwise, consume user activation and reject.
-            (AllowOrDeny::Allow, None) | (AllowOrDeny::Deny, _) => {
+            AllowOrDeny::Deny => {
                 self.window().consume_user_activation();
                 promise.reject_error(cx, not_allowed("the user did not allow it"));
             },

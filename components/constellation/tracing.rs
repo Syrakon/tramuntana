@@ -50,6 +50,7 @@ mod from_embedder {
         fn log_target(&self) -> &'static str {
             match self {
                 Self::Exit => target!("Exit"),
+                Self::GrantStorageAccess(..) => target!("GrantStorageAccess"),
                 Self::AllowNavigationResponse(..) => target!("AllowNavigationResponse"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
                 Self::TraverseHistory(..) => target!("TraverseHistory"),

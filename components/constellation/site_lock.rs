@@ -17,8 +17,8 @@ use std::sync::Arc;
 use log::{debug, warn};
 use net_traits::fetch::headers::{is_forbidden_method, is_forbidden_request_header};
 use net_traits::filemanager_thread::FileManagerThreadMsg;
-use net_traits::pub_domains::reg_suffix;
-use net_traits::request::{Origin, RequestBuilder, RequestMode};
+use net_traits::pub_domains::{is_same_site, reg_suffix};
+use net_traits::request::{CredentialsMode, Origin, RequestBuilder, RequestMode};
 use net_traits::{CookieSource, CoreResourceMsg, ResourceThreads};
 use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
@@ -113,6 +113,9 @@ impl SiteLock {
             let current_url = request.url_list.last().unwrap_or(&request.url);
             return self.allows_document(current_url);
         }
+        if !self.allows_cookie_context(request) {
+            return false;
+        }
         // The referrer is not checked: a module script or a stylesheet of another site is the
         // referrer of what it imports, so any URL the process loaded can be one. What a fetch
         // may do is decided by the origin it is made for, as in Chromium.
@@ -125,6 +128,29 @@ impl SiteLock {
                     Origin::Origin(origin) => self.allows_origin(origin),
                     Origin::Client => false,
                 }),
+        }
+    }
+
+    /// Whether the cookies a request carries, which its cookie context chooses, are the ones
+    /// a page of this site could carry. A context of another site's page, or one that puts
+    /// this site's page first-party under a top-level site of another site, would give the
+    /// process the cookies another site has as a top-level site. A request without a context
+    /// carries those of a top-level site, which only this site's own requests may.
+    fn allows_cookie_context(&self, request: &RequestBuilder) -> bool {
+        if request.credentials_mode != CredentialsMode::Include {
+            return true;
+        }
+        match request
+            .client
+            .as_ref()
+            .and_then(|client| client.cookie_context.as_ref())
+        {
+            Some(context) => {
+                self.allows_origin(&context.origin) &&
+                    (context.has_cross_site_ancestor ||
+                        is_same_site(&context.origin, &context.top_level_origin))
+            },
+            None => self.allows_url(&request.url),
         }
     }
 
@@ -163,9 +189,9 @@ impl SiteLock {
             CoreResourceMsg::HasStorageAccess(url, context, _) => {
                 self.allows_url(url) && self.allows_origin(&context.origin)
             },
-            // The grant gives a site the cookies it already has as a top-level site, in its
-            // own process; a process may ask for it only for its own site.
-            CoreResourceMsg::GrantStorageAccess(context) => self.allows_origin(&context.origin),
+            // Only the user grants storage access, through the embedder's prompt: the
+            // constellation sends the grant once they say yes.
+            CoreResourceMsg::GrantStorageAccess(_) => false,
             // A history state id is a namespace and a counter: whose it is depends on the
             // namespaces the process was given, see [`allows_resource_message`].
             CoreResourceMsg::GetHistoryState(..) |
@@ -526,7 +552,8 @@ mod tests {
     use http::{HeaderName, HeaderValue, Method};
     use net_traits::FetchChannels;
     use net_traits::blob_url_store::UrlWithBlobClaim;
-    use net_traits::request::Referrer;
+    use net_traits::cookie_partition::CookieContext;
+    use net_traits::request::{InsecureRequestsPolicy, Referrer, RequestClient};
     use net_traits::response::ResponseInit;
     use servo_base::generic_channel::GenericCallback;
     use servo_base::id::Index;
@@ -799,5 +826,74 @@ mod tests {
 
     fn registered_domain(url: &ServoUrl) -> Option<Host> {
         net_traits::pub_domains::registered_domain_name(url)
+    }
+
+    fn credentialed_fetch(target: &str, context: Option<CookieContext>) -> RequestBuilder {
+        let client = RequestClient {
+            preloaded_resources: Default::default(),
+            policy_container: Default::default(),
+            origin: Origin::Origin(url("https://example.com/").origin()),
+            is_nested_browsing_context: true,
+            insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
+            has_trustworthy_ancestor_origin: false,
+            cookie_context: context,
+        };
+        let mut request = RequestBuilder::new(
+            None,
+            UrlWithBlobClaim::from_url_without_having_claimed_blob(url(target)),
+            Referrer::NoReferrer,
+        )
+        .client(client);
+        request.origin = Origin::Client;
+        request.credentials_mode = CredentialsMode::Include;
+        request
+    }
+
+    fn context(origin: &str, top_level: &str, has_cross_site_ancestor: bool) -> CookieContext {
+        CookieContext {
+            top_level_origin: url(top_level).origin(),
+            has_cross_site_ancestor,
+            origin: url(origin).origin(),
+        }
+    }
+
+    #[test]
+    fn a_credentialed_fetch_carries_only_cookies_a_page_of_this_site_has() {
+        let lock = SiteLock::new(Some(Host::Domain("example.com".to_owned())), false);
+        let bank = "https://bank.example/account";
+
+        // A page of this site, top-level or embedded in another site.
+        let top_level = context("https://example.com/", "https://example.com/", false);
+        assert!(lock.allows_fetch(&credentialed_fetch(bank, Some(top_level))));
+        let embedded = context("https://example.com/", "https://news.example/", true);
+        assert!(lock.allows_fetch(&credentialed_fetch(bank, Some(embedded))));
+
+        // A page of another site, or this site's page first-party under another site, would
+        // carry the cookies the bank has as a top-level site.
+        let as_the_bank = context("https://bank.example/", "https://bank.example/", false);
+        assert!(!lock.allows_fetch(&credentialed_fetch(bank, Some(as_the_bank))));
+        let first_party_elsewhere =
+            context("https://example.com/", "https://bank.example/", false);
+        assert!(!lock.allows_fetch(&credentialed_fetch(bank, Some(first_party_elsewhere))));
+
+        // Without a context the cookies are those of a top-level site.
+        assert!(lock.allows_fetch(&credentialed_fetch("https://www.example.com/", None)));
+        assert!(!lock.allows_fetch(&credentialed_fetch(bank, None)));
+
+        // Without credentials the context chooses nothing.
+        let mut omitted = credentialed_fetch(bank, None);
+        omitted.credentials_mode = CredentialsMode::Omit;
+        assert!(lock.allows_fetch(&omitted));
+    }
+
+    #[test]
+    fn a_process_never_grants_itself_storage_access() {
+        let lock = SiteLock::new(Some(Host::Domain("example.com".to_owned())), false);
+        let grant = CoreResourceMsg::GrantStorageAccess(context(
+            "https://example.com/",
+            "https://news.example/",
+            true,
+        ));
+        assert!(!lock.allows_core_resource_message(&grant));
     }
 }

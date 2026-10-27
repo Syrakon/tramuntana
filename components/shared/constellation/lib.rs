@@ -19,9 +19,9 @@ use embedder_traits::user_contents::{
     UserContentManagerId, UserScript, UserScriptId, UserStyleSheet, UserStyleSheetId,
 };
 use embedder_traits::{
-    EmbedderControlId, EmbedderControlResponse, InputEventAndId, JavaScriptEvaluationId,
+    AllowOrDeny, EmbedderControlId, EmbedderControlResponse, InputEventAndId, JavaScriptEvaluationId,
     MediaSessionActionType, NewWebViewDetails, PaintHitTestResult, Theme, TraversalId, UrlRequest,
-    ViewportDetails, WebDriverCommandMsg,
+    StorageAccessSites, ViewportDetails, WebDriverCommandMsg,
 };
 pub use from_script_message::*;
 use malloc_size_of_derive::MallocSizeOf;
@@ -48,6 +48,11 @@ use webrender_api::{ExternalScrollId, ImageKey};
 pub enum EmbedderToConstellationMessage {
     /// Exit the constellation.
     Exit,
+    /// The user let the embedded site of [`StorageAccessSites`] use its first-party cookies
+    /// where the top-level site embeds it, in the given tab. The constellation tells the
+    /// network thread of the tab's session, then gives the callback the answer: a content
+    /// process never grants itself storage access.
+    GrantStorageAccess(WebViewId, StorageAccessSites, GenericCallback<AllowOrDeny>),
     /// Whether to allow script to navigate.
     AllowNavigationResponse(PipelineId, bool),
     /// Request to load a page, with optionally additional data in [`URLRequest`].

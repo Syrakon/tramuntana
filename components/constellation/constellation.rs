@@ -108,11 +108,12 @@ use devtools_traits::{
 use embedder_traits::resources::{self, Resource};
 use embedder_traits::user_contents::{UserContentManagerId, UserContents};
 use embedder_traits::{
-    AnimationState, EmbedderControlId, EmbedderControlResponse, EmbedderProxy, FocusSequenceNumber,
+    AllowOrDeny, AnimationState, EmbedderControlId, EmbedderControlResponse, EmbedderProxy, FocusSequenceNumber,
     GenericEmbedderProxy, InputEvent, InputEventAndId, InputEventOutcome, JSValue,
     JavaScriptEvaluationError, JavaScriptEvaluationId, KeyboardEvent, MediaSessionActionType,
     MediaSessionEvent, MediaSessionPlaybackState, MouseButtonAction, MouseButtonEvent,
-    NewWebViewDetails, PaintHitTestResult, TemporarySession, Theme, ViewportDetails,
+    NewWebViewDetails, PaintHitTestResult, StorageAccessSites, TemporarySession, Theme,
+    ViewportDetails,
     WakeLockDelegate, WakeLockType,
     WebDriverCommandMsg, WebDriverLoadStatus, WebDriverScriptCommand,
 };
@@ -1321,6 +1322,9 @@ where
         match message {
             EmbedderToConstellationMessage::Exit => {
                 self.handle_exit();
+            },
+            EmbedderToConstellationMessage::GrantStorageAccess(webview_id, sites, callback) => {
+                self.handle_grant_storage_access(webview_id, sites, callback);
             },
             EmbedderToConstellationMessage::AllowNavigationResponse(pipeline_id, allowed) => {
                 self.handle_allow_navigation_response(pipeline_id, allowed);
@@ -3718,6 +3722,54 @@ where
 
     /// The resource and storage threads that the script threads of this
     /// webview must use, if the webview is in a temporary session.
+    /// The user let `sites.embedded_site` use its first-party cookies where
+    /// `sites.top_level_site` embeds it, in `webview_id`. The network thread of the tab's
+    /// session learns of it before the page does, so what the page loads once it knows has
+    /// those cookies.
+    fn handle_grant_storage_access(
+        &self,
+        webview_id: WebViewId,
+        sites: StorageAccessSites,
+        callback: GenericCallback<AllowOrDeny>,
+    ) {
+        let answer = |answer| {
+            if let Err(error) = callback.send(answer) {
+                warn!("{webview_id}: Could not answer a storage access request: {error:?}");
+            }
+        };
+        let (Ok(embedded), Ok(top_level)) = (
+            ServoUrl::parse(&sites.embedded_site),
+            ServoUrl::parse(&sites.top_level_site),
+        ) else {
+            warn!("{webview_id}: Storage access asked for sites that are not URLs: {sites:?}");
+            return answer(AllowOrDeny::Deny);
+        };
+        let resource_threads = match self.temporary_session_threads(webview_id) {
+            Some((resource_threads, _)) => resource_threads,
+            None if self
+                .browsing_contexts
+                .get(&BrowsingContextId::from(webview_id))
+                .is_some_and(|browsing_context| browsing_context.is_private) =>
+            {
+                self.private_resource_threads.clone()
+            },
+            None => self.public_resource_threads.clone(),
+        };
+        let context = CookieContext {
+            top_level_origin: top_level.origin(),
+            has_cross_site_ancestor: true,
+            origin: embedded.origin(),
+        };
+        if let Err(error) = resource_threads
+            .core_thread
+            .send(net_traits::CoreResourceMsg::GrantStorageAccess(context))
+        {
+            warn!("{webview_id}: Could not grant storage access: {error:?}");
+            return answer(AllowOrDeny::Deny);
+        }
+        answer(AllowOrDeny::Allow);
+    }
+
     pub(crate) fn temporary_session_threads(
         &self,
         webview_id: WebViewId,
