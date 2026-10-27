@@ -122,6 +122,8 @@ pub(crate) struct BrowsingContextActor {
     name: String,
     /// This corresponds to webview_id
     pub browser_id: DevtoolsBrowserId,
+    /// The embedder's own name for the webview, so it can find the tab it shows.
+    pub webview_id: String,
     // TODO: Should these ids be atomic?
     active_pipeline_id: AtomicRefCell<PipelineId>,
     active_outer_window_id: AtomicRefCell<DevtoolsOuterWindowId>,
@@ -190,6 +192,7 @@ impl BrowsingContextActor {
         registry: &ActorRegistry,
         console_name: String,
         browser_id: DevtoolsBrowserId,
+        webview_id: String,
         browsing_context_id: DevtoolsBrowsingContextId,
         page_info: DevtoolsPageInfo,
         pipeline_id: PipelineId,
@@ -236,6 +239,7 @@ impl BrowsingContextActor {
             active_pipeline_id: pipeline_id.into(),
             active_outer_window_id: outer_window_id.into(),
             browser_id,
+            webview_id,
             browsing_context_id,
             accessibility_name: accessibility_actor.name().into(),
             console_name,

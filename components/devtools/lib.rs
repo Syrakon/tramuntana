@@ -571,6 +571,7 @@ impl DevtoolsInstance {
                         &self.registry,
                         console_name.clone(),
                         devtools_browser_id,
+                        webview_id.to_string(),
                         devtools_browsing_context_id,
                         page_info,
                         pipeline_id,

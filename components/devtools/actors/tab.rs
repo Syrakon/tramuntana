@@ -31,6 +31,8 @@ pub(crate) struct TabDescriptorActorMsg {
     /// This correspond to webview_id
     #[serde(rename = "browserId")]
     browser_id: u32,
+    /// Not in Firefox's protocol: the `WebViewId` as the embedder prints it.
+    web_view_id: String,
     #[serde(rename = "browsingContextID")]
     browsing_context_id: u32,
     is_zombie_tab: bool,
@@ -194,6 +196,7 @@ impl ActorEncode<TabDescriptorActorMsg> for TabDescriptorActor {
         TabDescriptorActorMsg {
             actor: self.name().into(),
             browser_id: browsing_context_actor.browser_id.value(),
+            web_view_id: browsing_context_actor.webview_id.clone(),
             browsing_context_id: browsing_context_actor.browsing_context_id.value(),
             is_zombie_tab: false,
             outer_window_id: browsing_context_actor.outer_window_id().value(),
