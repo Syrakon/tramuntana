@@ -111,8 +111,12 @@ use webrender_api::ExternalScrollId;
 use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint};
 
 use crate::dom::StatelessWorkletThreadPool;
-use crate::dom::bindings::callback::RootedCallback;
+use crate::dom::bindings::callback::{ExceptionHandling, RootedCallback, TracedCallback};
 use crate::dom::bindings::codegen::Bindings::AnimationFrameProviderBinding::FrameRequestCallback;
+use crate::dom::bindings::codegen::Bindings::IdleDeadlineBinding::{
+    IdleRequestCallback, IdleRequestOptions,
+};
+use crate::dom::bindings::codegen::Bindings::PerformanceBinding::PerformanceMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState, NamedPropertyValue,
 };
@@ -163,6 +167,7 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::fetchlaterresult::FetchLaterResult;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::window::idledeadline::IdleDeadline;
 use crate::dom::history::History;
 use crate::dom::html::htmlcollection::{CollectionFilter, HTMLCollection};
 use crate::dom::html::htmliframeelement::HTMLIFrameElement;
@@ -502,6 +507,12 @@ pub(crate) struct Window {
     /// <https://dom.spec.whatwg.org/#window-current-event>
     current_event: MutNullableDom<Event>,
 
+    /// <https://w3c.github.io/requestidlecallback/#dfn-list-of-idle-request-callbacks>
+    idle_request_callbacks: DomRefCell<Vec<(u32, TracedCallback<IdleRequestCallback>)>>,
+
+    /// <https://w3c.github.io/requestidlecallback/#dfn-idle-callback-identifier>
+    idle_callback_identifier: Cell<u32>,
+
     /// <https://w3c.github.io/reporting/#windoworworkerglobalscope-registered-reporting-observer-list>
     reporting_observer_list: DomRefCell<Vec<Dom<ReportingObserver>>>,
 
@@ -547,7 +558,40 @@ pub(crate) struct Window {
     has_dispatched_input_event: Cell<bool>,
 }
 
+
+/// How long after `requestIdleCallback` its callback runs.
+const IDLE_CALLBACK_DELAY_MS: i64 = 1;
+
+/// <https://w3c.github.io/requestidlecallback/#the-requestidlecallback-method>:
+/// the longest an idle period may last.
+const IDLE_PERIOD_MS: f64 = 50.0;
+
 impl Window {
+    /// <https://w3c.github.io/requestidlecallback/#invoke-idle-callbacks-algorithm>
+    fn run_idle_callback(&self, cx: &mut JSContext, handle: u32) {
+        if !self
+            .idle_request_callbacks
+            .borrow()
+            .iter()
+            .any(|(id, _)| *id == handle)
+        {
+            return;
+        }
+        let deadline = *self.Performance(cx).Now() + IDLE_PERIOD_MS;
+        let idle_deadline = IdleDeadline::new(cx, self, deadline, false);
+
+        // The callback leaves the list right before it is called, after the last
+        // allocation that could collect it, and the call itself keeps it alive.
+        let callback = {
+            let mut callbacks = self.idle_request_callbacks.borrow_mut();
+            let Some(index) = callbacks.iter().position(|(id, _)| *id == handle) else {
+                return;
+            };
+            callbacks.remove(index).1
+        };
+        let _ = callback.Call__(cx, &idle_deadline, ExceptionHandling::Report);
+    }
+
     pub(crate) fn script_thread(&self) -> Rc<ScriptThread> {
         Weak::upgrade(&self.weak_script_thread)
             .expect("Weak reference should always be upgradable when a ScriptThread is running")
@@ -1960,6 +2004,40 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
             .request_animation_frame(AnimationFrameCallback::FrameRequestCallback {
                 callback: callback.to_traced(),
             }))
+    }
+
+    /// <https://w3c.github.io/requestidlecallback/#the-requestidlecallback-method>
+    fn RequestIdleCallback(
+        &self,
+        callback: RootedCallback<IdleRequestCallback>,
+        _options: &IdleRequestOptions,
+    ) -> u32 {
+        let handle = self.idle_callback_identifier.get().wrapping_add(1);
+        self.idle_callback_identifier.set(handle);
+        self.idle_request_callbacks
+            .borrow_mut()
+            .push((handle, callback.to_traced()));
+
+        // Servo does not track idle periods yet. The callback runs from a timer task
+        // shortly after, with the budget of a whole idle period; that is never later
+        // than any `timeout` asks for, so the option changes nothing.
+        self.as_global_scope().run_steps_after_a_timeout(
+            DOMString::from("requestIdleCallback"),
+            IDLE_CALLBACK_DELAY_MS,
+            move |cx, global| {
+                if let Some(window) = global.downcast::<Window>() {
+                    window.run_idle_callback(cx, handle);
+                }
+            },
+        );
+        handle
+    }
+
+    /// <https://w3c.github.io/requestidlecallback/#the-cancelidlecallback-method>
+    fn CancelIdleCallback(&self, handle: u32) {
+        self.idle_request_callbacks
+            .borrow_mut()
+            .retain(|(id, _)| *id != handle);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-window-cancelanimationframe>
@@ -4229,6 +4307,8 @@ impl Window {
             throttled: Cell::new(false),
             layout_marker: DomRefCell::new(Rc::new(Cell::new(true))),
             current_event: MutNullableDom::new(None),
+            idle_request_callbacks: Default::default(),
+            idle_callback_identifier: Cell::new(0),
             trusted_types: Default::default(),
             reporting_observer_list: Default::default(),
             report_list: Default::default(),
