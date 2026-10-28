@@ -363,16 +363,15 @@ pub(crate) async fn start_websocket(
     let (stream, response) =
         client_async_tls_with_connector_and_config(builder, socket, Some(connector), None).await?;
 
-    let protocol_in_use = process_ws_response(
-        &http_state,
-        &response,
-        &url,
-        &http_state
-            .cookie_jar
-            .read()
-            .partition_for(&client.current_url(), client.cookie_context()),
-        protocols,
-    )?;
+    // Its own statement: a read guard taken in the argument list lives until the call returns,
+    // and `process_ws_response` takes the cookie jar's write lock, so every cookie access in the
+    // browser would wait on this connection forever.
+    let cookie_partition = http_state
+        .cookie_jar
+        .read()
+        .partition_for(&client.current_url(), client.cookie_context());
+    let protocol_in_use =
+        process_ws_response(&http_state, &response, &url, &cookie_partition, protocols)?;
 
     if !initiated_close.load(Ordering::SeqCst) {
         if resource_event_sender
