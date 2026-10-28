@@ -103,8 +103,7 @@ pub fn spawn_multiprocess(
     let (server, token) = IpcOneShotServer::<IpcSender<UnprivilegedContent>>::new()
         .expect("Failed to create IPC one-shot server.");
 
-    let path_to_self = env::current_exe().expect("Failed to get current executor.");
-    let mut child_process = process::Command::new(path_to_self);
+    let mut child_process = command_for_self();
     setup_common(&mut child_process, token);
 
     #[allow(clippy::zombie_processes)]
@@ -164,8 +163,7 @@ pub fn spawn_multiprocess(
                 .pid as u32,
         )
     } else {
-        let path_to_self = env::current_exe().expect("Failed to get current executor.");
-        let mut child_process = process::Command::new(path_to_self);
+        let mut child_process = command_for_self();
         setup_common(&mut child_process, token);
 
         crate::process_manager::Process::Unsandboxed(
@@ -185,6 +183,52 @@ pub fn spawn_multiprocess(
 pub fn spawn_multiprocess(_content: UnprivilegedContent) -> Result<Process, Error> {
     log::error!("Multiprocess is not supported on iOS.");
     process::exit(1);
+}
+
+/// The running binary, opened once. Content processes are started from this descriptor rather
+/// than from the path on disk, so they always run the same build as the process spawning them:
+/// once a rebuild or an update replaces the file, a child started from the path is a different
+/// build, does not speak the same IPC, and takes the browser down with it.
+#[cfg(target_os = "linux")]
+static CURRENT_EXE: std::sync::OnceLock<Option<(std::fs::File, std::path::PathBuf)>> =
+    std::sync::OnceLock::new();
+
+/// Open the running binary now, before anything can replace it on disk. Content processes are
+/// spawned later, when the first page loads.
+pub fn pin_current_exe() {
+    #[cfg(target_os = "linux")]
+    CURRENT_EXE.get_or_init(|| {
+        std::fs::File::open("/proc/self/exe")
+            .and_then(|file| Ok((file, env::current_exe()?)))
+            .inspect_err(|error| {
+                log::warn!(
+                    "Cannot open the running binary, content processes start from its path: {error}"
+                )
+            })
+            .ok()
+    });
+}
+
+/// A command that starts this same binary.
+#[cfg(not(target_os = "ios"))]
+fn command_for_self() -> process::Command {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        pin_current_exe();
+        if let Some(Some((file, path))) = CURRENT_EXE.get() {
+            // The descriptor is close-on-exec, but the kernel resolves the path before it closes
+            // anything. `arg0` keeps the path the binary had at startup in the child's command
+            // line: read now, it would end in " (deleted)" once the file is replaced.
+            let mut command =
+                process::Command::new(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            command.arg0(path);
+            return command;
+        }
+    }
+    process::Command::new(env::current_exe().expect("Failed to get current executor."))
 }
 
 fn setup_common<C: CommandMethods>(command: &mut C, token: String) {

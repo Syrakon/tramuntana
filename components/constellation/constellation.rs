@@ -654,6 +654,9 @@ where
         random_pipeline_closure_seed: Option<usize>,
         hard_fail: bool,
     ) {
+        if opts::get().multiprocess {
+            crate::sandboxing::pin_current_exe();
+        }
         thread::Builder::new()
             .name("Constellation".to_owned())
             .spawn(move || {
