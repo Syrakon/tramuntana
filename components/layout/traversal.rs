@@ -241,6 +241,17 @@ pub(crate) fn compute_damage_and_rebuild_box_tree_below_dirty_root<'dom>(
         layout_roots,
     );
 
+    // An inline `<svg>` is painted from a serialized copy that carries its computed
+    // paint. When it or a descendant is restyled, script compares that paint and
+    // serializes again if it changed.
+    if !(damage_set.on_element | damage_set.from_children).is_empty() &&
+        node.as_svg().is_some_and(|svg_data| matches!(svg_data.source, Some(Ok(_))))
+    {
+        layout_context
+            .image_resolver
+            .queue_svg_element_for_serialization(node);
+    }
+
     // Apply the calculated damage to this element (perhaps triggering box tree layout),
     // and propagate resulting damage to ancestors.
     damage_set.apply_damage(layout_context, layout_roots)

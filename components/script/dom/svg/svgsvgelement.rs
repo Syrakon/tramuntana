@@ -2,6 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use atomic_refcell::AtomicRefCell;
 use base64::Engine as _;
 use cssparser::Parser;
@@ -13,7 +16,10 @@ use layout_api::SVGElementData;
 use servo_url::ServoUrl;
 use style::attr::AttrValue;
 use style::parser::ParserContext;
+use style::properties::ComputedValues;
 use style::stylesheets::Origin;
+use style::values::computed::SVGPaint;
+use style::values::generics::svg::SVGPaintKind;
 use style::values::specified::LengthPercentage;
 use style_traits::{ParsingMode, ToCss};
 use uuid::Uuid;
@@ -44,6 +50,9 @@ pub(crate) struct SVGSVGElement {
     // on each layout and must be invalidated when the subtree changes.
     #[no_trace]
     cached_serialized_data_url: AtomicRefCell<Option<Result<ServoUrl, ()>>>,
+    // A hash of the computed paint baked into `cached_serialized_data_url`, so
+    // that a restyle which leaves it unchanged does not serialize again.
+    cached_paint_key: Cell<u64>,
 }
 
 impl SVGSVGElement {
@@ -56,6 +65,7 @@ impl SVGSVGElement {
             svggraphicselement: SVGGraphicsElement::new_inherited(local_name, prefix, document),
             uuid: Uuid::new_v4(),
             cached_serialized_data_url: Default::default(),
+            cached_paint_key: Cell::new(0),
         }
     }
 
@@ -73,6 +83,40 @@ impl SVGSVGElement {
             document,
             proto,
         )
+    }
+
+    /// Serialize the subtree again if its computed paint changed since it was last
+    /// serialized, as when a page switches to a dark theme after load. Layout asks
+    /// for this whenever the `<svg>` or one of its descendants is restyled.
+    pub(crate) fn serialize_and_cache_subtree_if_needed(&self, cx: &mut JSContext) {
+        let is_cached = self.cached_serialized_data_url.borrow().is_some();
+        if is_cached && self.cached_paint_key.get() == paint_key(&self.computed_paint()) {
+            return;
+        }
+        self.invalidate_cached_serialized_subtree_and_rasterization_result(cx.no_gc());
+        self.serialize_and_cache_subtree(cx);
+    }
+
+    /// The computed paint of each element of the subtree, in tree order.
+    ///
+    /// The serialized markup carries no CSS context: resvg sees neither the
+    /// page's style sheets nor the inherited `color`, so `currentColor` comes
+    /// out black and `fill` set by a rule never applies. Icon sets paint this
+    /// way all the time, and black icons vanish on dark pages. The computed
+    /// values already account for every rule, inline style and presentation
+    /// attribute, so writing them on the serialized copy makes resvg paint
+    /// what the page styled.
+    fn computed_paint(&self) -> Vec<Option<String>> {
+        self.upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::No)
+            .filter_map(DomRoot::downcast::<Element>)
+            .map(|element| {
+                let is_root = &*element == self.upcast::<Element>();
+                element
+                    .style_without_reflow()
+                    .map(|style| paint_declarations(&style, is_root))
+            })
+            .collect()
     }
 
     pub(crate) fn serialize_and_cache_subtree(&self, cx: &mut js::context::JSContext) {
@@ -94,6 +138,32 @@ impl SVGSVGElement {
             return;
         }
 
+        // This runs while `Window::reflow` handles the results of a reflow, so
+        // the styles are current. Asking for a new reflow here re-enters
+        // `Window::reflow`, which finds this element pending again and recurses
+        // until the stack overflows.
+        //
+        // The clone has the shape of the original, so its elements pair up in
+        // tree order. This has to happen before `<use>` targets are appended.
+        let paint = self.computed_paint();
+        let cloned_elements: Vec<_> = cloned_node
+            .traverse_preorder(ShadowIncluding::No)
+            .filter_map(DomRoot::downcast::<Element>)
+            .collect();
+        for (element, declarations) in cloned_elements.iter().zip(&paint) {
+            let Some(declarations) = declarations else {
+                continue;
+            };
+            // resvg drops a `style` that starts with an empty declaration.
+            let mut style = String::from(element.get_string_attribute(&local_name!("style")));
+            if !style.trim().is_empty() {
+                style.push(';');
+            }
+            style.push_str(declarations);
+            element.set_string_attribute(cx, &local_name!("style"), style.into());
+        }
+        self.cached_paint_key.set(paint_key(&paint));
+
         self.process_use_elements(cx, &cloned_node);
 
         let Ok(xml_source) = cloned_node.xml_serialize(TraversalScope::IncludeNode) else {
@@ -101,26 +171,7 @@ impl SVGSVGElement {
             return;
         };
 
-        let mut xml_source: String = xml_source.into();
-
-        // The serialized markup carries no CSS context, so resvg resolves
-        // `currentColor` to its default (black) when it rasterizes. Icon
-        // libraries that paint with `stroke="currentColor"` /
-        // `fill="currentColor"` (Lucide, Feather, Heroicons, …) then come out
-        // black and vanish on dark UIs. Inject the element's computed `color`
-        // onto the root `<svg>` as a presentation attribute so `currentColor`
-        // resolves to the inherited colour; any `color` set inside the SVG
-        // still wins over a presentation attribute.
-        //
-        // This runs while `Window::reflow` handles the results of a reflow, so
-        // the styles are current. Asking for a new reflow here re-enters
-        // `Window::reflow`, which finds this element pending again and recurses
-        // until the stack overflows.
-        if let Some(style) = self.upcast::<Element>().style_without_reflow() {
-            let color = style.get_inherited_text().color.to_css_string();
-            xml_source = xml_source.replacen("<svg", &format!("<svg color=\"{color}\""), 1);
-        }
-
+        let xml_source: String = xml_source.into();
         let base64_encoded_source = base64::engine::general_purpose::STANDARD.encode(xml_source);
         let data_url = format!("data:image/svg+xml;base64,{base64_encoded_source}");
         match ServoUrl::parse(&data_url) {
@@ -202,6 +253,51 @@ impl SVGSVGElement {
         *self.cached_serialized_data_url.borrow_mut() = None;
         self.upcast::<Node>().dirty(no_gc, NodeDamage::Other);
     }
+}
+
+/// The declarations that make resvg paint an element as the page computed it.
+/// The root's `opacity` is left out because the page already applies it when
+/// it paints the rasterized image.
+fn paint_declarations(style: &ComputedValues, is_root: bool) -> String {
+    let color = &style.get_inherited_text().color;
+    let svg = style.get_inherited_svg();
+    let mut declarations = format!("color:{}", color.to_css_string());
+    for (name, paint) in [("fill", &svg.fill), ("stroke", &svg.stroke)] {
+        if let Some(paint) = paint_value(paint, color) {
+            declarations.push_str(&format!(";{name}:{paint}"));
+        }
+    }
+    declarations.push_str(&format!(
+        ";fill-opacity:{};stroke-opacity:{};stroke-width:{}",
+        svg.fill_opacity.to_css_string(),
+        svg.stroke_opacity.to_css_string(),
+        svg.stroke_width.to_css_string(),
+    ));
+    if !is_root {
+        declarations.push_str(&format!(";opacity:{}", style.get_effects().opacity));
+    }
+    declarations
+}
+
+/// A paint resvg can parse. Colours are resolved, because resvg only knows
+/// `currentColor` with that exact casing. Paint servers are left to the markup:
+/// their computed `url()` is absolute and would not resolve inside a `data:` URL.
+fn paint_value(paint: &SVGPaint, color: &style::color::AbsoluteColor) -> Option<String> {
+    match &paint.kind {
+        SVGPaintKind::None => Some("none".to_owned()),
+        SVGPaintKind::Color(paint_color) => {
+            Some(paint_color.resolve_to_absolute(color).to_css_string())
+        },
+        SVGPaintKind::PaintServer(_) |
+        SVGPaintKind::ContextFill |
+        SVGPaintKind::ContextStroke => None,
+    }
+}
+
+fn paint_key(paint: &[Option<String>]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    paint.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl<'dom> LayoutDom<'dom, SVGSVGElement> {
