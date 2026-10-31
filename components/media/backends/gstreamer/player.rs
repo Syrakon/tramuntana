@@ -169,6 +169,9 @@ struct PlayerInner {
     paused: Cell<bool>,
     can_resume: Cell<bool>,
     playback_rate: Cell<f64>,
+    /// The rate GstPlay was last given. Its seeks run at it, and undo any
+    /// instant rate change made since.
+    play_rate: Cell<f64>,
     muted: Cell<bool>,
     volume: Cell<f64>,
     stream_type: StreamType,
@@ -257,9 +260,28 @@ impl PlayerInner {
         // set immediately before the initial gstreamer_play_MESSAGE_MEDIA_INFO_UPDATED
         // message is posted to bus.
         if self.last_metadata.is_some() {
-            self.player.set_rate(playback_rate);
+            self.apply_playback_rate();
         }
         Ok(())
+    }
+
+    /// Pass the playback rate to the pipeline. The source buffers take it as an
+    /// instant rate change, which keeps the position moving; GstPlay would pause,
+    /// flush and seek to where playback is instead.
+    fn apply_playback_rate(&self) {
+        let rate = self.playback_rate.get();
+        if self.stream_type == StreamType::MediaSource &&
+            rate > 0. &&
+            self.media_source.change_rate(rate / self.play_rate.get())
+        {
+            return;
+        }
+        self.set_play_rate(rate);
+    }
+
+    fn set_play_rate(&self, rate: f64) {
+        self.play_rate.set(rate);
+        self.player.set_rate(rate);
     }
 
     pub fn playback_rate(&self) -> f64 {
@@ -715,6 +737,13 @@ fn handle_message(
             }
         },
         gstreamer_play::PlayMessage::SeekDone(seek_done) => {
+            // The seek ran at the rate GstPlay was last given.
+            if let Some(lease) = Lease::take(weak_inner) &&
+                let Some(inner) = lease.lock() &&
+                inner.playback_rate.get() != inner.play_rate.get()
+            {
+                inner.apply_playback_rate();
+            }
             if let Some(position) = seek_done.position() {
                 let _ = notify!(observer, PlayerEvent::SeekDone(position.seconds_f64()));
             }
@@ -744,7 +773,7 @@ fn handle_message(
                     // The `paused` state change event will be fired after the
                     // seek initiated by the playback rate change has
                     // completed.
-                    inner.player.set_rate(inner.playback_rate.get());
+                    inner.set_play_rate(inner.playback_rate.get());
                 } else if inner.play_state == gstreamer_play::PlayState::Paused {
                     // We need to send the paused event for non seekable push streams.
                     send_pause_event = true;
@@ -1088,6 +1117,7 @@ impl GStreamerPlayer {
             paused: Cell::new(DEFAULT_PAUSED),
             can_resume: Cell::new(DEFAULT_CAN_RESUME),
             playback_rate: Cell::new(DEFAULT_PLAYBACK_RATE),
+            play_rate: Cell::new(DEFAULT_PLAYBACK_RATE),
             muted: Cell::new(DEFAULT_MUTED),
             volume: Cell::new(DEFAULT_VOLUME),
             stream_type: self.stream_type,

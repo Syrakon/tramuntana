@@ -1426,6 +1426,34 @@ impl MediaSource {
             .store(nanoseconds(position), Ordering::Relaxed);
     }
 
+    /// Change the rate of playback to `multiplier` times the rate of the last
+    /// seek, without a flush, the way a demuxer does when asked for an instant
+    /// rate change. The sinks ask the pipeline to switch together. Says whether
+    /// every track took it; a seek of the pipeline undoes it.
+    pub(crate) fn change_rate(&self, multiplier: f64) -> bool {
+        if self.playing.is_empty() {
+            return false;
+        }
+        let seqnum = gstreamer::Seqnum::next();
+        let mut taken = true;
+        for track in &self.playing {
+            let Some(appsrc) = lock(&track.buffer).appsrc.clone() else {
+                return false;
+            };
+            let Some(pad) = appsrc.static_pad("src") else {
+                return false;
+            };
+            let event = gstreamer::event::InstantRateChange::builder(
+                multiplier,
+                gstreamer::SegmentFlags::empty(),
+            )
+            .seqnum(seqnum)
+            .build();
+            taken &= pad.push_event(event);
+        }
+        taken
+    }
+
     /// Playback is about to move to `position`. The pipeline tells the tracks so
     /// itself when it seeks, but it cannot seek before it has shown a first
     /// frame, and it never will if the frames it starts with are not the ones
