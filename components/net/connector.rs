@@ -669,5 +669,8 @@ pub fn create_http_client(tls_config: TlsConfig) -> ServoClient {
         // limit controls the maximum idle connections per host, which we still don't want to grow
         // without bound.
         .pool_max_idle_per_host(6)
+        // hyper refuses HTTP/2 responses whose headers pass 16 KiB, which a site that sets
+        // many cookies reaches (YouTube, for a signed-in profile). Chromium allows 256 KiB.
+        .http2_max_header_list_size(256 * 1024)
         .build(InstrumentedConnector::from(connector))
 }
