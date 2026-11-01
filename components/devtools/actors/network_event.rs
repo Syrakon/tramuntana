@@ -6,7 +6,7 @@
 //! Handles interaction with the remote web console on network events (HTTP requests, responses) in Servo.
 
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atomic_refcell::AtomicRefCell;
 use base64::engine::Engine;
@@ -15,6 +15,7 @@ use chrono::{Local, LocalResult, TimeZone};
 use devtools_traits::{HttpRequest, HttpResponse};
 use headers::{ContentLength, HeaderMapExt};
 use http::HeaderMap;
+use http::header::CONTENT_TYPE;
 use malloc_size_of_derive::MallocSizeOf;
 use net::cookie::ServoCookie;
 use net_traits::fetch::headers::extract_mime_type_as_dataurl_mime;
@@ -27,6 +28,7 @@ use crate::StreamId;
 use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry, new_actor_name};
 use crate::actors::browsing_context::BrowsingContextActor;
 use crate::actors::long_string::LongStringActor;
+use crate::certificate;
 use crate::network_handler::Cause;
 use crate::protocol::ClientRequest;
 
@@ -134,6 +136,7 @@ struct RequestFields {
     remote_port: Option<u16>,
     request_cookies_available: bool,
     request_headers_available: bool,
+    /// Milliseconds from the start of the request to the end of its response.
     total_time: f64,
 }
 
@@ -148,6 +151,13 @@ struct ResponseFields {
     response_start_available: bool,
     status: String,
     status_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    /// The size of the body, decoded.
+    content_size: usize,
+    /// The size of the body on the wire, when the server said it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transferred_size: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -317,7 +327,51 @@ impl From<&TlsSecurityInfo> for SecurityInfo {
             used_delegated_credentials: info.used_delegated_credentials,
             used_ocsp: info.used_ocsp,
             used_private_dns: info.used_private_dns,
+            cert: info
+                .certificate_chain_der
+                .first()
+                .and_then(|der| certificate::parse(der))
+                .map(SecurityCertificate::from)
+                .unwrap_or_default(),
             ..Default::default()
+        }
+    }
+}
+
+impl From<certificate::Identity> for CertificateIdentity {
+    fn from(identity: certificate::Identity) -> Self {
+        Self {
+            name: identity.common_name.clone(),
+            common_name: identity.common_name,
+            organization: identity.organization,
+            organizational_unit: identity.organizational_unit,
+        }
+    }
+}
+
+impl From<certificate::Certificate> for SecurityCertificate {
+    fn from(cert: certificate::Certificate) -> Self {
+        let now = chrono::Utc::now();
+        let lifetime = cert
+            .not_before
+            .zip(cert.not_after)
+            .map(|(start, end)| format!("{} days", (end - start).num_days()));
+        Self {
+            subject: cert.subject.into(),
+            issuer: cert.issuer.into(),
+            validity: CertificateValidity {
+                start: cert.not_before.map(|t| t.to_rfc3339()),
+                end: cert.not_after.map(|t| t.to_rfc3339()),
+                lifetime,
+                expired: cert.not_after.is_some_and(|end| end < now) ||
+                    cert.not_before.is_some_and(|start| start > now),
+            },
+            fingerprint: CertificateFingerprint {
+                sha256: Some(cert.sha256),
+                sha1: Some(cert.sha1),
+            },
+            serial_number: Some(cert.serial_number),
+            is_built_in_root: None,
         }
     }
 }
@@ -474,7 +528,9 @@ impl Actor for NetworkEventActor {
                     .map(|content_length_header| content_length_header.0);
 
                 let content = response.response.body.as_ref().map(|body| {
-                    let (encoding, text) = if mime_type.is_some() {
+                    // A body that is not text goes as base64, so its bytes,
+                    // an image's, reach the client whole.
+                    let (encoding, text) = if mime_type.as_deref().is_some_and(is_text_mime) {
                         // Queue a LongStringActor for this body
                         let body_string = String::from_utf8_lossy(body).to_string();
                         let long_string_actor = LongStringActor::register(registry, body_string);
@@ -558,7 +614,11 @@ impl NetworkEventActor {
         registry.register::<Self>(actor)
     }
 
-    pub fn add_request(&self, request: HttpRequest) {
+    pub fn add_request(&self, mut request: HttpRequest) {
+        // An update of the request keeps the time the first report started it.
+        if let Some(earlier) = self.request.borrow().as_ref() {
+            request.started_date_time = earlier.request.started_date_time;
+        }
         *self.request.borrow_mut() = Some(NetworkEventRequest {
             // TODO: Fill the rest of the fields correctly for offsets and timings
             offsets: Default::default(),
@@ -575,6 +635,11 @@ impl NetworkEventActor {
     pub fn add_response(&self, response: HttpResponse) {
         if response.body.is_none() {
             return;
+        }
+        if let Some(request) = self.request.borrow_mut().as_mut() {
+            request.total_time = SystemTime::now()
+                .duration_since(request.request.started_date_time)
+                .unwrap_or_default();
         }
         *self.response.borrow_mut() = Some(NetworkEventResponse {
             cache_details: CacheDetails {
@@ -601,7 +666,7 @@ impl NetworkEventActor {
             remote_port: url.port(),
             request_cookies_available: !cookies.is_empty(),
             request_headers_available: !request.request.headers.is_empty(),
-            total_time: request.total_time.as_secs_f64(),
+            total_time: request.total_time.as_secs_f64() * 1000.0,
         })
     }
 
@@ -612,6 +677,13 @@ impl NetworkEventActor {
         let headers = response.response.headers.as_ref();
         let cookies = headers.map(|headers| get_cookies_from_headers(headers, &url));
         let status = &response.response.status;
+        let mime_type = headers
+            .and_then(|headers| headers.get(CONTENT_TYPE))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let transferred_size = headers
+            .and_then(|headers| headers.typed_get::<ContentLength>())
+            .map(|length| length.0);
 
         Some(ResponseFields {
             cache_details: response.cache_details.clone(),
@@ -623,8 +695,11 @@ impl NetworkEventActor {
             response_cookies_available: cookies.is_some(),
             response_headers_available: headers.is_some(),
             response_start_available: true,
-            status: status.code().to_string(),
+            status: status.raw_code().to_string(),
             status_text: String::from_utf8_lossy(status.message()).to_string(),
+            mime_type,
+            content_size: response.response.body.as_ref().map_or(0, |body| body.len()),
+            transferred_size,
         })
     }
 
@@ -654,6 +729,25 @@ impl NetworkEventActor {
             inner_window_id: 0,
         }
     }
+}
+
+/// Whether a body of this MIME type reads as text.
+fn is_text_mime(mime: &str) -> bool {
+    let essence = mime.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    essence.starts_with("text/") ||
+        essence.ends_with("+json") ||
+        essence.ends_with("+xml") ||
+        [
+            "application/json",
+            "application/javascript",
+            "application/ecmascript",
+            "application/x-javascript",
+            "application/xml",
+            "application/x-www-form-urlencoded",
+            "application/manifest+json",
+            "image/svg+xml",
+        ]
+        .contains(&essence.as_str())
 }
 
 fn get_cookies_from_headers(headers: &HeaderMap, url: &ServoUrl) -> Vec<CookieWrapper> {

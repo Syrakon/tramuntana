@@ -61,6 +61,7 @@ use crate::network_handler::handle_network_event;
 use crate::protocol::{DevtoolsConnection, JsonPacketStream};
 
 mod actor;
+mod certificate;
 /// <https://searchfox.org/mozilla-central/source/devtools/server/actors>
 mod actors {
     pub mod blackboxing;
