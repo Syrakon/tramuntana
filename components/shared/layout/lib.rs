@@ -14,6 +14,7 @@ mod layout_damage;
 mod layout_dom;
 mod layout_element;
 mod layout_node;
+pub mod phase_log;
 mod pseudo_element_chain;
 
 use std::any::Any;

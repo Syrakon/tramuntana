@@ -59,6 +59,7 @@ use js::jsapi::{GCReason, JSContext as UnsafeJSContext};
 use js::jsval::UndefinedValue;
 use js::rust::ParentRuntime;
 use js::rust::wrappers2::{JS_AddInterruptCallback, JS_GC, SetWindowProxyClass};
+use layout_api::phase_log::{self, PhaseLog};
 use layout_api::{LayoutConfig, LayoutFactory, RestyleReason, ScriptThreadFactory};
 use media::WindowGLContext;
 use metrics::MAX_TASK_NS;
@@ -1123,6 +1124,7 @@ impl ScriptThread {
         // steps per doc in docs. Currently `<iframe>` resizing depends on a parent being able to
         // queue resize events on a child and have those run in the same call to this method, so
         // that needs to be sorted out to fix this.
+        let phase_log = PhaseLog::begin();
         let mut painters_generating_frames = FxHashSet::default();
         for pipeline_id in documents_in_order.iter() {
             let Some(document) = self.documents.borrow().find_document(*pipeline_id) else {
@@ -1167,6 +1169,7 @@ impl ScriptThread {
             // TODO: Should this be broken and to match the specification more closely? For instance see
             // https://html.spec.whatwg.org/multipage/#flush-autofocus-candidates.
             self.process_pending_input_events(cx, *pipeline_id);
+            phase_log::mark("input");
 
             // > 8. For each doc of docs, run the resize steps for doc. [CSSOMVIEW]
             let resized = document.window().run_the_resize_steps(cx);
@@ -1191,6 +1194,7 @@ impl ScriptThread {
                 // As per the spec, this can be run at any time.
                 document.react_to_environment_changes(cx);
             }
+            phase_log::mark("resize_scroll_media");
 
             let mut realm = enter_auto_realm(cx, &*document);
             let cx = &mut realm.current_realm();
@@ -1201,6 +1205,7 @@ impl ScriptThread {
                 // > in relative high resolution time given frameTimestamp and doc's relevant
                 // > global object as the timestamp [WEBANIMATIONS]
                 document.update_animations_and_send_events(cx);
+                phase_log::mark("animations");
 
                 // TODO(#31866): Implement "run the fullscreen steps" from
                 // https://fullscreen.spec.whatwg.org/multipage/#run-the-fullscreen-steps.
@@ -1212,6 +1217,7 @@ impl ScriptThread {
                 // > in the relative high resolution time given frameTimestamp and doc's
                 // > relevant global object as the timestamp.
                 document.run_the_animation_frame_callbacks(cx);
+                phase_log::mark("animation_frames");
             }
 
             // Run the resize observer steps.
@@ -1220,6 +1226,7 @@ impl ScriptThread {
                 // Note: this will reflow the doc.
                 depth = document.broadcast_active_resize_observations(cx);
             }
+            phase_log::mark("resize_observers");
 
             if document.has_skipped_resize_observations() {
                 document.deliver_resize_loop_error_notification(cx);
@@ -1244,6 +1251,7 @@ impl ScriptThread {
             // > doc's relevant global object as the timestamp. [INTERSECTIONOBSERVER]
             // TODO(stevennovaryo): The time attribute should be relative to the time origin of the global object
             document.update_intersection_observer_steps(cx, CrossProcessInstant::now());
+            phase_log::mark("focus_intersection");
 
             // See <https://github.com/whatwg/html/issues/12704>.
             // Unspecified, but necessary: Any of the previous callbacks may have put the
@@ -1261,6 +1269,7 @@ impl ScriptThread {
             if document.update_the_rendering(cx).0.needs_frame() {
                 painters_generating_frames.insert(document.webview_id().into());
             }
+            phase_log::mark("render");
 
             // TODO: Process top layer removals according to
             // https://drafts.csswg.org/css-position-4/#process-top-layer-removals.
@@ -1274,7 +1283,12 @@ impl ScriptThread {
 
         // Perform a microtask checkpoint as the specifications says that *update the rendering*
         // should be run in a task and a microtask checkpoint is always done when running tasks.
+        phase_log::mark("generate_frame");
         self.perform_a_microtask_checkpoint(cx);
+        phase_log::mark("microtasks");
+        if let Some(phase_log) = phase_log {
+            phase_log.finish(|| format!("update_the_rendering documents={}", documents_in_order.len()));
+        }
         should_generate_frame
     }
 
@@ -1431,6 +1445,7 @@ impl ScriptThread {
             debug!("Processing event {:?}.", msg);
             let category = self.categorize_msg(&msg);
             let pipeline_id = msg.pipeline_id();
+            let phase_log = PhaseLog::begin();
             // Define a macro to be able to handle the `cx` whether the global exists or not.
             // That's because we need to enter the realm and take the `cx` from it. We cannot
             // use a `match`-statement, since the `realm` would be dropped and the `cx` would
@@ -1493,10 +1508,12 @@ impl ScriptThread {
                     if exiting {
                         return false;
                     }
+                    phase_log::mark("task");
 
                     // https://html.spec.whatwg.org/multipage/#event-loop-processing-model step 6
                     // TODO(#32003): A microtask checkpoint is only supposed to be performed after running a task.
                     self.perform_a_microtask_checkpoint($cx);
+                    phase_log::mark("microtasks");
                 )
             );
 
@@ -1511,13 +1528,20 @@ impl ScriptThread {
                     handle_message!(cx);
                 },
             };
+            if let Some(phase_log) = phase_log {
+                phase_log.finish(|| format!("task {category:?}"));
+            }
         }
 
+        let phase_log = PhaseLog::begin();
         for (_, doc) in self.documents.borrow().iter() {
             let window = doc.window();
             window
                 .upcast::<GlobalScope>()
                 .perform_a_dom_garbage_collection_checkpoint();
+        }
+        if let Some(phase_log) = phase_log {
+            phase_log.finish(|| "dom_gc_checkpoint".to_owned());
         }
 
         let built_any_display_lists =

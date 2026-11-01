@@ -26,8 +26,10 @@ use layout_api::{
     LayoutConfig, LayoutDamage, LayoutElement, LayoutFactory, LayoutNode, NodeRenderingType,
     OffsetParentResponse, PhysicalSides, QueryMsg, ReflowGoal, ReflowPhasesRun, ReflowRequest,
     ReflowRequestAccessibility, ReflowRequestRestyle, ReflowResult, ReflowStatistics,
-    ScrollContainerQueryFlags, ScrollContainerResponse, TrustedNodeAddress, with_layout_state,
+    ScrollContainerQueryFlags, ScrollContainerResponse, TrustedNodeAddress, phase_log,
+    with_layout_state,
 };
+use layout_api::phase_log::PhaseLog;
 use log::{debug, warn};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf, MallocSizeOfOps};
 use net_traits::image_cache::ImageCache;
@@ -1113,6 +1115,13 @@ impl LayoutThread {
                 });
         }
 
+        let phase_log = PhaseLog::begin();
+        let restyle_reason = reflow_request.restyle.as_ref().map(|restyle| restyle.reason);
+        let pending_restyle_count = reflow_request
+            .restyle
+            .as_ref()
+            .map_or(0, |restyle| restyle.pending_restyles.len());
+
         let document = unsafe { ServoLayoutNode::new(&reflow_request.document) };
         let document = unsafe { document.dangerous_style_node() }
             .as_document()
@@ -1149,13 +1158,16 @@ impl LayoutThread {
                 &image_resolver,
                 accessibility_damage.as_mut(),
             );
+        phase_log::mark("restyle_end");
 
         if self.build_stacking_context_tree_for_reflow(&reflow_request) {
             reflow_phases_run.insert(ReflowPhasesRun::BuiltStackingContextTree);
         }
+        phase_log::mark("stacking");
         if self.build_display_list(&reflow_request, &image_resolver, &mut reflow_statistics) {
             reflow_phases_run.insert(ReflowPhasesRun::BuiltDisplayList);
         }
+        phase_log::mark("display_list");
         if self.handle_update_scroll_node_request(&reflow_request) {
             reflow_phases_run.insert(ReflowPhasesRun::UpdatedScrollNodeOffset);
         }
@@ -1168,6 +1180,20 @@ impl LayoutThread {
             &mut reflow_statistics,
         ) {
             reflow_phases_run.insert(ReflowPhasesRun::UpdatedAccessibilityTree);
+        }
+        phase_log::mark("accessibility");
+        if let Some(phase_log) = phase_log {
+            phase_log.finish(|| {
+                format!(
+                    "reflow goal={:?} reason={:?} pending_restyles={pending_restyle_count} \
+                     ran={:?} fragments_rebuilt={} fragments_restyled={}",
+                    reflow_request.reflow_goal,
+                    restyle_reason,
+                    reflow_phases_run,
+                    reflow_statistics.rebuilt_fragment_count,
+                    reflow_statistics.restyle_fragment_count,
+                )
+            });
         }
 
         if self.debug.is_enabled(DiagnosticsLoggingOption::FlowTree) &&
@@ -1325,6 +1351,7 @@ impl LayoutThread {
         stylist_update
             .invalidation_set
             .process_style(dangerous_root_element, Some(&snapshot_map));
+        phase_log::mark("stylist");
 
         if self.previously_highlighted_dom_node.get() != reflow_request.highlighted_dom_node {
             // Need to manually force layout to build a new display list regardless of whether the box tree
@@ -1386,6 +1413,7 @@ impl LayoutThread {
 
             dirty_root = driver::traverse_dom(&recalc_style_traversal, token, rayon_pool).as_node();
         }
+        phase_log::mark("style");
 
         let root_node = root_element.as_node();
         let damage_from_environment = if device_has_changed {
@@ -1442,6 +1470,8 @@ impl LayoutThread {
             }
         };
 
+        phase_log::mark("box_tree");
+
         let damage = if counter_values_changed {
             damage | LayoutDamage::Relayout
         } else {
@@ -1490,10 +1520,11 @@ impl LayoutThread {
                 insert_accessibility_damage_if_necessary(layout_root.node());
             }
 
-            if layout_roots
+            let laid_out_roots = layout_roots
                 .iter()
-                .all(|layout_root| layout_root.try_layout(&layout_context))
-            {
+                .all(|layout_root| layout_root.try_layout(&layout_context));
+            phase_log::mark("layout_roots");
+            if laid_out_roots {
                 return (
                     ReflowPhasesRun::RanLayout,
                     std::mem::take(&mut *layout_context.iframe_sizes.lock()),
@@ -1527,6 +1558,7 @@ impl LayoutThread {
         });
 
         *self.fragment_tree.borrow_mut() = Some(fragment_tree);
+        phase_log::mark("layout");
 
         if self.debug.is_enabled(DiagnosticsLoggingOption::StyleTree) {
             println!(
