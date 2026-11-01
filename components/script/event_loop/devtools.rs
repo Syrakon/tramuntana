@@ -46,7 +46,7 @@ use crate::dom::element::Element;
 use crate::dom::iterators::ShadowIncluding;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::types::{
-    CSSGroupingRule, CSSLayerBlockRule, EventTarget, HTMLElement, TrustedHTML,
+    CSSGroupingRule, CSSLayerBlockRule, EventTarget, HTMLElement, Text, TrustedHTML,
 };
 use crate::event_loop::document_collection::DocumentCollection;
 use crate::realms::enter_auto_realm;
@@ -779,6 +779,46 @@ pub(crate) fn handle_modify_attribute(
             },
             None => elem.RemoveAttribute(cx, DOMString::from(&*name)),
         }
+    }
+}
+
+/// Replace the text of a node. An element whose only child is a text node
+/// keeps that child and changes its data, so the node the inspector already
+/// knows stays the same; any other element has its children replaced by the
+/// text, as `textContent` does. A `<style>` applies the new text at once.
+pub(crate) fn handle_set_node_value(
+    cx: &mut JSContext,
+    state: &DevtoolsState,
+    documents: &DocumentCollection,
+    pipeline: PipelineId,
+    node_id: &str,
+    value: String,
+) {
+    let Some(document) = documents.find_document(pipeline) else {
+        return warn!("document for pipeline id {} is not found", pipeline);
+    };
+    let mut realm = enter_auto_realm(cx, document.window());
+    let cx = &mut realm.current_realm();
+
+    let Some(node) = state.find_node_by_unique_id(pipeline, node_id) else {
+        return warn!(
+            "node id {} for pipeline id {} is not found",
+            node_id, pipeline
+        );
+    };
+
+    let value = Some(DOMString::from(value));
+    let result = if node.is::<Element>() {
+        let mut children = node.children();
+        match (children.next(), children.next()) {
+            (Some(only), None) if only.is::<Text>() => only.SetNodeValue(cx, value),
+            _ => node.SetTextContent(cx, value),
+        }
+    } else {
+        node.SetNodeValue(cx, value)
+    };
+    if let Err(error) = result {
+        warn!("devtools could not set the value of node {}: {:?}", node_id, error);
     }
 }
 

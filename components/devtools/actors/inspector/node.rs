@@ -147,6 +147,9 @@ impl Actor for NodeActor {
     /// - `modifyAttributes`: Asks the script to change a value in the attribute of the
     ///   corresponding node
     ///
+    /// - `setNodeValue`: Asks the script to replace the text of the node; on an
+    ///   element, the text inside it, which is how a `<style>` is edited
+    ///
     /// - `getUniqueSelector`: Returns the display name of this node
     fn handle_message(
         &self,
@@ -184,6 +187,24 @@ impl Actor for NodeActor {
                     ))
                     .map_err(|_| ActorError::Internal)?;
 
+                let reply = EmptyReplyMsg {
+                    from: self.name().into(),
+                };
+                request.reply_final(&reply)?
+            },
+            "setNodeValue" => {
+                let value = msg
+                    .get("value")
+                    .ok_or(ActorError::MissingParameter)?
+                    .as_str()
+                    .ok_or(ActorError::BadParameterType)?;
+                script_chan
+                    .send(DevtoolScriptControlMsg::SetNodeValue(
+                        pipeline_id,
+                        registry.actor_to_script(self.name().into()),
+                        value.to_owned(),
+                    ))
+                    .map_err(|_| ActorError::Internal)?;
                 let reply = EmptyReplyMsg {
                     from: self.name().into(),
                 };

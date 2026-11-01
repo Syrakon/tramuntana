@@ -444,6 +444,9 @@ pub enum DevtoolScriptControlMsg {
     ),
     /// Update a given node's attributes with a list of modifications.
     ModifyAttribute(PipelineId, String, Vec<AttrModification>),
+    /// Replace the text of a node: the data of a text or comment node, or the
+    /// text inside an element such as a `<style>`.
+    SetNodeValue(PipelineId, String, String),
     /// Update a given node's style rules with a list of modifications: the
     /// stylesheet rule given, or the node's style attribute when `None`.
     ModifyRule(PipelineId, String, Option<MatchedRule>, Vec<RuleModification>),

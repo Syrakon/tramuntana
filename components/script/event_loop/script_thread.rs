@@ -2197,6 +2197,16 @@ impl ScriptThread {
                     modifications,
                 )
             },
+            DevtoolScriptControlMsg::SetNodeValue(id, node_id, value) => {
+                devtools::handle_set_node_value(
+                    cx,
+                    &self.devtools_state,
+                    &documents,
+                    id,
+                    &node_id,
+                    value,
+                )
+            },
             DevtoolScriptControlMsg::ModifyRule(id, node_id, matched_rule, modifications) => {
                 devtools::handle_modify_rule(
                     cx,
