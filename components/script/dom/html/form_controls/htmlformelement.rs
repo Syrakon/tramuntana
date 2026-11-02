@@ -63,6 +63,7 @@ use crate::dom::formdataevent::FormDataEvent;
 use crate::dom::html::form_controls::htmlinputelement::HTMLInputElement;
 use crate::dom::html::form_controls::input_type::InputType;
 use crate::dom::html::htmlbuttonelement::HTMLButtonElement;
+use crate::dom::html::interactive::htmldialogelement::HTMLDialogElement;
 use crate::dom::html::htmlcollection::CollectionFilter;
 use crate::dom::html::htmldatalistelement::HTMLDataListElement;
 use crate::dom::html::htmlelement::HTMLElement;
@@ -817,7 +818,28 @@ impl HTMLFormElement {
         // Step 10. Let method be the submitter element's method.
         let method = submitter.method();
         // Step 11. If method is dialog, then:
-        // TODO
+        if matches!(method, FormMethod::Dialog) {
+            // Step 11.1. If form does not have an ancestor dialog element, return.
+            // Step 11.2. Let subject be form's nearest ancestor dialog element.
+            let Some(subject) = self
+                .upcast::<Node>()
+                .ancestors()
+                .find_map(DomRoot::downcast::<HTMLDialogElement>)
+            else {
+                return;
+            };
+            // Step 11.3. Let result be null.
+            // Step 11.4. If submitter is an input element whose type attribute is in
+            // the Image Button state, then set result to the selected coordinate.
+            // Servo does not keep the selected coordinate of an image button, so
+            // such a submitter gives its value, as the next step does.
+            // Step 11.5. Otherwise, if submitter has a value, then set result to that value.
+            let result = submitter.value();
+            // Step 11.6. Close the dialog subject with result and null.
+            subject.close_the_dialog(cx, result, None);
+            // Step 11.7. Return.
+            return;
+        }
 
         // Step 12. Let action be the submitter element's action.
         let mut action = submitter.action();
@@ -900,10 +922,8 @@ impl HTMLFormElement {
         // Then, select the appropriate cell on that row based on method as given in the first cell of each column.
         // Then, jump to the steps named in that cell and defined below the table.
         match (&*scheme, method) {
-            (_, FormMethod::Dialog) => {
-                // TODO: Submit dialog
-                // https://html.spec.whatwg.org/multipage/#submit-dialog
-            },
+            // Step 11 has closed the dialog and returned.
+            (_, FormMethod::Dialog) => {},
             // https://html.spec.whatwg.org/multipage/#submit-mutate-action
             ("http", FormMethod::Get) | ("https", FormMethod::Get) | ("data", FormMethod::Get) => {
                 load_data
@@ -1679,6 +1699,17 @@ impl FormSubmitterElement<'_> {
                     |f| f.NoValidate(),
                 ),
         }
+    }
+
+    /// The value of a submit button, which `method="dialog"` gives as the
+    /// dialog's return value. A form submitting itself has none.
+    fn value(&self) -> Option<DOMString> {
+        let element = match *self {
+            FormSubmitterElement::Form(_) => return None,
+            FormSubmitterElement::Input(input_element) => input_element.to_element(),
+            FormSubmitterElement::Button(button_element) => button_element.to_element(),
+        };
+        element.get_nullable_string_attribute(&local_name!("value"))
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-submit-button>
