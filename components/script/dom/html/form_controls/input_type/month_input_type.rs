@@ -1,6 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+use embedder_traits::DatePickerKind;
 use std::cmp::Ordering;
 
 use js::context::JSContext;
@@ -84,6 +85,10 @@ impl SpecificInputType for MonthInputType {
     /// <https://html.spec.whatwg.org/multipage/#month-state-(type=month):suffering-from-bad-input>
     fn suffers_from_bad_input(&self, value: &DOMString) -> bool {
         !value.str().is_valid_month_string()
+    }
+
+    fn show_the_picker_if_applicable(&self, input: &HTMLInputElement) {
+        input.show_date_picker(DatePickerKind::Month);
     }
 
     fn update_shadow_tree(&self, cx: &mut JSContext, input: &HTMLInputElement) {

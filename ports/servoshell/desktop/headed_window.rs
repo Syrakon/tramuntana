@@ -1091,6 +1091,11 @@ impl PlatformWindow for HeadedWindow {
             EmbedderControl::FilePicker(file_picker) => {
                 self.add_dialog(webview_id, Dialog::new_file_dialog(file_picker));
             },
+            EmbedderControl::DatePicker(date_picker) => {
+                // servoshell has no calendar. Dropping the picker dismisses it, and the
+                // value can still be typed into the field.
+                drop(date_picker);
+            },
             EmbedderControl::SimpleDialog(simple_dialog) => {
                 self.add_dialog(webview_id, Dialog::new_simple_dialog(simple_dialog));
             },

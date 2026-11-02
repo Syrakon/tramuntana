@@ -48,6 +48,7 @@ use crate::navigation::navigate;
 pub(crate) enum ControlElement {
     Select(Dom<HTMLSelectElement>),
     ColorInput(Dom<HTMLInputElement>),
+    DateInput(Dom<HTMLInputElement>),
     FileInput(Dom<HTMLInputElement>),
     Ime(Dom<HTMLElement>),
     ContextMenu(ContextMenuNodes),
@@ -58,6 +59,7 @@ impl ControlElement {
         match self {
             ControlElement::Select(element) => element.upcast::<Node>(),
             ControlElement::ColorInput(element) => element.upcast::<Node>(),
+            ControlElement::DateInput(element) => element.upcast::<Node>(),
             ControlElement::FileInput(element) => element.upcast::<Node>(),
             ControlElement::Ime(element) => element.upcast::<Node>(),
             ControlElement::ContextMenu(context_menu_nodes) => &context_menu_nodes.node,
@@ -145,6 +147,7 @@ impl DocumentEmbedderControls {
         match request {
             EmbedderControlRequest::SelectElement(..) |
             EmbedderControlRequest::ColorPicker(..) |
+            EmbedderControlRequest::DatePicker(..) |
             EmbedderControlRequest::InputMethod(..) |
             EmbedderControlRequest::ContextMenu(..) => self
                 .window
@@ -228,6 +231,12 @@ impl DocumentEmbedderControls {
                 EmbedderControlResponse::ColorPicker(response),
             ) => {
                 input_element.handle_color_picker_response(cx, response);
+            },
+            (
+                ControlElement::DateInput(input_element),
+                EmbedderControlResponse::DatePicker(response),
+            ) => {
+                input_element.handle_date_picker_response(cx, response);
             },
             (
                 ControlElement::FileInput(input_element),

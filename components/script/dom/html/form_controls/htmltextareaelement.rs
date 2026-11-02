@@ -56,6 +56,10 @@ pub(crate) struct HTMLTextAreaElement {
     placeholder: RefCell<DOMString>,
     // https://html.spec.whatwg.org/multipage/#concept-textarea-dirty
     value_dirty: Cell<bool>,
+    /// Whether the user changed the value since the last time a `change` event was fired
+    /// for it. A `<textarea>` commits its value, and fires `change`, when it loses focus.
+    /// <https://html.spec.whatwg.org/multipage/#the-textarea-element:event-change>
+    uncommitted_user_change: Cell<bool>,
     form_owner: MutNullableDom<HTMLFormElement>,
     labels_node_list: MutNullableDom<NodeList>,
     validity_state: MutNullableDom<ValidityState>,
@@ -124,6 +128,7 @@ impl HTMLTextAreaElement {
                 },
             )),
             value_dirty: Cell::new(false),
+            uncommitted_user_change: Cell::new(false),
             form_owner: Default::default(),
             labels_node_list: Default::default(),
             validity_state: Default::default(),
@@ -165,6 +170,13 @@ impl HTMLTextAreaElement {
         let event_type = event.upcast::<Event>().type_();
         let document = self.owner_document();
         if *event_type == *"blur" {
+            // > When the textarea element loses focus after its value was changed by the
+            // > user, the user agent must queue an element task on the user interaction
+            // > task source given the textarea element to fire an event named change at
+            // > the textarea element, with the bubbles attribute initialized to true.
+            if self.uncommitted_user_change.replace(false) {
+                self.queue_change_event();
+            }
             document
                 .embedder_controls()
                 .hide_embedder_control(self.upcast());
@@ -336,6 +348,7 @@ impl TextControlElement for HTMLTextAreaElement {
             KeyReaction::DispatchInput(text, is_composing, input_type) => {
                 self.queue_input_event(text, is_composing, input_type);
                 self.value_dirty.set(true);
+                self.uncommitted_user_change.set(true);
                 self.handle_text_content_changed(cx);
             },
             KeyReaction::RedrawSelection => {

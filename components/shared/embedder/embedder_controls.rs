@@ -39,6 +39,9 @@ pub enum EmbedderControlRequest {
     ColorPicker(RgbColor),
     /// Indicates that the user has activated a `<input type=file>` element.
     FilePicker(FilePickerRequest),
+    /// Indicates that the user has activated a `<input type=date>`, `<input type=month>`,
+    /// `<input type=datetime-local>` or `<input type=time>` element.
+    DatePicker(DatePickerRequest),
     /// Indicates that the the user has activated a text or input control that should show
     /// an IME.
     InputMethod(InputMethodRequest),
@@ -160,6 +163,44 @@ pub struct FilePickerRequest {
     pub accept_current_paths_for_testing: bool,
 }
 
+/// The kind of value a [`DatePickerRequest`] asks the user to pick. Each kind uses the
+/// value format of its `<input>` type.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub enum DatePickerKind {
+    /// `<input type=date>`: a [date string](https://html.spec.whatwg.org/multipage/#valid-date-string),
+    /// such as `2026-11-02`.
+    Date,
+    /// `<input type=month>`: a [month string](https://html.spec.whatwg.org/multipage/#valid-month-string),
+    /// such as `2026-11`.
+    Month,
+    /// `<input type=datetime-local>`: a
+    /// [normalized local date and time string](https://html.spec.whatwg.org/multipage/#valid-normalised-local-date-and-time-string),
+    /// such as `2026-11-02T14:30`.
+    DatetimeLocal,
+    /// `<input type=time>`: a [time string](https://html.spec.whatwg.org/multipage/#valid-time-string),
+    /// such as `14:30` or `14:30:15`. The picker shows no calendar, only a clock.
+    Time,
+}
+
+/// Request to the embedder to display a calendar for a date-like `<input>` element.
+/// All the strings use the value format of [`DatePickerRequest::kind`]; any of them
+/// may be empty when the element has no valid value for it.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DatePickerRequest {
+    pub kind: DatePickerKind,
+    /// The current value of the element.
+    pub value: String,
+    /// The value of the `min` attribute, if it is valid.
+    pub min: Option<String>,
+    /// The value of the `max` attribute, if it is valid.
+    pub max: Option<String>,
+    /// For the kinds that hold a time, the
+    /// [allowed value step](https://html.spec.whatwg.org/multipage/#concept-input-step) in
+    /// seconds, or `None` when the element allows any step (`step=any`). A step that is not
+    /// a whole number of minutes means the picker should offer seconds.
+    pub step: Option<f64>,
+}
+
 /// Request to the embedder to display a control for a `<select>` element.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SelectElementRequest {
@@ -174,6 +215,9 @@ pub enum EmbedderControlResponse {
     SelectElement(Vec<usize>),
     ColorPicker(Option<RgbColor>),
     FilePicker(Option<Vec<SelectedFile>>),
+    /// The value the user picked, in the format of the request's [`DatePickerKind`], or
+    /// `None` if the picker was dismissed.
+    DatePicker(Option<String>),
     ContextMenu(Option<ContextMenuAction>),
 }
 

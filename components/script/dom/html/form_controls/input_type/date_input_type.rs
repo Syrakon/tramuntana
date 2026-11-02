@@ -2,14 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use embedder_traits::DatePickerKind;
 use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
 use time::OffsetDateTime;
 
 use crate::dom::bindings::str::{DOMString, FromInputValueString, ToInputValueString};
 use crate::dom::html::form_controls::htmlinputelement::HTMLInputElement;
-use crate::dom::html::form_controls::input_type::SpecificInputType;
+use crate::dom::event::Event;
+use crate::dom::eventtarget::EventTarget;
 use crate::dom::html::form_controls::input_type::text_input_widget::TextInputWidget;
+use crate::dom::html::form_controls::input_type::{SpecificInputActivationType, SpecificInputType};
 
 #[derive(Default, JSTraceable, MallocSizeOf, PartialEq)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
@@ -67,6 +70,10 @@ impl SpecificInputType for DateInputType {
         !value.str().is_valid_date_string()
     }
 
+    fn show_the_picker_if_applicable(&self, input: &HTMLInputElement) {
+        input.show_date_picker(DatePickerKind::Date);
+    }
+
     fn update_shadow_tree(&self, cx: &mut JSContext, input: &HTMLInputElement) {
         self.text_input_widget
             .borrow()
@@ -77,5 +84,25 @@ impl SpecificInputType for DateInputType {
         self.text_input_widget
             .borrow()
             .update_placeholder_contents(cx, input)
+    }
+}
+
+/// The input activation behavior of the input types that pick a value from a calendar or
+/// a clock: `date`, `month`, `datetime-local` and `time`. Their pickers are drawn by the
+/// embedder.
+#[derive(Clone, Copy)]
+pub(crate) struct DatePickerInputActivation;
+
+impl SpecificInputActivationType for DatePickerInputActivation {
+    /// <https://html.spec.whatwg.org/multipage/#date-state-(type=date)>
+    /// > User agents may have an input activation behavior that shows the picker.
+    fn activation_behavior(
+        &self,
+        _cx: &mut JSContext,
+        input: &HTMLInputElement,
+        _event: &Event,
+        _target: &EventTarget,
+    ) {
+        input.show_the_picker_if_applicable();
     }
 }

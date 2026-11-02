@@ -6,7 +6,10 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::{f64, ptr};
 
 use dom_struct::dom_struct;
-use embedder_traits::{EmbedderControlRequest, InputMethodRequest, RgbColor, SelectedFile};
+use embedder_traits::{
+    DatePickerKind, DatePickerRequest, EmbedderControlRequest, InputMethodRequest, RgbColor,
+    SelectedFile,
+};
 use encoding_rs::Encoding;
 use html5ever::{LocalName, Prefix, local_name};
 use js::context::{JSContext, NoGC};
@@ -126,6 +129,11 @@ pub(crate) struct HTMLInputElement {
     pending_webdriver_response: RefCell<Option<PendingWebDriverResponse>>,
     /// <https://html.spec.whatwg.org/multipage/#concept-input-value-dirty-flag>
     value_dirty: Cell<bool>,
+    /// Whether the user changed the value since the last time a `change` event was fired
+    /// for it. Text controls fire `change` when the user commits the value: on blur, or
+    /// when Enter is pressed in a single-line control.
+    /// <https://html.spec.whatwg.org/multipage/#concept-input-apply:event-change>
+    uncommitted_user_change: Cell<bool>,
 
     /// <https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event>
     has_scheduled_selectionchange_event: Cell<bool>,
@@ -181,6 +189,7 @@ impl HTMLInputElement {
                 },
             )),
             value_dirty: Cell::new(false),
+            uncommitted_user_change: Cell::new(false),
             form_owner: Default::default(),
             labels_node_list: MutNullableDom::new(None),
             validity_state: Default::default(),
@@ -835,7 +844,14 @@ impl HTMLInputElement {
 
     fn may_have_embedder_control(&self) -> bool {
         let el = self.upcast::<Element>();
-        matches!(*self.input_type(), InputType::Color(_)) && !el.disabled_state()
+        matches!(
+            *self.input_type(),
+            InputType::Color(_) |
+                InputType::Date(_) |
+                InputType::Month(_) |
+                InputType::DatetimeLocal(_) |
+                InputType::Time(_)
+        ) && !el.disabled_state()
     }
 
     /// Return a string that represents the contents of the element in its displayed shadow DOM.
@@ -1057,11 +1073,15 @@ impl TextControlElement for HTMLInputElement {
     fn handle_key_reaction(&self, cx: &mut JSContext, action: KeyReaction) {
         match action {
             KeyReaction::TriggerDefaultAction => {
+                // Enter commits the value of a single-line text control before the form is
+                // implicitly submitted, so `change` listeners see it first.
+                self.commit_user_change();
                 self.implicit_submission(cx);
             },
             KeyReaction::DispatchInput(text, is_composing, input_type) => {
                 self.queue_input_event(text, is_composing, input_type);
                 self.value_dirty.set(true);
+                self.uncommitted_user_change.set(true);
                 self.update_placeholder_shown_state();
                 self.upcast::<Node>().dirty(cx.no_gc(), NodeDamage::Other);
             },
@@ -2055,6 +2075,71 @@ impl HTMLInputElement {
         }
     }
 
+    /// Ask the embedder to show a calendar for this `date`, `month` or `datetime-local`
+    /// input, or a clock for this `time` input. `kind` gives the format of the value it
+    /// picks.
+    pub(crate) fn show_date_picker(&self, kind: DatePickerKind) {
+        let element = self.upcast::<Element>();
+        // Only pass bounds that are valid for this type, normalized like a value would be.
+        let bound = |name: &LocalName| {
+            let mut bound = element.get_string_attribute(name);
+            self.sanitize_value(&mut bound);
+            (!bound.is_empty()).then(|| String::from(bound))
+        };
+        let request = DatePickerRequest {
+            kind,
+            value: String::from(self.Value()),
+            min: bound(&local_name!("min")),
+            max: bound(&local_name!("max")),
+            // The step of a time is kept in milliseconds; the embedder gets seconds.
+            step: match kind {
+                DatePickerKind::Time | DatePickerKind::DatetimeLocal => {
+                    self.allowed_value_step().map(|step| step / 1000.0)
+                },
+                DatePickerKind::Date | DatePickerKind::Month => None,
+            },
+        };
+        self.owner_document().embedder_controls().show_embedder_control(
+            ControlElement::DateInput(Dom::from_ref(self)),
+            EmbedderControlRequest::DatePicker(request),
+            None,
+        );
+    }
+
+    /// Give this input the value the user picked in its calendar, as if the user had
+    /// typed it and committed it.
+    pub(crate) fn handle_date_picker_response(
+        &self,
+        cx: &mut JSContext,
+        response: Option<String>,
+    ) {
+        let Some(picked) = response else {
+            return;
+        };
+        if !matches!(
+            *self.input_type(),
+            InputType::Date(_) |
+                InputType::Month(_) |
+                InputType::DatetimeLocal(_) |
+                InputType::Time(_)
+        ) {
+            return;
+        }
+        let mut picked = DOMString::from(picked);
+        self.sanitize_value(&mut picked);
+        if picked.is_empty() || picked == self.Value() {
+            return;
+        }
+        if self.SetValue(cx, picked).is_err() {
+            return;
+        }
+        // Picking a value is a committed user change: `input`, then `change`. Any edit typed
+        // before it is committed by this same `change`.
+        self.uncommitted_user_change.set(false);
+        self.value_changed(cx);
+        self.fire_value_change_events(cx, ValueChangeEvents::Input | ValueChangeEvents::Change);
+    }
+
     pub(crate) fn handle_file_picker_response(
         &self,
         cx: &mut JSContext,
@@ -2065,10 +2150,28 @@ impl HTMLInputElement {
         }
     }
 
+    /// Fire `change` if the user edited the value of this text control since the last
+    /// commit.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/#concept-input-apply:event-change>
+    /// > For input elements without a defined input activation behavior, but to which these
+    /// > events apply, and for which the user interface involves both interactive
+    /// > manipulation and an explicit commit action, then when the user commits a change to
+    /// > the element's value, the user agent must queue an element task on the user
+    /// > interaction task source given the input element to fire an event named change at
+    /// > the input element, with the bubbles attribute initialized to true.
+    fn commit_user_change(&self) {
+        if self.uncommitted_user_change.replace(false) {
+            self.queue_change_event();
+        }
+    }
+
     fn handle_focus_event(&self, cx: &mut JSContext, event: &FocusEvent) {
         let event_type = event.upcast::<Event>().type_();
         let document = self.owner_document();
         if *event_type == *"blur" {
+            // Losing focus commits what the user typed.
+            self.commit_user_change();
             document
                 .embedder_controls()
                 .hide_embedder_control(self.upcast());

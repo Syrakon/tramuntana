@@ -44,7 +44,7 @@ use crate::responders::AutomaticResponder;
 use crate::servo::PendingHandledInputEvent;
 use crate::webview_delegate::{CreateNewWebViewRequest, DefaultWebViewDelegate, WebViewDelegate};
 use crate::{
-    ColorPicker, ContextMenu, EmbedderControl, InputMethodControl, SelectElement, Servo,
+    ColorPicker, ContextMenu, DatePicker, EmbedderControl, InputMethodControl, SelectElement, Servo,
     UserContentManager, ViewportScrollExtent, WebRenderDebugOption,
 };
 
@@ -849,6 +849,20 @@ impl WebView {
                 EmbedderControl::ColorPicker(ColorPicker {
                     id: control_id,
                     current_color: Some(current_color),
+                    position,
+                    constellation_proxy,
+                    response_sent: false,
+                })
+            },
+            EmbedderControlRequest::DatePicker(request) => {
+                EmbedderControl::DatePicker(DatePicker {
+                    id: control_id,
+                    kind: request.kind,
+                    value: request.value,
+                    min: request.min,
+                    max: request.max,
+                    step: request.step,
+                    selected: None,
                     position,
                     constellation_proxy,
                     response_sent: false,

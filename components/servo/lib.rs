@@ -119,7 +119,8 @@ pub use crate::user_content_manager::UserContentManager;
 pub use crate::webview::{WebView, WebViewBuilder};
 pub use crate::webview_delegate::{
     AlertDialog, AllowOrDenyRequest, AuthenticationRequest, BluetoothDeviceSelectionRequest,
-    ColorPicker, ConfirmDialog, ContextMenu, CreateNewWebViewRequest, EmbedderControl, FilePicker,
+    ColorPicker, ConfirmDialog, ContextMenu, CreateNewWebViewRequest, DatePicker, EmbedderControl,
+    FilePicker,
     InputMethodControl, NavigationRequest, PasskeyRequest, PermissionRequest, PromptDialog,
     SelectElement, SimpleDialog, WebResourceLoad, WebViewDelegate,
 };

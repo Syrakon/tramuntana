@@ -8,7 +8,7 @@ use std::rc::Rc;
 use embedder_traits::{
     AlertResponse, AllowOrDeny, AuthenticationResponse, BluetoothDeviceDescription,
     ConfirmResponse, ConsoleLogLevel, ContextMenuAction, ContextMenuElementInformation,
-    ContextMenuItem, Cursor, EmbedderControlId, EmbedderControlResponse, FilePickerRequest,
+    ContextMenuItem, Cursor, EmbedderControlId, EmbedderControlResponse, FilePickerRequest, DatePickerKind,
     FilterPattern, InputEventId, InputEventResult, InputMethodType, LoadStatus, MediaSessionEvent,
     NewWebViewDetails, Notification, PasskeyOperation, PasskeyResponse, PermissionFeature,
     PromptResponse, RgbColor, ScreenGeometry,
@@ -402,6 +402,9 @@ pub enum EmbedderControl {
     ColorPicker(ColorPicker),
     /// The picker of a `<input type=file>` element.
     FilePicker(FilePicker),
+    /// The calendar of a `<input type=date>`, `<input type=month>` or
+    /// `<input type=datetime-local>` element.
+    DatePicker(DatePicker),
     /// Request to present an input method (IME) interface to the user when an
     /// editable element is focused.
     InputMethod(InputMethodControl),
@@ -423,6 +426,7 @@ impl EmbedderControl {
             EmbedderControl::SelectElement(select_element) => select_element.id,
             EmbedderControl::ColorPicker(color_picker) => color_picker.id,
             EmbedderControl::FilePicker(file_picker) => file_picker.id,
+            EmbedderControl::DatePicker(date_picker) => date_picker.id,
             EmbedderControl::InputMethod(input_method) => input_method.id,
             EmbedderControl::SimpleDialog(simple_dialog) => simple_dialog.id(),
             EmbedderControl::ContextMenu(context_menu) => context_menu.id,
@@ -621,6 +625,95 @@ impl Drop for ColorPicker {
                 .send(EmbedderToConstellationMessage::EmbedderControlResponse(
                     self.id,
                     EmbedderControlResponse::ColorPicker(self.current_color),
+                ));
+        }
+    }
+}
+
+/// Represents a calendar or clock triggered by clicking a `<input type=date>`,
+/// `<input type=month>`, `<input type=datetime-local>` or `<input type=time>` element.
+///
+/// Dropping it without calling [`Self::submit`] dismisses it and leaves the element's
+/// value unchanged.
+pub struct DatePicker {
+    pub(crate) id: EmbedderControlId,
+    pub(crate) kind: DatePickerKind,
+    pub(crate) value: String,
+    pub(crate) min: Option<String>,
+    pub(crate) max: Option<String>,
+    pub(crate) step: Option<f64>,
+    pub(crate) selected: Option<String>,
+    pub(crate) position: DeviceIntRect,
+    pub(crate) constellation_proxy: ConstellationProxy,
+    pub(crate) response_sent: bool,
+}
+
+impl DatePicker {
+    /// Return the [`EmbedderControlId`] associated with this element.
+    pub fn id(&self) -> EmbedderControlId {
+        self.id
+    }
+
+    /// Get the area occupied by the `<input>` element that triggered the calendar.
+    ///
+    /// The embedder should use this value to position the calendar that is shown to the user.
+    pub fn position(&self) -> DeviceIntRect {
+        self.position
+    }
+
+    /// The kind of value to pick. It also gives the format of every string of this
+    /// [`DatePicker`].
+    pub fn kind(&self) -> DatePickerKind {
+        self.kind
+    }
+
+    /// The value of the element when the calendar was opened. Empty if it had none.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// The earliest value the element accepts, from its `min` attribute.
+    pub fn min(&self) -> Option<&str> {
+        self.min.as_deref()
+    }
+
+    /// The latest value the element accepts, from its `max` attribute.
+    pub fn max(&self) -> Option<&str> {
+        self.max.as_deref()
+    }
+
+    /// For a [`DatePickerKind`] that holds a time, the step between the values the element
+    /// accepts, in seconds; `None` when it accepts any. A step that is not a whole number of
+    /// minutes asks for seconds to be pickable.
+    pub fn step(&self) -> Option<f64> {
+        self.step
+    }
+
+    /// Set the value to give the element when [`Self::submit`] is called. It must use the
+    /// format of [`Self::kind`]; the element drops a value that does not.
+    pub fn select(&mut self, value: String) {
+        self.selected = Some(value);
+    }
+
+    /// Give the element the value set by [`Self::select`]. Without one, this behaves like
+    /// dismissing the calendar.
+    pub fn submit(mut self) {
+        self.response_sent = true;
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                self.id,
+                EmbedderControlResponse::DatePicker(self.selected.take()),
+            ));
+    }
+}
+
+impl Drop for DatePicker {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            self.constellation_proxy
+                .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                    self.id,
+                    EmbedderControlResponse::DatePicker(None),
                 ));
         }
     }

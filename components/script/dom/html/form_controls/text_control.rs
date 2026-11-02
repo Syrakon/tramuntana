@@ -181,6 +181,23 @@ pub(crate) trait TextControlElement {
             }));
     }
 
+    /// Queue a task on the user interaction task source that fires a bubbling `change`
+    /// event at this control. This is the same task source as `input`, so a `change`
+    /// that commits an edit always arrives after the `input` events of that edit.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/#concept-input-apply:event-change>
+    fn queue_change_event(&self) {
+        let element = self.as_element();
+        let target = Trusted::new(element.upcast::<EventTarget>());
+        element
+            .owner_global()
+            .task_manager()
+            .user_interaction_task_source()
+            .queue(task!(fire_change_event: move |cx| {
+                target.root().fire_bubbling_event(cx, atom!("change"));
+            }));
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-textarea/input-select>
     fn dom_select(&self, cx: &mut JSContext) {
         // Step 1: If this element is an input element, and either select() does not apply
