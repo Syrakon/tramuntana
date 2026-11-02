@@ -307,8 +307,6 @@ pub(crate) fn handle_get_children(
         node.node_type == NodeConstants::TEXT_NODE &&
             node.node_value.as_ref().is_none_or(|v| v.trim().is_empty())
     };
-    let mut pipeline_state = state.mut_pipeline_state_for(pipeline).unwrap();
-
     let inline: Vec<_> = parent
         .children()
         .map(|child| {
@@ -340,11 +338,19 @@ pub(crate) fn handle_get_children(
         if is_whitespace(&info) && !is_inline_level {
             return None;
         }
-        pipeline_state.register_node(&child);
-
-        Some(info)
+        Some((child, info))
     });
-    children.extend(children_iter);
+    let shown: Vec<_> = children_iter.collect();
+
+    // The nodes are remembered only once every summary is made: making one
+    // can run a garbage collection, which traces the devtools state and
+    // must not find it borrowed.
+    let mut pipeline_state = state.mut_pipeline_state_for(pipeline).unwrap();
+    for (child, info) in shown {
+        pipeline_state.register_node(&child);
+        children.push(info);
+    }
+    drop(pipeline_state);
 
     reply.send(Some(children)).unwrap();
 }
