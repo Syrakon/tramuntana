@@ -2125,7 +2125,13 @@ impl HTMLInputElement {
         ) {
             return;
         }
-        let mut picked = DOMString::from(picked);
+        self.commit_picked_value(cx, DOMString::from(picked));
+    }
+
+    /// Give this input `picked`, a value the user chose in a picker the embedder drew,
+    /// as a committed user change. A value that sanitizes to nothing, or to the value
+    /// the input already has, changes nothing and fires nothing.
+    pub(crate) fn commit_picked_value(&self, cx: &mut JSContext, mut picked: DOMString) {
         self.sanitize_value(&mut picked);
         if picked.is_empty() || picked == self.Value() {
             return;

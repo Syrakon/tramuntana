@@ -57,7 +57,8 @@ impl ColorInputType {
             "#{:0>2x}{:0>2x}{:0>2x}",
             selected_color.red, selected_color.green, selected_color.blue
         );
-        let _ = input.SetValue(cx, formatted_color.into());
+        // The user picked it: `input` and `change` fire, as for a typed and committed value.
+        input.commit_picked_value(cx, formatted_color.into());
     }
 
     /// <https://html.spec.whatwg.org/multipage/#update-a-color-well-control-color>
