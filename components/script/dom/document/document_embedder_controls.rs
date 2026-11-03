@@ -8,7 +8,8 @@ use std::cell::Cell;
 
 use embedder_traits::{
     ClipboardAction, ContextMenuAction, ContextMenuElementInformation,
-    ContextMenuElementInformationFlags, ContextMenuItem, ContextMenuRequest, EmbedderControlId,
+    ContextMenuElementInformationFlags, ContextMenuItem, ContextMenuRequest, DataListOption,
+    EmbedderControlId,
     EmbedderControlRequest, EmbedderControlResponse, EmbedderMsg, ValidationProblem,
 };
 use euclid::{Point2D, Rect, Size2D};
@@ -54,6 +55,8 @@ pub(crate) enum ControlElement {
     ContextMenu(ContextMenuNodes),
     /// The control a validation message is about.
     Validation(Dom<Element>),
+    /// The input whose `<datalist>` suggestions are shown.
+    DataList(Dom<HTMLInputElement>),
 }
 
 impl ControlElement {
@@ -65,6 +68,7 @@ impl ControlElement {
             ControlElement::FileInput(element) => element.upcast::<Node>(),
             ControlElement::Ime(element) => element.upcast::<Node>(),
             ControlElement::Validation(element) => element.upcast::<Node>(),
+            ControlElement::DataList(element) => element.upcast::<Node>(),
             ControlElement::ContextMenu(context_menu_nodes) => &context_menu_nodes.node,
         }
     }
@@ -153,7 +157,8 @@ impl DocumentEmbedderControls {
             EmbedderControlRequest::DatePicker(..) |
             EmbedderControlRequest::InputMethod(..) |
             EmbedderControlRequest::ContextMenu(..) |
-            EmbedderControlRequest::ValidationMessage(..) => self
+            EmbedderControlRequest::ValidationMessage(..) |
+            EmbedderControlRequest::DataList(..) => self
                 .window
                 .send_to_embedder(EmbedderMsg::ShowEmbedderControl(id, rect, request)),
             EmbedderControlRequest::FilePicker(file_picker_request) => {
@@ -209,6 +214,39 @@ impl DocumentEmbedderControls {
         self.show_embedder_control(
             ControlElement::Validation(Dom::from_ref(element)),
             EmbedderControlRequest::ValidationMessage(problem),
+            None,
+        );
+    }
+
+    /// Show the suggestions of `input`'s `<datalist>` that match its value, in place of
+    /// those shown before for it, or take them down when `options` is empty. Only the
+    /// list is touched: the input method of the element stays up.
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    pub(crate) fn show_datalist(&self, input: &HTMLInputElement, options: Vec<DataListOption>) {
+        self.visible_elements
+            .borrow_mut()
+            .retain(|index, control_element| {
+                let ControlElement::DataList(shown) = control_element else {
+                    return true;
+                };
+                if **shown != *input {
+                    return true;
+                }
+                let id = EmbedderControlId {
+                    webview_id: self.window.webview_id(),
+                    pipeline_id: self.window.pipeline_id(),
+                    index: index.0,
+                };
+                self.window
+                    .send_to_embedder(EmbedderMsg::HideEmbedderControl(id));
+                false
+            });
+        if options.is_empty() {
+            return;
+        }
+        self.show_embedder_control(
+            ControlElement::DataList(Dom::from_ref(input)),
+            EmbedderControlRequest::DataList(options),
             None,
         );
     }
@@ -281,6 +319,9 @@ impl DocumentEmbedderControls {
                 EmbedderControlResponse::ContextMenu(action),
             ) => {
                 context_menu_nodes.handle_context_menu_action(action, cx);
+            },
+            (ControlElement::DataList(input_element), EmbedderControlResponse::DataList(response)) => {
+                input_element.handle_datalist_response(cx, response);
             },
             (_, _) => unreachable!(
                 "The response to a form control should always match it's originating type."

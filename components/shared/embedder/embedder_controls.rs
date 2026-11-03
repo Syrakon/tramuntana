@@ -53,6 +53,21 @@ pub enum EmbedderControlRequest {
     /// The embedder answers nothing; Servo hides it when the control loses focus or leaves
     /// the document.
     ValidationMessage(ValidationProblem),
+    /// Indicates that a text-like `<input>` with a `list` attribute should show the
+    /// suggestions of its `<datalist>` that match what the user typed. A later request for
+    /// the same element replaces this one; Servo hides it when nothing matches any more,
+    /// or when the element loses focus or leaves the document.
+    DataList(Vec<DataListOption>),
+}
+
+/// A suggestion of a [`EmbedderControlRequest::DataList`]: one `<option>` of the `<datalist>`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DataListOption {
+    /// The value the element takes if the user picks this suggestion.
+    pub value: String,
+    /// A description to show next to the value, from the option's label or text. `None`
+    /// when the option has none, or it is the value itself.
+    pub label: Option<String>,
 }
 
 /// The kind of control a [`ValidationProblem::ValueMissing`] is about, as each one is filled
@@ -275,6 +290,8 @@ pub enum EmbedderControlResponse {
     /// `None` if the picker was dismissed.
     DatePicker(Option<String>),
     ContextMenu(Option<ContextMenuAction>),
+    /// The value of the suggestion the user picked, or `None` if the list was dismissed.
+    DataList(Option<String>),
 }
 
 /// Response to file selection request

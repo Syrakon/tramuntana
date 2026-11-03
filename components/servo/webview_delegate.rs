@@ -8,7 +8,7 @@ use std::rc::Rc;
 use embedder_traits::{
     AlertResponse, AllowOrDeny, AuthenticationResponse, BluetoothDeviceDescription,
     ConfirmResponse, ConsoleLogLevel, ContextMenuAction, ContextMenuElementInformation,
-    ContextMenuItem, Cursor, EmbedderControlId, EmbedderControlResponse, FilePickerRequest, DatePickerKind,
+    ContextMenuItem, Cursor, DataListOption, EmbedderControlId, EmbedderControlResponse, FilePickerRequest, DatePickerKind,
     FilterPattern, InputEventId, InputEventResult, InputMethodType, LoadStatus, MediaSessionEvent,
     NewWebViewDetails, Notification, PasskeyOperation, PasskeyResponse, PermissionFeature,
     PromptResponse, RgbColor, ScreenGeometry,
@@ -420,6 +420,8 @@ pub enum EmbedderControl {
     ContextMenu(ContextMenu),
     /// Why a form control failed its constraints, to show next to it.
     ValidationMessage(ValidationMessage),
+    /// The suggestions of the `<datalist>` of a text-like `<input>`.
+    DataList(DataList),
 }
 
 impl EmbedderControl {
@@ -434,6 +436,7 @@ impl EmbedderControl {
             EmbedderControl::SimpleDialog(simple_dialog) => simple_dialog.id(),
             EmbedderControl::ContextMenu(context_menu) => context_menu.id,
             EmbedderControl::ValidationMessage(message) => message.id,
+            EmbedderControl::DataList(data_list) => data_list.id,
         }
     }
 }
@@ -461,6 +464,73 @@ impl ValidationMessage {
     /// What is wrong with the control's value.
     pub fn problem(&self) -> &ValidationProblem {
         &self.problem
+    }
+}
+
+/// The suggestions of the `<datalist>` of a text-like `<input>` that match what the user
+/// typed, to show in a list under it while the input keeps focus. Servo sends a new one each
+/// time the matches change, after hiding the one before, and hides it when nothing matches,
+/// or when the input loses focus or leaves the document.
+///
+/// While it is shown, the embedder should take the Up, Down, Enter and Escape keys to move
+/// through it, pick a suggestion and dismiss it, and let the other keys reach the page.
+/// Dropping it without calling [`Self::select`] dismisses it and leaves the input unchanged.
+pub struct DataList {
+    pub(crate) id: EmbedderControlId,
+    pub(crate) position: DeviceIntRect,
+    pub(crate) options: Vec<DataListOption>,
+    pub(crate) constellation_proxy: ConstellationProxy,
+    pub(crate) response_sent: bool,
+}
+
+impl DataList {
+    /// Return the [`EmbedderControlId`] associated with this list.
+    pub fn id(&self) -> EmbedderControlId {
+        self.id
+    }
+
+    /// Get the area occupied by the `<input>` element, to show the list under it.
+    pub fn position(&self) -> DeviceIntRect {
+        self.position
+    }
+
+    /// The suggestions, in the order of the `<datalist>`. There is always at least one.
+    pub fn options(&self) -> &[DataListOption] {
+        &self.options
+    }
+
+    /// Give the input the value of the suggestion at `index` in [`Self::options`], as if
+    /// the user had typed it and committed it. An index out of range dismisses the list.
+    pub fn select(mut self, index: usize) {
+        let value = self.options.get(index).map(|option| option.value.clone());
+        self.response_sent = true;
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                self.id,
+                EmbedderControlResponse::DataList(value),
+            ));
+    }
+
+    /// Tell Servo that the list was dismissed with no suggestion picked.
+    pub fn dismiss(mut self) {
+        self.response_sent = true;
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                self.id,
+                EmbedderControlResponse::DataList(None),
+            ));
+    }
+}
+
+impl Drop for DataList {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            self.constellation_proxy
+                .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                    self.id,
+                    EmbedderControlResponse::DataList(None),
+                ));
+        }
     }
 }
 

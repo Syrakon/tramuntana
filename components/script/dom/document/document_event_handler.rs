@@ -2204,6 +2204,17 @@ impl DocumentEventHandler {
             .unwrap_or_else(|| document.upcast());
 
         let event = &event.event;
+
+        // Down, or Alt+Down, in a field with suggestions shows them, as in other browsers.
+        // Once they are shown the embedder takes the arrows to move through them.
+        if event.key == Key::Named(NamedKey::ArrowDown) &&
+            (event.modifiers.is_empty() || event.modifiers == Modifiers::ALT) &&
+            let Some(input) = node.downcast::<HTMLInputElement>() &&
+            input.show_datalist_suggestions()
+        {
+            return input_event_result | InputEventResult::Consumed;
+        }
+
         if let Some(editing_action) = editing_action_from_keyboard_event(event) {
             let editing_host = document.editing_context(cx.no_gc(), node);
             if editing_host.perform_editing_action(cx, editing_action) {

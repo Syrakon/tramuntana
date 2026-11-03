@@ -7,7 +7,8 @@ use std::{f64, ptr};
 
 use dom_struct::dom_struct;
 use embedder_traits::{
-    DatePickerKind, DatePickerRequest, EmbedderControlRequest, InputMethodRequest, RgbColor,
+    DataListOption, DatePickerKind, DatePickerRequest, EmbedderControlRequest, InputMethodRequest,
+    RgbColor,
     SelectedFile,
 };
 use encoding_rs::Encoding;
@@ -37,9 +38,11 @@ use xml5ever::ns;
 
 use crate::dom::activation::Activatable;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
+use crate::dom::bindings::codegen::Bindings::EventBinding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::FileListBinding::FileListMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLFormElementBinding::SelectionMode;
 use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLOptionElementBinding::HTMLOptionElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::{GetRootNodeOptions, NodeMethods};
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
@@ -63,6 +66,7 @@ use crate::dom::html::form_controls::input_type::{
 use crate::dom::html::form_controls::text_control::TextControlElement;
 use crate::dom::html::form_controls::text_input::{KeyReaction, Lines, TextInput};
 use crate::dom::html::htmldatalistelement::HTMLDataListElement;
+use crate::dom::html::htmloptionelement::HTMLOptionElement;
 use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
 use crate::dom::html::htmlformelement::{
@@ -1084,6 +1088,11 @@ impl TextControlElement for HTMLInputElement {
                 self.uncommitted_user_change.set(true);
                 self.update_placeholder_shown_state();
                 self.upcast::<Node>().dirty(cx.no_gc(), NodeDamage::Other);
+                // What the user typed narrows the suggestions down. Text still being
+                // composed in an input method is not typed yet.
+                if !bool::from(is_composing) {
+                    self.show_datalist_suggestions();
+                }
             },
             KeyReaction::RedrawSelection => {
                 self.maybe_update_shared_selection();
@@ -2107,6 +2116,89 @@ impl HTMLInputElement {
         );
     }
 
+    /// Whether this input offers the suggestions of its `<datalist>` in a list under it.
+    /// Only the text-like types do, while the user can change them; the other types that
+    /// take a `list` attribute have a picker of their own. An email field that takes
+    /// several addresses is left out, as a suggestion would replace all of them.
+    fn datalist_applies(&self) -> bool {
+        let applies_to_type = match *self.input_type() {
+            InputType::Text(_) |
+            InputType::Search(_) |
+            InputType::Url(_) |
+            InputType::Tel(_) |
+            InputType::Number(_) => true,
+            InputType::Email(_) => !self.Multiple(),
+            _ => false,
+        };
+        applies_to_type && self.is_mutable()
+    }
+
+    /// The [suggestions](https://html.spec.whatwg.org/multipage/#concept-input-list) of this
+    /// input's `<datalist>` that match its value: its `<option>` descendants that are not
+    /// disabled and hold a valid, non-empty value, in document order. A valid value is one
+    /// that sanitizes to itself and fits the type, such as an absolute URL for `url`. As in Chromium, an
+    /// option matches when its value or its label contains the input's value, ignoring
+    /// case; an empty input matches them all.
+    fn datalist_suggestions(&self) -> Vec<DataListOption> {
+        let Some(datalist) = self.suggestions_source_element() else {
+            return Vec::new();
+        };
+        let typed = String::from(self.Value()).to_lowercase();
+        datalist
+            .upcast::<Node>()
+            .traverse_preorder(ShadowIncluding::No)
+            .filter_map(|node| {
+                let option = node.downcast::<HTMLOptionElement>()?;
+                if option.upcast::<Element>().disabled_state() {
+                    return None;
+                }
+                let value = option.Value();
+                let mut sanitized = value.clone();
+                self.sanitize_value(&mut sanitized);
+                if value.is_empty() ||
+                    sanitized != value ||
+                    self.suffers_from_type_mismatch(&value)
+                {
+                    return None;
+                }
+                let value = String::from(value);
+                let label = String::from(option.Label()).trim().to_owned();
+                let label = (!label.is_empty() && label != value).then_some(label);
+                let matches = value.to_lowercase().contains(&typed) ||
+                    label
+                        .as_ref()
+                        .is_some_and(|label| label.to_lowercase().contains(&typed));
+                matches.then_some(DataListOption { value, label })
+            })
+            .collect()
+    }
+
+    /// Show under this input the suggestions of its `<datalist>` that match its value,
+    /// or take the list down when none does. Returns whether a list is shown.
+    pub(crate) fn show_datalist_suggestions(&self) -> bool {
+        if !self.datalist_applies() || self.suggestions_source_element().is_none() {
+            return false;
+        }
+        let suggestions = self.datalist_suggestions();
+        let shown = !suggestions.is_empty();
+        self.owner_document()
+            .embedder_controls()
+            .show_datalist(self, suggestions);
+        shown
+    }
+
+    /// Give this input the suggestion the user picked in its list, as if the user had
+    /// typed it and committed it.
+    pub(crate) fn handle_datalist_response(&self, cx: &mut JSContext, response: Option<String>) {
+        let Some(picked) = response else {
+            return;
+        };
+        if !self.datalist_applies() {
+            return;
+        }
+        self.commit_picked_value(cx, DOMString::from(picked));
+    }
+
     /// Give this input the value the user picked in its calendar, as if the user had
     /// typed it and committed it.
     pub(crate) fn handle_date_picker_response(
@@ -2746,6 +2838,12 @@ impl Activatable for HTMLInputElement {
             input_activation_type
                 .as_specific()
                 .activation_behavior(cx, self, event, target);
+        }
+
+        // A click of the user on a field with suggestions shows them, as in other browsers.
+        // A click from script does not.
+        if event.IsTrusted() {
+            self.show_datalist_suggestions();
         }
 
         // Step 3. If element has a form owner and element's type attribute

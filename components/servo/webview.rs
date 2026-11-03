@@ -44,7 +44,7 @@ use crate::responders::AutomaticResponder;
 use crate::servo::PendingHandledInputEvent;
 use crate::webview_delegate::{CreateNewWebViewRequest, DefaultWebViewDelegate, WebViewDelegate};
 use crate::{
-    ColorPicker, ContextMenu, DatePicker, EmbedderControl, InputMethodControl, SelectElement, Servo, ValidationMessage,
+    ColorPicker, ContextMenu, DataList, DatePicker, EmbedderControl, InputMethodControl, SelectElement, Servo, ValidationMessage,
     UserContentManager, ViewportScrollExtent, WebRenderDebugOption,
 };
 
@@ -912,6 +912,13 @@ impl WebView {
                     problem,
                 })
             },
+            EmbedderControlRequest::DataList(options) => EmbedderControl::DataList(DataList {
+                id: control_id,
+                position,
+                options,
+                constellation_proxy,
+                response_sent: false,
+            }),
             EmbedderControlRequest::FilePicker { .. } => {
                 unreachable!("This message should be routed through the FileManagerThread")
             },
