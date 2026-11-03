@@ -1678,6 +1678,20 @@ pub struct PathPromptOptions {
     pub multiple: bool,
     /// The prompt to show to a user when selecting a path
     pub prompt: Option<SharedString>,
+    /// The kinds of file the dialog shows first. The user can still switch
+    /// to every file. Only the Linux dialog follows it for now.
+    pub filter: Option<PathFilter>,
+}
+
+/// A group of file extensions a file dialog offers to show alone.
+#[derive(Clone, Debug)]
+pub struct PathFilter {
+    /// The name the dialog gives the group.
+    pub label: SharedString,
+    /// The extensions of the group, without the leading dot.
+    pub extensions: Vec<SharedString>,
+    /// The name the dialog gives the choice of every file.
+    pub all_files_label: SharedString,
 }
 
 /// What kind of prompt styling to show
