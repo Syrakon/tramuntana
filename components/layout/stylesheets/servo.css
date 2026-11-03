@@ -156,6 +156,19 @@ input[type="file"]::file-selector-button {
   text-align: center;
 }
 
+/* Buttons look like Chromium's, in the light and the dark color scheme: a grey face with
+   a darker border, slightly rounded, and little padding. */
+button,
+input[type="button"],
+input[type="submit"],
+input[type="reset"],
+input[type="file"]::file-selector-button {
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: light-dark(#efefef, #6b6b6b);
+  border-color: light-dark(#767676, #858585);
+}
+
 button:hover,
 select:hover,
 input[type="button"]:hover,
@@ -164,6 +177,15 @@ input[type="reset"]:hover,
 input[type="color"]:hover,
 input[type="file"]:hover::file-selector-button {
   background: lightgrey;
+}
+
+button:hover,
+input[type="button"]:hover,
+input[type="submit"]:hover,
+input[type="reset"]:hover,
+input[type="file"]:hover::file-selector-button {
+  background: light-dark(#e5e5e5, #7b7b7b);
+  border-color: light-dark(#4f4f4f, #acacac);
 }
 
 button:active,
@@ -175,6 +197,15 @@ input[type="color"]:active,
 input[type="file"]:active::file-selector-button {
   border-color: grey;
   background: gainsboro;
+}
+
+button:active,
+input[type="button"]:active,
+input[type="submit"]:active,
+input[type="reset"]:active,
+input[type="file"]:active::file-selector-button {
+  background: light-dark(#f5f5f5, #595959);
+  border-color: light-dark(#8d8d8d, #6e6e6e);
 }
 
 button:focus,
@@ -196,9 +227,9 @@ input[type="submit"]:disabled,
 input[type="reset"]:disabled,
 input[type="color"]:disabled,
 input[type="file"]:disabled::file-selector-button {
-  background: rgb(240, 240, 240);
-  border-color: lightgrey;
-  color: grey;
+  background: light-dark(rgb(240, 240, 240), #3b3b3b);
+  border-color: light-dark(lightgrey, #5b5b5b);
+  color: light-dark(grey, #8b8b8b);
 }
 
 input[type="file"]::file-selector-button {
@@ -293,51 +324,86 @@ input[type="range"]:disabled::slider-thumb {
   border-color: rgba(180, 180, 180);
 }
 
-/* Checkbox and radio button inputs */
+/* Checkbox and radio button inputs. They look like Chromium's, in the light and the dark
+   color scheme: 13px, a grey border on the field color, and the blue accent when checked. */
 input[type="checkbox"],
 input[type="radio"] {
-  margin-inline: 4px 2px;
+  display: inline-block;
+  box-sizing: border-box;
+
+  /* Only a default size: pages set their own, as they do in other engines. */
+  width: 13px;
+  height: 13px;
 
   /* Offset the outline a bit so that it doesn't just make the rounded border thicker. */
   outline-offset: 0.4px;
 
   /* Allow for centering the bullet or check. */
   position: relative;
+
+  background: light-dark(white, #3b3b3b);
+  border: 1px solid light-dark(#767676, #858585);
 }
 
 input[type="checkbox"] {
-  border: 1px solid grey;
-}
-
-input[type="checkbox"]:disabled {
-  border-color: lightgrey;
-}
-
-input[type="checkbox"] {
-  display: inline-block;
-  position: relative;
-
-  /* Only a default size: pages set their own, as they do in other engines. */
-  width: 14px;
-  height: 14px;
-
+  margin: 3px 3px 3px 4px;
   border-radius: 2px;
 
   /* This prevents the baseline from escaping and changing the baseline of the containing line. */
   overflow: hidden;
 }
 
+input[type="radio"] {
+  margin: 3px 3px 0 5px;
+  border-radius: 50%;
+}
+
+input[type="checkbox"]:hover,
+input[type="radio"]:hover {
+  border-color: light-dark(#4f4f4f, #acacac);
+}
+
+input[type="checkbox"]:checked,
+input[type="checkbox"]:indeterminate {
+  background: light-dark(#0075ff, #99c8ff);
+  border-color: light-dark(#0075ff, #99c8ff);
+}
+
+input[type="checkbox"]:checked:hover,
+input[type="checkbox"]:indeterminate:hover {
+  background: light-dark(#005cc8, #d1e6ff);
+  border-color: light-dark(#005cc8, #d1e6ff);
+}
+
+input[type="radio"]:checked {
+  border-color: light-dark(#0075ff, #99c8ff);
+}
+
+input[type="radio"]:checked:hover {
+  border-color: light-dark(#005cc8, #d1e6ff);
+}
+
+input[type="checkbox"]:disabled,
+input[type="radio"]:disabled {
+  background: light-dark(rgba(239, 239, 239, 0.3), rgba(59, 59, 59, 0.3));
+  border-color: light-dark(rgba(118, 118, 118, 0.3), rgba(133, 133, 133, 0.3));
+}
+
+input[type="checkbox"]:checked:disabled,
+input[type="checkbox"]:indeterminate:disabled {
+  background: light-dark(rgba(118, 118, 118, 0.3), rgba(133, 133, 133, 0.3));
+  border-color: transparent;
+}
+
 input[type="checkbox"]::before {
   content: "";
-  font-size: 12px;
+  font-size: 10px;
+  line-height: 1;
+  color: light-dark(white, #3b3b3b);
   position: absolute;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-}
-
-input[type="checkbox"]:disabled::before {
-  color: grey;
 }
 
 input[type="checkbox"]:checked::before {
@@ -348,50 +414,13 @@ input[type="checkbox"]:indeterminate::before {
   content: "—";
 }
 
-input[type="radio"] {
-  display: inline-block;
-
-  /* TODO: According to https://wpt.fyi/results/css/css-grid/stretch-grid-item-radio-input.html,
-     radio buttons should be able to grow / shrink depending of the width/height of the input
-     element. These values should probably be changed once `aspect-ratio` has been supported
-     for non-replaced elements.
-  */
-  min-height: 14px;
-  min-width: 14px;
-  height: 14px;
-  width: 14px;
-}
-
-/* This creates the ring of the radio input. TODO: It might be better to add a UA shadow tree instead of using pseudo elements. */
-input[type="radio"]::before {
-  content: "";
-  background: transparent;
-
-  /* TODO: The ring should be able to grow & shrink according to min(width, height).
-    However, this is currently not possible to be implemented as `aspect-ratio` hasn't
-    been supported for non-replaced elements.
-  */
-  width: 10px;
-  height: 10px;
-
-  /* Center the bullet in the containing block. */
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  border: 2px solid grey;
-  border-radius: 50%;
-}
-
-/* This creates the bullet of the radio input. TODO: It might be better to add a UA shadow tree instead of using pseudo elements.*/
+/* The bullet of the radio input. TODO: It might be better to add a UA shadow tree instead of
+   using a pseudo element. */
 input[type="radio"]::after {
   content: "";
   background: transparent;
-
-  /* TODO:  The bullet should be able to grow & shrink according to min(width, height).
-  However, this is currently not possible to be implemented as `aspect-ratio` hasn't been supported for non-replaced elements. */
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
 
   /* Center the bullet in the containing block. */
   position: absolute;
@@ -402,11 +431,15 @@ input[type="radio"]::after {
 }
 
 input[type="radio"]:checked::after {
-  background: black;
+  background: light-dark(#0075ff, #99c8ff);
+}
+
+input[type="radio"]:checked:hover::after {
+  background: light-dark(#005cc8, #d1e6ff);
 }
 
 input[type="radio"]:checked:disabled::after {
-  background: grey;
+  background: light-dark(rgba(118, 118, 118, 0.3), rgba(133, 133, 133, 0.3));
 }
 
 td[align="left"]    { text-align: left; }
