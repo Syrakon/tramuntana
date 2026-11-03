@@ -2711,7 +2711,16 @@ impl Window {
             };
             let mut element = tooltip_request.tooltip.view.clone().into_any();
             let mouse_position = tooltip_request.tooltip.mouse_position;
-            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
+            // A tooltip placed against an element is offered the width of that element, so one
+            // sized to fill it lines up with it; a tooltip at the mouse takes the size it needs.
+            let available_space = match tooltip_request.tooltip.anchor {
+                Some(anchor) => Size {
+                    width: AvailableSpace::Definite(anchor.size.width),
+                    height: AvailableSpace::MinContent,
+                },
+                None => AvailableSpace::min_size(),
+            };
+            let tooltip_size = element.layout_as_root(available_space, self, cx);
 
             let window_bounds = Bounds {
                 origin: Point::default(),
