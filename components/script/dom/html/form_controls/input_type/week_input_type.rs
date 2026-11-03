@@ -1,6 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+use embedder_traits::DatePickerKind;
 use js::context::JSContext;
 use script_bindings::cell::DomRefCell;
 use time::OffsetDateTime;
@@ -64,6 +65,10 @@ impl SpecificInputType for WeekInputType {
     /// <https://html.spec.whatwg.org/multipage/#week-state-(type=week):suffering-from-bad-input>
     fn suffers_from_bad_input(&self, value: &DOMString) -> bool {
         !value.str().is_valid_week_string()
+    }
+
+    fn show_the_picker_if_applicable(&self, input: &HTMLInputElement) {
+        input.show_date_picker(DatePickerKind::Week);
     }
 
     fn update_shadow_tree(&self, cx: &mut JSContext, input: &HTMLInputElement) {

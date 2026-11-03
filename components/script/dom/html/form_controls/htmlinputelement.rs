@@ -853,6 +853,7 @@ impl HTMLInputElement {
             InputType::Color(_) |
                 InputType::Date(_) |
                 InputType::Month(_) |
+                InputType::Week(_) |
                 InputType::DatetimeLocal(_) |
                 InputType::Time(_)
         ) && !el.disabled_state()
@@ -2085,8 +2086,8 @@ impl HTMLInputElement {
         }
     }
 
-    /// Ask the embedder to show a calendar for this `date`, `month` or `datetime-local`
-    /// input, or a clock for this `time` input. `kind` gives the format of the value it
+    /// Ask the embedder to show a calendar for this `date`, `month`, `week` or
+    /// `datetime-local` input, or a clock for this `time` input. `kind` gives the format of the value it
     /// picks.
     pub(crate) fn show_date_picker(&self, kind: DatePickerKind) {
         let element = self.upcast::<Element>();
@@ -2106,7 +2107,7 @@ impl HTMLInputElement {
                 DatePickerKind::Time | DatePickerKind::DatetimeLocal => {
                     self.allowed_value_step().map(|step| step / 1000.0)
                 },
-                DatePickerKind::Date | DatePickerKind::Month => None,
+                DatePickerKind::Date | DatePickerKind::Month | DatePickerKind::Week => None,
             },
         };
         self.owner_document().embedder_controls().show_embedder_control(
@@ -2213,6 +2214,7 @@ impl HTMLInputElement {
             *self.input_type(),
             InputType::Date(_) |
                 InputType::Month(_) |
+                InputType::Week(_) |
                 InputType::DatetimeLocal(_) |
                 InputType::Time(_)
         ) {

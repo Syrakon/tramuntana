@@ -242,6 +242,10 @@ pub enum DatePickerKind {
     /// `<input type=month>`: a [month string](https://html.spec.whatwg.org/multipage/#valid-month-string),
     /// such as `2026-11`.
     Month,
+    /// `<input type=week>`: a [week string](https://html.spec.whatwg.org/multipage/#valid-week-string),
+    /// such as `2026-W45`. Weeks are ISO 8601 weeks: they start on Monday, and the first
+    /// week of a year is the one with its first Thursday.
+    Week,
     /// `<input type=datetime-local>`: a
     /// [normalized local date and time string](https://html.spec.whatwg.org/multipage/#valid-normalised-local-date-and-time-string),
     /// such as `2026-11-02T14:30`.

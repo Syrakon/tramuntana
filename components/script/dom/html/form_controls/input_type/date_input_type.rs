@@ -88,7 +88,7 @@ impl SpecificInputType for DateInputType {
 }
 
 /// The input activation behavior of the input types that pick a value from a calendar or
-/// a clock: `date`, `month`, `datetime-local` and `time`. Their pickers are drawn by the
+/// a clock: `date`, `month`, `week`, `datetime-local` and `time`. Their pickers are drawn by the
 /// embedder.
 #[derive(Clone, Copy)]
 pub(crate) struct DatePickerInputActivation;

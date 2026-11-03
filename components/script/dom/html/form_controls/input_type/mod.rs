@@ -180,6 +180,7 @@ impl InputActivationType {
             InputType::Color(_) => Some(Self::Color(ColorInputActivation)),
             InputType::Date(_) |
             InputType::Month(_) |
+            InputType::Week(_) |
             InputType::DatetimeLocal(_) |
             InputType::Time(_) => Some(Self::DatePicker(DatePickerInputActivation)),
             InputType::File(_) => Some(Self::File(FileInputActivation)),
