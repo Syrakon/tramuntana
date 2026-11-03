@@ -9,7 +9,7 @@ use std::cell::Cell;
 use embedder_traits::{
     ClipboardAction, ContextMenuAction, ContextMenuElementInformation,
     ContextMenuElementInformationFlags, ContextMenuItem, ContextMenuRequest, EmbedderControlId,
-    EmbedderControlRequest, EmbedderControlResponse, EmbedderMsg,
+    EmbedderControlRequest, EmbedderControlResponse, EmbedderMsg, ValidationProblem,
 };
 use euclid::{Point2D, Rect, Size2D};
 use js::context::{JSContext, NoGC};
@@ -52,6 +52,8 @@ pub(crate) enum ControlElement {
     FileInput(Dom<HTMLInputElement>),
     Ime(Dom<HTMLElement>),
     ContextMenu(ContextMenuNodes),
+    /// The control a validation message is about.
+    Validation(Dom<Element>),
 }
 
 impl ControlElement {
@@ -62,6 +64,7 @@ impl ControlElement {
             ControlElement::DateInput(element) => element.upcast::<Node>(),
             ControlElement::FileInput(element) => element.upcast::<Node>(),
             ControlElement::Ime(element) => element.upcast::<Node>(),
+            ControlElement::Validation(element) => element.upcast::<Node>(),
             ControlElement::ContextMenu(context_menu_nodes) => &context_menu_nodes.node,
         }
     }
@@ -149,7 +152,8 @@ impl DocumentEmbedderControls {
             EmbedderControlRequest::ColorPicker(..) |
             EmbedderControlRequest::DatePicker(..) |
             EmbedderControlRequest::InputMethod(..) |
-            EmbedderControlRequest::ContextMenu(..) => self
+            EmbedderControlRequest::ContextMenu(..) |
+            EmbedderControlRequest::ValidationMessage(..) => self
                 .window
                 .send_to_embedder(EmbedderMsg::ShowEmbedderControl(id, rect, request)),
             EmbedderControlRequest::FilePicker(file_picker_request) => {
@@ -179,6 +183,34 @@ impl DocumentEmbedderControls {
                     .unwrap();
             },
         }
+    }
+
+    /// Tell the user why `element` failed its constraints, next to it. A message shown
+    /// before is taken down first: only one is up at a time, as in other browsers. Like any
+    /// other control of the element, the message goes when the element loses focus or
+    /// leaves the document.
+    #[cfg_attr(crown, expect(crown::unrooted_must_root))]
+    pub(crate) fn show_validation_message(&self, element: &Element, problem: ValidationProblem) {
+        self.visible_elements
+            .borrow_mut()
+            .retain(|index, control_element| {
+                if !matches!(control_element, ControlElement::Validation(..)) {
+                    return true;
+                }
+                let id = EmbedderControlId {
+                    webview_id: self.window.webview_id(),
+                    pipeline_id: self.window.pipeline_id(),
+                    index: index.0,
+                };
+                self.window
+                    .send_to_embedder(EmbedderMsg::HideEmbedderControl(id));
+                false
+            });
+        self.show_embedder_control(
+            ControlElement::Validation(Dom::from_ref(element)),
+            EmbedderControlRequest::ValidationMessage(problem),
+            None,
+        );
     }
 
     pub(crate) fn hide_embedder_control(&self, element: &Element) {

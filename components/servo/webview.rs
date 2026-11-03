@@ -44,7 +44,7 @@ use crate::responders::AutomaticResponder;
 use crate::servo::PendingHandledInputEvent;
 use crate::webview_delegate::{CreateNewWebViewRequest, DefaultWebViewDelegate, WebViewDelegate};
 use crate::{
-    ColorPicker, ContextMenu, DatePicker, EmbedderControl, InputMethodControl, SelectElement, Servo,
+    ColorPicker, ContextMenu, DatePicker, EmbedderControl, InputMethodControl, SelectElement, Servo, ValidationMessage,
     UserContentManager, ViewportScrollExtent, WebRenderDebugOption,
 };
 
@@ -903,6 +903,13 @@ impl WebView {
                     element_info: context_menu_request.element_info,
                     constellation_proxy,
                     response_sent: false,
+                })
+            },
+            EmbedderControlRequest::ValidationMessage(problem) => {
+                EmbedderControl::ValidationMessage(ValidationMessage {
+                    id: control_id,
+                    position,
+                    problem,
                 })
             },
             EmbedderControlRequest::FilePicker { .. } => {

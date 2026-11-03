@@ -48,6 +48,59 @@ pub enum EmbedderControlRequest {
     InputMethod(InputMethodRequest),
     /// Indicates that the the user has triggered the display of a context menu.
     ContextMenu(ContextMenuRequest),
+    /// Indicates that a form control failed its constraints when its form was submitted or
+    /// `reportValidity()` was called, and the user should be told why. It carries what is wrong.
+    /// The embedder answers nothing; Servo hides it when the control loses focus or leaves
+    /// the document.
+    ValidationMessage(ValidationProblem),
+}
+
+/// The kind of control a [`ValidationProblem::ValueMissing`] is about, as each one is filled
+/// in a different way.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub enum MissingValueKind {
+    /// A field the user types in, `<textarea>` too.
+    Text,
+    /// `<input type=checkbox>`.
+    Checkbox,
+    /// A group of `<input type=radio>`.
+    Radio,
+    /// `<input type=file>`.
+    File,
+    /// `<select>`.
+    Select,
+}
+
+/// Why a form control fails its constraints, for the embedder to tell the user in its own
+/// language. When a control fails several, it is the first one in this order.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum ValidationProblem {
+    /// The page's own message, from `setCustomValidity()`.
+    Custom(String),
+    /// A required control has no value.
+    ValueMissing(MissingValueKind),
+    /// `<input type=email>` holds something that is not an email address.
+    NotAnEmail,
+    /// `<input type=url>` holds something that is not an absolute URL.
+    NotAUrl,
+    /// What the user typed cannot be turned into a value of the field, such as letters in
+    /// a number field.
+    BadInput,
+    /// The value does not match the `pattern` attribute. It carries the field's `title`,
+    /// which pages use to describe the pattern.
+    PatternMismatch {
+        title: Option<String>,
+    },
+    /// The value is longer than `maxlength`. Lengths count UTF-16 code units, as the page does.
+    TooLong { max: u32, length: u32 },
+    /// The value is shorter than `minlength`.
+    TooShort { min: u32, length: u32 },
+    /// The value is below `min`, as written in the attribute.
+    RangeUnderflow { min: String },
+    /// The value is above `max`, as written in the attribute.
+    RangeOverflow { max: String },
+    /// The value is not one of the steps `step` allows.
+    StepMismatch,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

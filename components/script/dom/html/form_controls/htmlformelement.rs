@@ -80,6 +80,7 @@ use crate::dom::html::links::relations::{
 };
 use crate::dom::node::virtualmethods::VirtualMethods;
 use crate::dom::node::{Node, NodeFlags, NodeTraits, UnbindContext, VecPreOrderInsertionHelper};
+use crate::dom::validation::report_validation_problem;
 use crate::dom::nodelist::{NodeList, RadioListMode};
 use crate::dom::radionodelist::RadioNodeList;
 use crate::dom::submitevent::SubmitEvent;
@@ -1182,13 +1183,10 @@ impl HTMLFormElement {
 
         // Step 3: Report the problems with the constraints of at least one of the elements
         // given in unhandled invalid controls to the user.
-        let mut first = true;
-
-        for elem in unhandled_invalid_controls {
-            if let Some(validatable) = elem.as_maybe_validatable() {
-                error!("Validation error: {}", validatable.validation_message(cx));
-            }
-            if first && let Some(html_elem) = elem.downcast::<HTMLElement>() {
+        // As other browsers do, the user is told about the first of them, which is also
+        // the one that gets focus.
+        if let Some(elem) = unhandled_invalid_controls.first() {
+            if let Some(html_elem) = elem.downcast::<HTMLElement>() {
                 // Step 3.1: User agents may focus one of those elements in the process,
                 // by running the focusing steps for that element,
                 // and may change the scrolling position of the document, or perform
@@ -1196,8 +1194,8 @@ impl HTMLFormElement {
 
                 // Here we run focusing steps and scroll element into view.
                 html_elem.Focus(cx, &FocusOptions::default());
-                first = false;
             }
+            report_validation_problem(cx, elem);
         }
 
         // If it's form-associated and has a validation anchor, point the

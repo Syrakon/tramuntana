@@ -13,6 +13,7 @@ use embedder_traits::{
     NewWebViewDetails, Notification, PasskeyOperation, PasskeyResponse, PermissionFeature,
     PromptResponse, RgbColor, ScreenGeometry,
     SelectElementOptionOrOptgroup, SelectElementRequest, SimpleDialogRequest, StorageAccessSites,
+    ValidationProblem,
     TraversalId,
     WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
 };
@@ -417,6 +418,8 @@ pub enum EmbedderControl {
     /// The menu that is actually shown the user may be customized, but custom menu entries
     /// must be handled by the embedder.
     ContextMenu(ContextMenu),
+    /// Why a form control failed its constraints, to show next to it.
+    ValidationMessage(ValidationMessage),
 }
 
 impl EmbedderControl {
@@ -430,7 +433,34 @@ impl EmbedderControl {
             EmbedderControl::InputMethod(input_method) => input_method.id,
             EmbedderControl::SimpleDialog(simple_dialog) => simple_dialog.id(),
             EmbedderControl::ContextMenu(context_menu) => context_menu.id,
+            EmbedderControl::ValidationMessage(message) => message.id,
         }
+    }
+}
+
+/// Tells the user why a form control failed its constraints. Servo expects no answer: it
+/// hides the message when the control loses focus or leaves the document, and the embedder
+/// may take it down sooner, such as when the user types or after a while.
+pub struct ValidationMessage {
+    pub(crate) id: EmbedderControlId,
+    pub(crate) position: DeviceIntRect,
+    pub(crate) problem: ValidationProblem,
+}
+
+impl ValidationMessage {
+    /// Return the [`EmbedderControlId`] associated with this message.
+    pub fn id(&self) -> EmbedderControlId {
+        self.id
+    }
+
+    /// Get the area occupied by the control the message is about, to point at it.
+    pub fn position(&self) -> DeviceIntRect {
+        self.position
+    }
+
+    /// What is wrong with the control's value.
+    pub fn problem(&self) -> &ValidationProblem {
+        &self.problem
     }
 }
 
