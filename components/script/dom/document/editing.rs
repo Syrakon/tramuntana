@@ -806,6 +806,16 @@ pub(crate) fn editing_action_from_keyboard_event(
         .shortcut(CMD_OR_CONTROL, 'V', || {
             Some(EditingAction::Clipboard(ClipboardAction::Paste))
         })
+        // The other paste chords Chromium and Firefox take on Linux and
+        // Windows: Ctrl+Shift+V (paste as plain text, which is all Servo pastes)
+        // and Shift+Insert. Emoji pickers and other tools that type through a
+        // virtual keyboard send one of these.
+        .shortcut(CMD_OR_CONTROL | Modifiers::SHIFT, 'V', || {
+            Some(EditingAction::Clipboard(ClipboardAction::Paste))
+        })
+        .shortcut(Modifiers::SHIFT, Key::Named(NamedKey::Insert), || {
+            Some(EditingAction::Clipboard(ClipboardAction::Paste))
+        })
         // TODO: Figure out if the bit about Option+Enter works and whether or not this
         //       ends up providing the correct behavior on Mac. (i.e. whether or not
         //       Shift should be accepted in addition to Option.)
