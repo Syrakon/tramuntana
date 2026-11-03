@@ -623,6 +623,27 @@ impl Interactivity {
         self.tooltip_builder = Some(TooltipBuilder {
             build: Rc::new(build_tooltip),
             hoverable: false,
+            anchored: false,
+        });
+    }
+
+    /// Like [`Interactivity::tooltip`], but the tooltip is placed against this element rather
+    /// than at the mouse: below it, or above it when there is no room below in the window.
+    /// The imperative API equivalent to [`StatefulInteractiveElement::anchored_tooltip`].
+    pub fn anchored_tooltip(
+        &mut self,
+        build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+    ) where
+        Self: Sized,
+    {
+        debug_assert!(
+            self.tooltip_builder.is_none(),
+            "calling tooltip more than once on the same element is not supported"
+        );
+        self.tooltip_builder = Some(TooltipBuilder {
+            build: Rc::new(build_tooltip),
+            hoverable: false,
+            anchored: true,
         });
     }
 
@@ -642,6 +663,7 @@ impl Interactivity {
         self.tooltip_builder = Some(TooltipBuilder {
             build: Rc::new(build_tooltip),
             hoverable: true,
+            anchored: false,
         });
     }
 
@@ -1350,6 +1372,20 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     }
 
     /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
+    /// The tooltip is placed below this element, or above it when there is no room below.
+    /// The fluent API equivalent to [`Interactivity::anchored_tooltip`].
+    fn anchored_tooltip(
+        mut self,
+        build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().anchored_tooltip(build_tooltip);
+        self
+    }
+
+    /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
     /// The tooltip itself is also hoverable and won't disappear when the user moves the mouse into
     /// the tooltip. The fluent API equivalent to [`Interactivity::hoverable_tooltip`].
     fn hoverable_tooltip(
@@ -1391,6 +1427,8 @@ type CanDropPredicate = Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> bool + 's
 pub(crate) struct TooltipBuilder {
     build: Rc<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>,
     hoverable: bool,
+    /// Whether the tooltip is placed against the element instead of at the mouse.
+    anchored: bool,
 }
 
 pub(crate) type KeyDownListener =
@@ -2599,8 +2637,13 @@ impl Interactivity {
                     .clone();
 
                 let tooltip_is_hoverable = tooltip_builder.hoverable;
+                let anchor = tooltip_builder.anchored.then_some(hitbox.bounds);
                 let build_tooltip = Rc::new(move |window: &mut Window, cx: &mut App| {
-                    Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
+                    Some(TooltipBuild {
+                        view: (tooltip_builder.build)(window, cx),
+                        is_hoverable: tooltip_is_hoverable,
+                        anchor,
+                    })
                 });
                 // Use bounds instead of testing hitbox since this is called during prepaint.
                 let check_is_hovered_during_prepaint = Rc::new({
@@ -3008,10 +3051,18 @@ pub(crate) fn set_tooltip_on_window(
     Some(window.set_tooltip(tooltip))
 }
 
+/// What a tooltip builder hands back: the view, and how the tooltip behaves and is placed.
+pub(crate) struct TooltipBuild {
+    pub(crate) view: AnyView,
+    pub(crate) is_hoverable: bool,
+    /// The bounds of the element the tooltip is placed against, if it is not placed at the mouse.
+    pub(crate) anchor: Option<Bounds<Pixels>>,
+}
+
 pub(crate) fn register_tooltip_mouse_handlers(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
     tooltip_id: Option<TooltipId>,
-    build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
+    build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<TooltipBuild>>,
     check_is_hovered: Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
     window: &mut Window,
@@ -3065,7 +3116,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
 /// gets occluded after display, it will stick around until the mouse exits the hover bounds.
 fn handle_tooltip_mouse_move(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
-    build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
+    build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<TooltipBuild>>,
     check_is_hovered: &Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
     phase: DispatchPhase,
@@ -3121,12 +3172,18 @@ fn handle_tooltip_mouse_move(
                     };
                     cx.update(|window, cx| {
                         let new_tooltip =
-                            build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
+                            build_tooltip(window, cx).map(|built| {
+                                let TooltipBuild {
+                                    view,
+                                    is_hoverable: tooltip_is_hoverable,
+                                    anchor,
+                                } = built;
                                 let weak_active_tooltip = Rc::downgrade(&active_tooltip);
                                 ActiveTooltip::Visible {
                                     tooltip: AnyTooltip {
                                         view,
                                         mouse_position: window.mouse_position(),
+                                        anchor,
                                         check_visible_and_update: Rc::new(
                                             move |tooltip_bounds, window, cx| {
                                                 let Some(active_tooltip) =

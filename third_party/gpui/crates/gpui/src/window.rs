@@ -2713,36 +2713,14 @@ impl Window {
             let mouse_position = tooltip_request.tooltip.mouse_position;
             let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
 
-            let mut tooltip_bounds =
-                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
             let window_bounds = Bounds {
                 origin: Point::default(),
                 size: self.viewport_size(),
             };
-
-            if tooltip_bounds.right() > window_bounds.right() {
-                let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= Pixels::ZERO {
-                    tooltip_bounds.origin.x = new_x;
-                } else {
-                    tooltip_bounds.origin.x = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
-                    );
-                }
-            }
-
-            if tooltip_bounds.bottom() > window_bounds.bottom() {
-                let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-                if new_y >= Pixels::ZERO {
-                    tooltip_bounds.origin.y = new_y;
-                } else {
-                    tooltip_bounds.origin.y = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
-                    );
-                }
-            }
+            let tooltip_bounds = match tooltip_request.tooltip.anchor {
+                Some(anchor) => anchored_tooltip_bounds(anchor, tooltip_size, window_bounds),
+                None => mouse_tooltip_bounds(mouse_position, tooltip_size, window_bounds),
+            };
 
             // It's possible for an element to have an active tooltip while not being painted (e.g.
             // via the `visible_on_hover` method). Since mouse listeners are not active in this
@@ -6037,4 +6015,60 @@ pub fn outline(
         border_color: border_color.into(),
         border_style,
     }
+}
+
+/// Where a tooltip shown at the mouse goes: just past the pointer, flipped to the other side of
+/// it on an axis where it would leave the window.
+fn mouse_tooltip_bounds(
+    mouse_position: Point<Pixels>,
+    tooltip_size: Size<Pixels>,
+    window_bounds: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let mut tooltip_bounds = Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
+    if tooltip_bounds.right() > window_bounds.right() {
+        let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
+        if new_x >= Pixels::ZERO {
+            tooltip_bounds.origin.x = new_x;
+        } else {
+            tooltip_bounds.origin.x = cmp::max(
+                Pixels::ZERO,
+                tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
+            );
+        }
+    }
+
+    if tooltip_bounds.bottom() > window_bounds.bottom() {
+        let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
+        if new_y >= Pixels::ZERO {
+            tooltip_bounds.origin.y = new_y;
+        } else {
+            tooltip_bounds.origin.y = cmp::max(
+                Pixels::ZERO,
+                tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
+            );
+        }
+    }
+    tooltip_bounds
+}
+
+/// The gap between a tooltip and the element it is placed against.
+const ANCHORED_TOOLTIP_GAP: Pixels = px(4.);
+
+/// Where a tooltip placed against an element goes: below it, aligned with its start, or above it
+/// when it would leave the bottom of the window. It is moved in from the right edge of the window
+/// rather than cut by it.
+fn anchored_tooltip_bounds(
+    anchor: Bounds<Pixels>,
+    tooltip_size: Size<Pixels>,
+    window_bounds: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let mut origin = point(anchor.left(), anchor.bottom() + ANCHORED_TOOLTIP_GAP);
+    if origin.y + tooltip_size.height > window_bounds.bottom() {
+        let above = anchor.top() - ANCHORED_TOOLTIP_GAP - tooltip_size.height;
+        origin.y = cmp::max(window_bounds.top(), above);
+    }
+    if origin.x + tooltip_size.width > window_bounds.right() {
+        origin.x = cmp::max(window_bounds.left(), window_bounds.right() - tooltip_size.width);
+    }
+    Bounds::new(origin, tooltip_size)
 }
