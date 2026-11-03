@@ -845,10 +845,11 @@ impl WebView {
                     response_sent: false,
                 })
             },
-            EmbedderControlRequest::ColorPicker(current_color) => {
+            EmbedderControlRequest::ColorPicker(current_color, alpha) => {
                 EmbedderControl::ColorPicker(ColorPicker {
                     id: control_id,
                     current_color: Some(current_color),
+                    alpha,
                     position,
                     constellation_proxy,
                     response_sent: false,

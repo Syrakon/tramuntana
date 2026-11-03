@@ -35,8 +35,9 @@ pub struct EmbedderControlId {
 pub enum EmbedderControlRequest {
     /// Indicates that the user has activated a `<select>` element.
     SelectElement(SelectElementRequest),
-    /// Indicates that the user has activated a `<input type=color>` element.
-    ColorPicker(RgbColor),
+    /// Indicates that the user has activated a `<input type=color>` element. It carries the
+    /// element's color and, when the element has an `alpha` attribute, its opacity from 0 to 1.
+    ColorPicker(RgbColor, Option<f32>),
     /// Indicates that the user has activated a `<input type=file>` element.
     FilePicker(FilePickerRequest),
     /// Indicates that the user has activated a `<input type=date>`, `<input type=month>`,
@@ -213,7 +214,9 @@ pub struct SelectElementRequest {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum EmbedderControlResponse {
     SelectElement(Vec<usize>),
-    ColorPicker(Option<RgbColor>),
+    /// The color the user picked, or `None` to leave the element as it is, and the opacity
+    /// picked, from 0 to 1, when the request carried one.
+    ColorPicker(Option<RgbColor>, Option<f32>),
     FilePicker(Option<Vec<SelectedFile>>),
     /// The value the user picked, in the format of the request's [`DatePickerKind`], or
     /// `None` if the picker was dismissed.

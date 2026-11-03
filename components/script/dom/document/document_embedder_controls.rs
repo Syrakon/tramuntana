@@ -228,9 +228,9 @@ impl DocumentEmbedderControls {
             },
             (
                 ControlElement::ColorInput(input_element),
-                EmbedderControlResponse::ColorPicker(response),
+                EmbedderControlResponse::ColorPicker(response, alpha),
             ) => {
-                input_element.handle_color_picker_response(cx, response);
+                input_element.handle_color_picker_response(cx, response, alpha);
             },
             (
                 ControlElement::DateInput(input_element),

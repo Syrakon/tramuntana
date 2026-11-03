@@ -48,15 +48,27 @@ impl ColorInputType {
         cx: &mut js::context::JSContext,
         input: &HTMLInputElement,
         response: Option<RgbColor>,
+        alpha: Option<f32>,
     ) {
         let Some(selected_color) = response else {
             return;
         };
 
-        let formatted_color = format!(
-            "#{:0>2x}{:0>2x}{:0>2x}",
-            selected_color.red, selected_color.green, selected_color.blue
-        );
+        // An opacity is only kept by an element with an `alpha` attribute. Either way the
+        // value is sanitized into the element's own serialization when it is set.
+        let formatted_color = match alpha.filter(|_| input.Alpha()) {
+            Some(alpha) => format!(
+                "rgb({} {} {} / {})",
+                selected_color.red,
+                selected_color.green,
+                selected_color.blue,
+                alpha.clamp(0.0, 1.0)
+            ),
+            None => format!(
+                "#{:0>2x}{:0>2x}{:0>2x}",
+                selected_color.red, selected_color.green, selected_color.blue
+            ),
+        };
         // The user picked it: `input` and `change` fire, as for a typed and committed value.
         input.commit_picked_value(cx, formatted_color.into());
     }
@@ -181,14 +193,17 @@ impl SpecificInputType for ColorInputType {
         let current_value = input.Value();
         let current_color =
             parse_color_value(&current_value.str()).to_color_space(ColorSpace::Srgb);
+        let current_alpha = current_color.alpha.clamp(0.0, 1.0);
         let current_color = RgbColor {
             red: (current_color.components.0 * 255.0).round() as u8,
             green: (current_color.components.1 * 255.0).round() as u8,
             blue: (current_color.components.2 * 255.0).round() as u8,
         };
+        // The opacity is offered to the user only when the element keeps one.
+        let alpha = input.Alpha().then_some(current_alpha);
         document.embedder_controls().show_embedder_control(
             ControlElement::ColorInput(Dom::from_ref(input)),
-            EmbedderControlRequest::ColorPicker(current_color),
+            EmbedderControlRequest::ColorPicker(current_color, alpha),
             None,
         );
     }

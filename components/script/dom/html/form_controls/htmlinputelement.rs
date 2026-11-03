@@ -2069,9 +2069,10 @@ impl HTMLInputElement {
         &self,
         cx: &mut JSContext,
         response: Option<RgbColor>,
+        alpha: Option<f32>,
     ) {
         if let InputType::Color(ref color_input_type) = *self.input_type() {
-            color_input_type.handle_color_picker_response(cx, self, response)
+            color_input_type.handle_color_picker_response(cx, self, response, alpha)
         }
     }
 

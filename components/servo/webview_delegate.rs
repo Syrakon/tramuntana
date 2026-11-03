@@ -577,6 +577,7 @@ impl Drop for SelectElement {
 pub struct ColorPicker {
     pub(crate) id: EmbedderControlId,
     pub(crate) current_color: Option<RgbColor>,
+    pub(crate) alpha: Option<f32>,
     pub(crate) position: DeviceIntRect,
     pub(crate) constellation_proxy: ConstellationProxy,
     pub(crate) response_sent: bool,
@@ -607,13 +608,28 @@ impl ColorPicker {
         self.current_color = color;
     }
 
+    /// The opacity selected for this [`ColorPicker`], from 0 to 1. It is `Some` only when the
+    /// `<input>` element keeps an opacity, because it has an `alpha` attribute: the embedder
+    /// should offer to change it only then. This is initially the opacity of the element's
+    /// color before the picker is opened.
+    pub fn alpha(&self) -> Option<f32> {
+        self.alpha
+    }
+
+    /// Set the selected opacity, from 0 to 1. It is ignored when [`Self::alpha`] is `None`.
+    pub fn select_alpha(&mut self, alpha: f32) {
+        if self.alpha.is_some() {
+            self.alpha = Some(alpha.clamp(0.0, 1.0));
+        }
+    }
+
     /// Resolve the prompt with the options that have been selected by calling [`Self::select`] previously.
     pub fn submit(mut self) {
         self.response_sent = true;
         self.constellation_proxy
             .send(EmbedderToConstellationMessage::EmbedderControlResponse(
                 self.id,
-                EmbedderControlResponse::ColorPicker(self.current_color),
+                EmbedderControlResponse::ColorPicker(self.current_color, self.alpha),
             ));
     }
 }
@@ -624,7 +640,7 @@ impl Drop for ColorPicker {
             self.constellation_proxy
                 .send(EmbedderToConstellationMessage::EmbedderControlResponse(
                     self.id,
-                    EmbedderControlResponse::ColorPicker(self.current_color),
+                    EmbedderControlResponse::ColorPicker(self.current_color, self.alpha),
                 ));
         }
     }
