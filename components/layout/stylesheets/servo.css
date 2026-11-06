@@ -54,55 +54,57 @@ input[type="radio"]:disabled {
   border: none;
 }
 
-/* FIXME(#36982): Use `display: block; align-content: center` instead of flex. */
-input::-servo-text-control-inner-container {
-  display: flex;
-  /* Centre the value vertically. `align-items: center` (unlike the previous
-     `margin-block: auto` on the editor) keeps the text centred even when its
-     line box is taller than the field's content box — `margin: auto` collapses
-     to 0 when there is no free space, which top-aligned the text and let the
-     bottom half / descenders overflow into the input's `overflow: clip` and get
-     cut off (e.g. Google's search box). */
-  align-items: center;
+/* The text control is laid out as Chromium lays it out: the editor fills the
+   field, and the placeholder lies over it in the same place, not beside it.
+   Both share the one cell of a grid, so a page that styles either one (its
+   padding, its line height, its alignment) sees it where Chromium puts it.
+   The cell is centred vertically in an <input>, as Chromium centres the
+   editor; if the text is taller than the field it overflows both edges
+   evenly instead of being cut at the bottom (e.g. Google's search box). */
+input::-servo-text-control-inner-container,
+textarea::-servo-text-control-inner-container {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   height: stretch;
   pointer-events: none;
   position: relative;
 }
 
-input::-servo-text-control-inner-editor,
-input::placeholder {
-  /* This limits the block size of the inner div to that of the text size so that
-     it can be centered in the container. This is only necessary for <input>. */
-  block-size: fit-content !important;
-  white-space: pre;
+input::-servo-text-control-inner-container {
+  align-items: center;
+}
+
+textarea::-servo-text-control-inner-container {
+  align-items: start;
 }
 
 input::-servo-text-control-inner-editor,
 input::placeholder,
 textarea::-servo-text-control-inner-editor,
 textarea::placeholder {
-  min-width: stretch;
+  grid-area: 1 / 1;
+  min-width: 0;
   overflow-wrap: normal;
+}
+
+input::-servo-text-control-inner-editor,
+input::placeholder {
+  /* Only as tall as the text, so that it can be centred in the field. */
+  block-size: fit-content !important;
+  white-space: pre;
+}
+
+/* Chromium's `input::placeholder`: its own line height never moves it off
+   the editor's line, and what does not fit is cut. */
+input::placeholder {
+  line-height: initial !important;
+  overflow: hidden;
 }
 
 input:not(:placeholder-shown)::placeholder,
 textarea:not(:placeholder-shown)::placeholder {
   display: none !important;
-}
-
-/* The editor stays in the box while the placeholder shows: the caret is painted
-   in it, and a focused empty field with no caret looks as if it took no typing.
-   It is given no room, so the placeholder starts where the caret is. */
-input:placeholder-shown::-servo-text-control-inner-editor {
-  flex: none !important;
-  inline-size: 0 !important;
-  min-width: 0 !important;
-  overflow: visible !important;
-}
-
-textarea:placeholder-shown::-servo-text-control-inner-editor {
-  block-size: 0 !important;
-  overflow: visible !important;
 }
 
 input::placeholder,
