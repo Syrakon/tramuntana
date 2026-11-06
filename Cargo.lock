@@ -8513,6 +8513,8 @@ dependencies = [
  "servo-net-traits",
  "servo-profile-traits",
  "servo-url",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
  "uuid",
 ]
 
@@ -8720,6 +8722,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "parking_lot",
+ "peniko",
  "phf 0.14.0",
  "quickcheck",
  "rayon",
@@ -8755,6 +8758,7 @@ dependencies = [
  "unicode_categories",
  "url",
  "uuid",
+ "vello_cpu 0.2.0",
  "web_atoms",
  "webrender_api",
 ]
