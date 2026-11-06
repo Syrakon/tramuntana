@@ -124,6 +124,8 @@ pub(crate) struct ImageFragment {
     pub clip: PhysicalRect<Au>,
     pub image_key: Option<ImageKey>,
     pub showing_broken_image_icon: bool,
+    /// Whether the image is a dark icon, painted inverted on a darkened page.
+    pub dark_icon: bool,
     pub url: Option<ServoUrl>,
     /// The intrinsic (natural) width of the image, if known.
     pub natural_width: Option<Au>,

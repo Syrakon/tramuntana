@@ -888,13 +888,25 @@ pub enum Theme {
     Light,
     /// Dark theme.
     Dark,
+    /// Dark theme, and a page that stays light anyway (it offers no dark
+    /// scheme of its own) has its colours darkened when it is painted: light
+    /// backgrounds turn dark and dark text turns light. Images are left alone.
+    /// Pages see this as `prefers-color-scheme: dark`.
+    ForcedDark,
+}
+
+impl Theme {
+    /// Whether light pages are darkened when they are painted.
+    pub fn darkens_light_pages(self) -> bool {
+        self == Theme::ForcedDark
+    }
 }
 
 impl From<Theme> for PrefersColorScheme {
     fn from(value: Theme) -> Self {
         match value {
             Theme::Light => PrefersColorScheme::Light,
-            Theme::Dark => PrefersColorScheme::Dark,
+            Theme::Dark | Theme::ForcedDark => PrefersColorScheme::Dark,
         }
     }
 }

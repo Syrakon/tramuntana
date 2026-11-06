@@ -82,14 +82,14 @@ use style::{Zero, driver};
 use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
 use url::Url;
-use webrender_api::ExternalScrollId;
+use webrender_api::{ExternalScrollId, ImageKey};
 use webrender_api::units::{DevicePixel, LayoutVector2D};
 
 use crate::accessibility::{AccessibilityContext, AccessibilityDamageMap, AccessibilityTree};
 use crate::context::{CachedImageOrError, ImageResolver, LayoutContext};
 use crate::counters::CounterValues;
 use crate::display_list::{
-    DisplayListBuilder, HitTest, PaintTimingHandler, StackingContextTree, TextMasks,
+    DisplayListBuilder, HitTest, PageCanvas, PaintTimingHandler, StackingContextTree, TextMasks,
 };
 use crate::dom::NodeExt;
 use crate::query::{
@@ -143,6 +143,10 @@ pub struct LayoutThread {
 
     /// Is the current reflow of an iframe, as opposed to a root window?
     is_iframe: bool,
+
+    /// Whether a page that stays light is darkened when it is painted, as
+    /// asked by the embedder through `Theme::ForcedDark`.
+    darken_light_pages: bool,
 
     /// The channel on which messages can be sent to the time profiler.
     time_profiler_chan: profile_time::ProfilerChan,
@@ -213,6 +217,9 @@ pub struct LayoutThread {
     // for `background-image` or `content` properties) to either the final resolved
     // image data, or an error if the image cache failed to load/decode the image.
     resolved_images_cache: Arc<RwLock<HashMap<ServoUrl, CachedImageOrError>>>,
+
+    /// Which images, by key, are dark icons (see `ImageResolver::dark_icons`).
+    dark_icons: Arc<RwLock<HashMap<ImageKey, bool>>>,
 
     /// The executors for paint worklets.
     registered_painters: RegisteredPaintersImpl,
@@ -285,14 +292,15 @@ impl Layout for LayoutThread {
         self.stylist.device()
     }
 
-    fn set_theme(&mut self, theme: Theme) -> bool {
+    fn set_theme(&mut self, theme: Theme, darken_light_pages: bool) -> bool {
         let theme: PrefersColorScheme = theme.into();
         let device = self.stylist.device_mut();
-        if theme == device.color_scheme() {
+        if theme == device.color_scheme() && darken_light_pages == self.darken_light_pages {
             return false;
         }
 
         device.set_color_scheme(theme);
+        self.darken_light_pages = darken_light_pages;
         self.device_has_changed = true;
         true
     }
@@ -896,6 +904,7 @@ impl LayoutThread {
             webview_id: config.webview_id,
             url: config.url,
             is_iframe: config.is_iframe,
+            darken_light_pages: false,
             time_profiler_chan: config.time_profiler_chan,
             embedder_chan: config.embedder_chan.clone(),
             registered_painters: RegisteredPaintersImpl(Default::default()),
@@ -920,6 +929,7 @@ impl LayoutThread {
             paint_api: config.paint_api,
             stylist: Stylist::new(device, QuirksMode::NoQuirks),
             resolved_images_cache: Default::default(),
+            dark_icons: Default::default(),
             debug: opts::get().debug.clone(),
             previously_highlighted_dom_node: Cell::new(None),
             paint_timing_handler: Default::default(),
@@ -1140,6 +1150,8 @@ impl LayoutThread {
             pending_svg_elements_for_serialization: Mutex::default(),
             animating_images: reflow_request.animating_images.clone(),
             animation_timeline_value: reflow_request.animation_timeline_value,
+            darken_light_pages: self.darken_light_pages,
+            dark_icons: self.dark_icons.clone(),
         });
         let mut reflow_statistics = Default::default();
 
@@ -1711,6 +1723,11 @@ impl LayoutThread {
             reflow_statistics,
             &mut text_masks,
             reflow_request.frame_focused,
+            PageCanvas {
+                device: self.device(),
+                is_iframe: self.is_iframe,
+                darken_light_pages: self.darken_light_pages,
+            },
         );
 
         stacking_context_tree.paint_info.paint_timing_info = reflow_request.paint_timing_info;

@@ -42,6 +42,7 @@ use style::values::computed::{
 use style::values::generics::NonNegative;
 use style::values::generics::color::ColorOrAuto;
 use style::values::generics::rect::Rect as StyleRect;
+use style::values::specified::color::ColorSchemeFlags;
 use style::values::specified::text::TextDecorationLine;
 use style_traits::{CSSPixel as StyloCSSPixel, DevicePixel as StyloDevicePixel};
 use webrender_api::units::{
@@ -59,6 +60,7 @@ use wr::units::LayoutVector2D;
 use crate::context::{ImageResolver, ResolvedImage};
 use crate::display_list::background::BackgroundPainter;
 use crate::display_list::conversions::FilterToWebRender;
+use crate::display_list::darkening::{ColorRole, DarkeningScope};
 pub(crate) use crate::display_list::conversions::ToWebRender;
 use crate::display_list::paint_traversal::{PaintTraversal, PaintTraversalHandler, TraversalState};
 use crate::fragment_tree::{
@@ -75,6 +77,8 @@ use crate::style_ext::{BorderStyleColor, ComputedValuesExt};
 mod background;
 mod clip;
 mod conversions;
+mod darkening;
+pub(crate) use darkening::is_dark_icon;
 mod gradient;
 mod hit_test;
 mod paint_timing_handler;
@@ -154,6 +158,10 @@ pub(crate) struct DisplayListBuilder<'a> {
     /// The background color used for the shell.
     shell_background_color: AbsoluteColor,
 
+    /// The colour painted under a top-level document whose root paints no
+    /// background of its own. `None` for an iframe, which stays transparent.
+    canvas_color: Option<AbsoluteColor>,
+
     /// Whether or not the `WebView` this display list is being rendered for has system focus
     /// and is the focused frame in the frame tree.
     frame_focused: bool,
@@ -210,6 +218,7 @@ impl DisplayListBuilder<'_> {
         reflow_statistics: &mut ReflowStatistics,
         text_masks: &mut TextMasks,
         frame_focused: bool,
+        page_canvas: PageCanvas<'_>,
     ) -> BuiltDisplayList {
         // Build the rest of the display list which inclues all of the WebRender primitives.
         let paint_info = &mut stacking_context_tree.paint_info;
@@ -238,6 +247,22 @@ impl DisplayListBuilder<'_> {
             .into_srgb_legacy()
         };
 
+        // The canvas of the page: its propagated root background, or, when that is
+        // transparent, the `Canvas` colour of the root's used colour scheme.
+        let root_color_scheme = fragment_tree
+            .root_box_fragment()
+            .map(|fragment| fragment.style().get_inherited_ui().color_scheme_bits())
+            .unwrap_or_else(ColorSchemeFlags::empty);
+        let default_canvas = page_canvas.device.canvas_color(root_color_scheme);
+        let canvas_color = (!page_canvas.is_iframe).then_some(default_canvas);
+        let page_color = root_background_style(fragment_tree)
+            .map(|style| style.resolve_color(&style.get_background().background_color))
+            .filter(|color| color.alpha > 0.0)
+            .unwrap_or(default_canvas);
+        let _darkening = DarkeningScope::enter(
+            page_canvas.darken_light_pages && darkening::is_light_canvas(page_color),
+        );
+
         let _span = profile_traits::trace_span!("DisplayListBuilder::build").entered();
         let mut builder = DisplayListBuilder {
             fragment_tree,
@@ -255,6 +280,7 @@ impl DisplayListBuilder<'_> {
             largest_contentful_paint_enabled: pref!(largest_contentful_paint_enabled),
             container_timing_enabled: pref!(container_timing_enabled),
             shell_background_color,
+            canvas_color,
             frame_focused,
         };
 
@@ -284,6 +310,31 @@ impl DisplayListBuilder<'_> {
         builder.paint_dom_inspector_highlight();
 
         webrender_display_list_builder.end().1
+    }
+
+    /// Open a stacking context that paints a dark icon inverted, when the
+    /// display list is darkened (see [`darkening`]). Returns whether it was
+    /// opened, in which case the caller pops it after the image.
+    fn push_dark_icon_filter(&mut self, state: &TraversalState, dark_icon: bool) -> bool {
+        if !dark_icon || !darkening::is_active() {
+            return false;
+        }
+        let spatial_id = self.spatial_id(state.spatial_id);
+        // Inverting turns the dark ink light; turning the hue half way round
+        // brings the hue of a tinted ink back to where it was.
+        self.wr().push_stacking_context(
+            spatial_id,
+            PrimitiveFlags::empty(),
+            None,
+            TransformStyle::Flat,
+            MixBlendMode::Normal,
+            &[wr::FilterOp::Invert(1.0), wr::FilterOp::HueRotate(180.0)],
+            &[],
+            RasterSpace::Screen,
+            StackingContextFlags::empty(),
+            None,
+        );
+        true
     }
 
     fn wr(&mut self) -> &mut wr::DisplayListBuilder {
@@ -1012,6 +1063,7 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         let common = self.common_properties(state, clip, &style);
 
         if let Some(image_key) = fragment.image_key {
+            let inverted = self.push_dark_icon_filter(state, fragment.dark_icon);
             self.wr().push_image(
                 &common,
                 rect,
@@ -1020,6 +1072,9 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                 image_key,
                 wr::ColorF::WHITE,
             );
+            if inverted {
+                self.wr().pop_stacking_context();
+            }
 
             self.paint_timing_handler
                 .check_if_paintable(rect, style.slow_clone_opacity());
@@ -1076,7 +1131,7 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                 self.wr().push_rect(
                     &common,
                     containing_block.to_webrender(),
-                    rgba(background_color),
+                    rgba(background_color, ColorRole::Background),
                 );
             }
         }
@@ -1112,29 +1167,13 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         };
         let fragment = fragment.with_style();
 
-        let source_style = {
-            // > For documents whose root element is an HTML HTML element or an XHTML html element
-            // > [HTML]: if the computed value of background-image on the root element is none and its
-            // > background-color is transparent, user agents must instead propagate the computed
-            // > values of the background properties from that element’s first HTML BODY or XHTML body
-            // > child element.
-            let root_fragment_style = fragment.style();
-            if root_fragment_style.background_is_transparent() {
-                let body_fragment = self.fragment_tree.body_fragment();
-                self.paint_body_background = body_fragment.is_none();
-                body_fragment
-                    .map(|body_fragment| body_fragment.style().clone())
-                    .unwrap_or(fragment.style().clone())
-            } else {
-                root_fragment_style.clone()
-            }
-        };
-
-        // This can happen if the root fragment does not have a `<body>` child (either because it is
-        // `display: none` or `display: contents`) or if the `<body>`'s background is transparent.
-        if source_style.background_is_transparent() {
-            return;
+        // See `root_background_style` for the propagation from `<body>`.
+        let root_fragment_style = fragment.style();
+        if root_fragment_style.background_is_transparent() {
+            self.paint_body_background = self.fragment_tree.body_fragment().is_none();
         }
+        let source_style = root_background_style(self.fragment_tree)
+            .unwrap_or_else(|| root_fragment_style.clone());
 
         // The painting area is theoretically the infinite 2D plane,
         // but we need a rectangle with finite coordinates.
@@ -1150,9 +1189,30 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
 
         let background_color =
             source_style.resolve_color(&source_style.get_background().background_color);
+
+        // Under a background that does not cover it, a top-level document has a
+        // canvas in the colour of its used colour scheme: white for a page that
+        // knows nothing of colour schemes, whatever colour the shell clears to.
+        // <https://drafts.csswg.org/css-color-adjust/#color-scheme-effect>
+        // It is not first paint, so it does not mark the document paintable.
+        if let Some(canvas_color) = self.canvas_color.filter(|_| background_color.alpha < 1.0) {
+            let common = self.common_properties(state, painting_area, &source_style);
+            self.wr().push_rect(
+                &common,
+                painting_area,
+                rgba(canvas_color, ColorRole::Background),
+            );
+        }
+
+        // This can happen if the root fragment does not have a `<body>` child (either because it is
+        // `display: none` or `display: contents`) or if the `<body>`'s background is transparent.
+        if source_style.background_is_transparent() {
+            return;
+        }
+
         if background_color.alpha > 0.0 {
             let common = self.common_properties(state, painting_area, &source_style);
-            let color = rgba(background_color);
+            let color = rgba(background_color, ColorRole::Background);
             self.wr().push_rect(&common, painting_area, color);
 
             // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
@@ -1306,7 +1366,10 @@ impl Fragment {
                 },
                 wr::Shadow {
                     offset: LayoutVector2D::new(shadow.horizontal.px(), shadow.vertical.px()),
-                    color: rgba(shadow.color.resolve_to_absolute(&color)),
+                    color: rgba(
+                        shadow.color.resolve_to_absolute(&color),
+                        ColorRole::Background,
+                    ),
                     blur_radius: shadow.blur.px(),
                 },
                 true, /* should_inflate */
@@ -1356,7 +1419,7 @@ impl Fragment {
             glyph_bounds,
             &glyphs,
             fragment.font_key,
-            rgba(fill_color),
+            rgba(fill_color, ColorRole::Foreground),
             None,
         );
 
@@ -1466,7 +1529,7 @@ impl Fragment {
             &expand_rect_for_text_decoration(rect),
             wavy_line_thickness,
             wr::LineOrientation::Horizontal,
-            &rgba(text_decoration.color),
+            &rgba(text_decoration.color, ColorRole::Foreground),
             text_decoration.style.to_webrender(),
         );
 
@@ -1483,7 +1546,7 @@ impl Fragment {
                 &rect,
                 wavy_line_thickness,
                 wr::LineOrientation::Horizontal,
-                &rgba(text_decoration.color),
+                &rgba(text_decoration.color, ColorRole::Foreground),
                 text_decoration.style.to_webrender(),
             );
         }
@@ -1615,7 +1678,7 @@ impl Fragment {
             let selection_common = builder.common_properties(state, selection_rect, &parent_style);
             builder
                 .wr()
-                .push_rect(&selection_common, selection_rect, rgba(*selection_color));
+                .push_rect(&selection_common, selection_rect, rgba(*selection_color, ColorRole::Background));
 
             return;
         }
@@ -1647,7 +1710,7 @@ impl Fragment {
         let insertion_point_common =
             builder.common_properties(state, insertion_point_rect, &parent_style);
 
-        let caret_color = rgba(caret_color);
+        let caret_color = rgba(caret_color, ColorRole::Foreground);
         let property_binding = if prefs::get().editing_caret_blink_time().is_some() {
             // It's okay to always use the same property binding key for this pipeline, as
             // there is currently only a single thing that animates in this way (the caret).
@@ -1948,7 +2011,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             let common = painter.common_properties(self, builder, state, layer_index, bounds);
             builder
                 .wr()
-                .push_rect(&common, bounds, rgba(background_color));
+                .push_rect(&common, bounds, rgba(background_color, ColorRole::Background));
 
             // From <https://www.w3.org/TR/paint-timing/#sec-terminology>:
             // First paint ... includes non-default background paint and the enclosing box of an iframe.
@@ -2108,7 +2171,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                             }
                         },
                         ResolvedImage::Color(color) => {
-                            let color = rgba(style.resolve_color(color));
+                            let color = rgba(style.resolve_color(color), ColorRole::Background);
                             builder.wr().push_rect(&layer.common, layer.bounds, color);
                         },
                         _ => {},
@@ -2141,7 +2204,9 @@ impl<'a> BuilderForBoxFragment<'a> {
                         .to_i32()
                     });
 
-                    let Some(image_key) = builder.image_resolver.image_key_from_cached_image(
+                    let Some((image_key, dark_icon)) = builder
+                        .image_resolver
+                        .image_key_and_dark_icon_from_cached_image(
                         &image,
                         preferred_size.unwrap_or(default_size),
                         node,
@@ -2154,6 +2219,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                         if needs_blending {
                             push_stacking_context(builder, layer.blend_mode, Default::default());
                         }
+                        let inverted = builder.push_dark_icon_filter(state, dark_icon);
 
                         if layer.repeat {
                             builder.wr().push_repeating_image(
@@ -2177,6 +2243,9 @@ impl<'a> BuilderForBoxFragment<'a> {
                             )
                         }
 
+                        if inverted {
+                            builder.wr().pop_stacking_context();
+                        }
                         if needs_blending {
                             builder.wr().pop_stacking_context();
                         }
@@ -2224,7 +2293,7 @@ impl<'a> BuilderForBoxFragment<'a> {
 
     fn build_border_side(&self, style_color: BorderStyleColor) -> wr::BorderSide {
         wr::BorderSide {
-            color: rgba(style_color.color),
+            color: rgba(style_color.color, ColorRole::Border),
             style: match style_color.style {
                 BorderStyle::None => wr::BorderStyle::None,
                 BorderStyle::Solid => wr::BorderStyle::Solid,
@@ -2430,7 +2499,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             Ok(ResolvedImage::Color(color)) => {
                 // NinePatchBorderSource doesn't support a lone color, so pretend that
                 // its a linear gradient.
-                let color = rgba(style.resolve_color(color));
+                let color = rgba(style.resolve_color(color), ColorRole::Border);
                 let gradient = builder.wr().create_gradient(
                     Point2D::zero(),
                     Point2D::zero(),
@@ -2573,7 +2642,10 @@ impl<'a> BuilderForBoxFragment<'a> {
                 &common,
                 rect,
                 offset,
-                rgba(style.resolve_color(&box_shadow.base.color)),
+                rgba(
+                    style.resolve_color(&box_shadow.base.color),
+                    ColorRole::Background,
+                ),
                 blur,
                 spread,
                 border_radius,
@@ -2584,8 +2656,44 @@ impl<'a> BuilderForBoxFragment<'a> {
     }
 }
 
-fn rgba(color: AbsoluteColor) -> wr::ColorF {
-    let rgba = color.to_color_space(ColorSpace::Srgb);
+/// What the display list needs to know about the page beyond its fragments,
+/// to paint its canvas and decide whether to darken it.
+pub(crate) struct PageCanvas<'a> {
+    /// The device the page is styled for, which knows the `Canvas` colours.
+    pub device: &'a style::device::Device,
+    /// Whether the page is in an iframe, whose canvas stays transparent.
+    pub is_iframe: bool,
+    /// Whether a page that stays light is darkened (see [`darkening`]).
+    pub darken_light_pages: bool,
+}
+
+/// The style whose background paints the canvas, if the page has a root.
+///
+/// > For documents whose root element is an HTML HTML element or an XHTML html element
+/// > [HTML]: if the computed value of background-image on the root element is none and its
+/// > background-color is transparent, user agents must instead propagate the computed
+/// > values of the background properties from that element’s first HTML BODY or XHTML body
+/// > child element.
+///
+/// <https://drafts.csswg.org/css-backgrounds/#body-background>
+fn root_background_style(fragment_tree: &FragmentTree) -> Option<ServoArc<ComputedValues>> {
+    let fragment = fragment_tree.root_box_fragment()?;
+    let root_style = fragment.style();
+    if !root_style.background_is_transparent() {
+        return Some(root_style.clone());
+    }
+    Some(
+        fragment_tree
+            .body_fragment()
+            .map(|body_fragment| body_fragment.style().clone())
+            .unwrap_or_else(|| root_style.clone()),
+    )
+}
+
+/// The WebRender colour for a colour of the page, darkened for its role when
+/// the display list being built is darkened (see [`darkening`]).
+fn rgba(color: AbsoluteColor, role: ColorRole) -> wr::ColorF {
+    let rgba = darkening::darkened(color, role).to_color_space(ColorSpace::Srgb);
     wr::ColorF::new(
         rgba.components.0.clamp(0.0, 1.0),
         rgba.components.1.clamp(0.0, 1.0),

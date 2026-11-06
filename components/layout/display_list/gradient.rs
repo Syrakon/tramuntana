@@ -425,7 +425,7 @@ fn create_webrender_stops(
     stops
         .iter()
         .map(|stop| wr::GradientStop {
-            color: super::rgba(stop.color),
+            color: super::rgba(stop.color, super::ColorRole::Background),
             offset: stop.position,
         })
         .collect()
@@ -603,7 +603,7 @@ fn interpolate_gradient_stop_colors(
             );
 
             output.push(wr::GradientStop {
-                color: super::rgba(color),
+                color: super::rgba(color, super::ColorRole::Background),
                 offset: position,
             });
         }

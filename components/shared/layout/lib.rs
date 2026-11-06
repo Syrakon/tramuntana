@@ -296,10 +296,12 @@ pub trait Layout {
     /// resolve font metrics.
     fn device(&self) -> &Device;
 
-    /// Set the theme on this [`Layout`]'s [`Device`]. The caller should also trigger a
-    /// new layout when this happens, though it can happen later. Returns `true` if the
-    /// [`Theme`] actually changed or `false` otherwise.
-    fn set_theme(&mut self, theme: Theme) -> bool;
+    /// Set the theme on this [`Layout`]'s [`Device`], and whether a page that
+    /// stays light is darkened when it is painted (see [`Theme::ForcedDark`]).
+    /// The caller should also trigger a new layout when this happens, though it
+    /// can happen later. Returns `true` if either actually changed or `false`
+    /// otherwise.
+    fn set_theme(&mut self, theme: Theme, darken_light_pages: bool) -> bool;
 
     /// Set the [`ViewportDetails`] on this [`Layout`]'s [`Device`]. The caller should also
     /// trigger a new layout when this happens, though it can happen later. Returns `true`

@@ -152,6 +152,14 @@ pub(crate) struct ImageResolver {
 
     /// The current animation timeline value used to properly initialize animating images.
     pub animation_timeline_value: f64,
+
+    /// Whether the page may be darkened (see `display_list::darkening`), in
+    /// which case images are classified as dark icons or not.
+    pub darken_light_pages: bool,
+
+    /// Which images, by key, are dark icons. Kept by the layout thread, so an
+    /// image is classified once.
+    pub dark_icons: Arc<RwLock<HashMap<ImageKey, bool>>>,
 }
 
 impl Drop for ImageResolver {
@@ -285,6 +293,43 @@ impl ImageResolver {
                 });
         }
         result
+    }
+
+    /// Whether `image` should be painted inverted on a darkened page. Always
+    /// `false` when the page may not be darkened.
+    pub(crate) fn is_dark_icon(&self, image: &RasterImage) -> bool {
+        if !self.darken_light_pages {
+            return false;
+        }
+        let Some(key) = image.id else {
+            return false;
+        };
+        if let Some(known) = self.dark_icons.read().get(&key) {
+            return *known;
+        }
+        let dark_icon = crate::display_list::is_dark_icon(image);
+        self.dark_icons.write().insert(key, dark_icon);
+        dark_icon
+    }
+
+    /// Resolve a cached image to a WebRender [`ImageKey`], with whether it is a
+    /// dark icon (see [`Self::is_dark_icon`]).
+    pub(crate) fn image_key_and_dark_icon_from_cached_image(
+        &self,
+        image: &CachedImage,
+        size: DeviceIntSize,
+        node: Option<OpaqueNode>,
+    ) -> Option<(ImageKey, bool)> {
+        match image {
+            CachedImage::Raster(raster_image) => {
+                Some((raster_image.id?, self.is_dark_icon(raster_image)))
+            },
+            CachedImage::Vector(vector_image) => node.and_then(|node| {
+                let rasterized =
+                    self.rasterize_vector_image(vector_image.id, size, node, vector_image.svg_id)?;
+                Some((rasterized.id?, self.is_dark_icon(&rasterized)))
+            }),
+        }
     }
 
     /// Resolve a cached image to a WebRender [`ImageKey`]

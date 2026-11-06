@@ -534,13 +534,15 @@ impl ReplacedContents {
                         object_fit_size.width.scale_by(scale.0).to_px(),
                         object_fit_size.height.scale_by(scale.0).to_px(),
                     );
-                    layout_context.image_resolver.image_key_from_cached_image(
-                        image,
-                        size,
-                        self.base_fragment_info.tag.map(|tag| tag.node),
-                    )
+                    layout_context
+                        .image_resolver
+                        .image_key_and_dark_icon_from_cached_image(
+                            image,
+                            size,
+                            self.base_fragment_info.tag.map(|tag| tag.node),
+                        )
                 })
-                .map(|image_key| {
+                .map(|(image_key, dark_icon)| {
                     Fragment::Image(Arc::new(ImageFragment {
                         base,
                         style: style.clone().into(),
@@ -548,6 +550,7 @@ impl ReplacedContents {
                         clip,
                         image_key: Some(image_key),
                         showing_broken_image_icon: image_info.showing_broken_image_icon,
+                        dark_icon,
                         url: image_info.url.clone(),
                         natural_width: self.natural_size.width,
                         natural_height: self.natural_size.height,
@@ -564,6 +567,7 @@ impl ReplacedContents {
                     clip,
                     image_key: video_info.image_key,
                     showing_broken_image_icon: false,
+                    dark_icon: false,
                     url: video_info.poster_url.clone(),
                     natural_width: self.natural_size.width,
                     natural_height: self.natural_size.height,
@@ -610,6 +614,7 @@ impl ReplacedContents {
                     clip,
                     image_key: Some(image_key),
                     showing_broken_image_icon: false,
+                    dark_icon: false,
                     url: None,
                     natural_width: self.natural_size.width,
                     natural_height: self.natural_size.height,
@@ -658,8 +663,11 @@ impl ReplacedContents {
                         tag.node,
                         vector_image.svg_id,
                     )
-                    .and_then(|image| image.id)
-                    .map(|image_key| {
+                    .and_then(|image| {
+                        let dark_icon = layout_context.image_resolver.is_dark_icon(&image);
+                        Some((image.id?, dark_icon))
+                    })
+                    .map(|(image_key, dark_icon)| {
                         Fragment::Image(Arc::new(ImageFragment {
                             base,
                             style: style.clone().into(),
@@ -667,6 +675,7 @@ impl ReplacedContents {
                             clip,
                             image_key: Some(image_key),
                             showing_broken_image_icon: false,
+                            dark_icon,
                             url: None,
                             natural_width: self.natural_size.width,
                             natural_height: self.natural_size.height,
