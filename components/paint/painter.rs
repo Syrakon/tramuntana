@@ -1077,6 +1077,12 @@ impl Painter {
         let details = webview_renderer.ensure_pipeline_details(pipeline_id.into());
 
         details.install_new_scroll_tree(display_list_info.scroll_tree);
+        // Before its first display list a pipeline has no scale of its own, and
+        // `old_scale` above fell back to the current page zoom. The root
+        // display list may have been built at another one: a page zoom set
+        // between the frame tree switching to this pipeline and its first
+        // display list resends nothing by itself.
+        let first_display_list = details.viewport_scale.is_none();
         details.viewport_scale = Some(display_list_info.viewport_details.hidpi_scale_factor);
 
         let epoch = display_list_info.epoch.into();
@@ -1121,7 +1127,9 @@ impl Painter {
 
         let mut transaction = Transaction::new();
         let is_root_pipeline = Some(pipeline_id.into()) == webview_renderer.root_pipeline_id;
-        if is_root_pipeline && old_scale != webview_renderer.device_pixels_per_page_pixel() {
+        if is_root_pipeline &&
+            (first_display_list || old_scale != webview_renderer.device_pixels_per_page_pixel())
+        {
             self.send_root_pipeline_display_list_in_transaction(&mut transaction);
         }
 
