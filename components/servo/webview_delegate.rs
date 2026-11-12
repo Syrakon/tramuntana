@@ -8,7 +8,7 @@ use std::rc::Rc;
 use embedder_traits::{
     AlertResponse, AllowOrDeny, AuthenticationResponse, BluetoothDeviceDescription,
     ConfirmResponse, ConsoleLogLevel, ContextMenuAction, ContextMenuElementInformation,
-    ContextMenuItem, Cursor, DataListOption, EmbedderControlId, EmbedderControlResponse, FilePickerRequest, DatePickerKind,
+    ContextMenuItem, Cursor, DataListOption, Download, EmbedderControlId, EmbedderControlResponse, FilePickerRequest, DatePickerKind,
     FilterPattern, InputEventId, InputEventResult, InputMethodType, LoadStatus, MediaSessionEvent,
     NewWebViewDetails, Notification, PasskeyOperation, PasskeyResponse, PermissionFeature,
     PromptResponse, RgbColor, ScreenGeometry,
@@ -1301,6 +1301,11 @@ pub trait WebViewDelegate {
     /// Content in a [`WebView`] asks for a passkey to be made or used. An embedder
     /// with no authenticator leaves this alone, which refuses the request.
     fn request_passkey(&self, _webview: WebView, _request: PasskeyRequest) {}
+
+    /// A navigation in this [`WebView`] turned out to be a file to save rather than a page
+    /// to show; the page stays as it was. The body arrives on [`Download::events`] for as
+    /// long as the [`Download`] is kept: dropping it cancels the transfer.
+    fn notify_download(&self, _webview: WebView, _download: Download) {}
 
     /// Request that the embedder supply credentials to use for HTTP authentication.
     fn request_authentication(

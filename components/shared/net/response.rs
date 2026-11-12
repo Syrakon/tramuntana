@@ -134,6 +134,10 @@ pub struct Response {
     /// <https://fetch.spec.whatwg.org/#response-request-includes-credentials>
     /// A response has an associated request-includes-credentials, which is initially true.
     pub request_includes_credentials: bool,
+
+    /// A navigation response the user agent saves to a file instead of rendering it. Its
+    /// body goes to the embedder and is neither kept in memory nor stored in the HTTP cache.
+    pub download: bool,
 }
 
 impl Response {
@@ -159,6 +163,7 @@ impl Response {
             range_requested: false,
             request_includes_credentials: true,
             redirect_taint: Default::default(),
+            download: false,
         }
     }
 
@@ -193,6 +198,7 @@ impl Response {
             range_requested: false,
             request_includes_credentials: true,
             redirect_taint: Default::default(),
+            download: false,
         }
     }
 
@@ -340,6 +346,7 @@ impl Response {
             metadata.referrer.clone_from(&response.referrer);
             metadata.referrer_policy = response.referrer_policy;
             metadata.redirected = response.actual_response().url_list.len() > 1;
+            metadata.download = response.actual_response().download;
             metadata
                 .tls_security_info
                 .clone_from(&response.tls_security_info);

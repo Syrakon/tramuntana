@@ -1157,6 +1157,9 @@ pub struct Metadata {
     pub redirected: bool,
     /// Detailed TLS metadata associated with the response, if any.
     pub tls_security_info: Option<TlsSecurityInfo>,
+    /// The navigation turned into a download: the body goes to the embedder, and the
+    /// navigation must end without replacing the current document.
+    pub download: bool,
 }
 
 impl Metadata {
@@ -1174,6 +1177,7 @@ impl Metadata {
             timing: None,
             redirected: false,
             tls_security_info: None,
+            download: false,
         }
     }
 

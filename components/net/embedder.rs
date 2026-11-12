@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use cookie::Cookie;
 use embedder_traits::{
-    AuthenticationResponse, EmbedderControlId, FilePickerRequest, WebResourceRequest,
+    AuthenticationResponse, Download, EmbedderControlId, FilePickerRequest, WebResourceRequest,
     WebResourceResponseMsg,
 };
 use net_traits::CookieOperationId;
@@ -35,6 +35,8 @@ pub enum NetToEmbedderMsg {
         bool, /* for proxy */
         TokioOneshotSender<Option<AuthenticationResponse>>,
     ),
+    /// A navigation in this webview turned out to be a file to save.
+    Download(WebViewId, Download),
     /// Response to an asynchronous request from SiteDataManager with cookies result.
     EmbedderCookieOperationResponseWithCookies(CookieOperationId, Vec<Cookie<'static>>),
     /// Response to an asynchronous request from SiteDataManager.

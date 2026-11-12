@@ -59,6 +59,7 @@ use crate::connector::{
 use crate::cookie::ServoCookie;
 use crate::cookie_storage::CookieStorage;
 use crate::embedder::NetToEmbedderMsg;
+use crate::download::DownloadDiverter;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::orb::MediaUrls;
 use crate::fetch::fetch_params::{FetchParams, SharedPreloadedResources};
@@ -991,7 +992,7 @@ impl CoreResourceManager {
         &self,
         request_builder: RequestBuilder,
         res_init_: Option<ResponseInit>,
-        mut sender: Target,
+        sender: Target,
         http_state: &Arc<HttpState>,
         cancellation_listener: Arc<CancellationListener>,
         protocols: Arc<ProtocolRegistry>,
@@ -1036,6 +1037,12 @@ impl CoreResourceManager {
         let ignore_certificate_errors = self.ignore_certificate_errors;
         let in_flight_keep_alive_records = self.in_flight_keep_alive_records.clone();
         let preloaded_resources = self.preloaded_resources.clone();
+        // A navigation can turn out to be a file to save; then its body goes to the embedder.
+        let mut sender = DownloadDiverter::new(
+            sender,
+            http_state.embedder_proxy.clone(),
+            cancellation_listener.clone(),
+        );
         if let Some(ref preload_id) = request.preload_id {
             let mut preloaded_resources = self.preloaded_resources.lock().unwrap();
             let entry = PreloadEntry::new(request.integrity_metadata.clone());

@@ -8,6 +8,7 @@
 //! is not exposed in the API or doesn't involve messages sent to the embedding/libservo layer, it
 //! is probably a better fit for the `servo_constellation_traits` crate.
 
+pub mod download;
 pub mod embedder_controls;
 pub mod input_events;
 pub mod resources;
@@ -49,6 +50,7 @@ use webrender_api::units::{
     DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D,
 };
 
+pub use crate::download::*;
 pub use crate::embedder_controls::*;
 pub use crate::input_events::*;
 use crate::user_contents::UserContentManagerId;
@@ -892,13 +894,21 @@ pub enum Theme {
     /// scheme of its own) has its colours darkened when it is painted: light
     /// backgrounds turn dark and dark text turns light. Images are left alone.
     /// Pages see this as `prefers-color-scheme: dark`.
-    ForcedDark,
+    ///
+    /// The value is the grey, from 0 (pure black) to 255, that a white
+    /// background turns into; every other darkened colour is placed between
+    /// that grey and white, so the whole page follows it.
+    ForcedDark(u8),
 }
 
 impl Theme {
-    /// Whether light pages are darkened when they are painted.
-    pub fn darkens_light_pages(self) -> bool {
-        self == Theme::ForcedDark
+    /// The grey a white background turns into when light pages are darkened
+    /// (see [`Theme::ForcedDark`]), or `None` when they are not.
+    pub fn darkened_background(self) -> Option<u8> {
+        match self {
+            Theme::ForcedDark(grey) => Some(grey),
+            Theme::Light | Theme::Dark => None,
+        }
     }
 }
 
@@ -906,7 +916,7 @@ impl From<Theme> for PrefersColorScheme {
     fn from(value: Theme) -> Self {
         match value {
             Theme::Light => PrefersColorScheme::Light,
-            Theme::Dark | Theme::ForcedDark => PrefersColorScheme::Dark,
+            Theme::Dark | Theme::ForcedDark(_) => PrefersColorScheme::Dark,
         }
     }
 }

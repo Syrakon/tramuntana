@@ -3663,9 +3663,11 @@ impl Window {
         // light-only through `<meta name="color-scheme">` is exactly the page
         // with no dark scheme of its own. A devtools override is a request to
         // see the page as it is, so it turns darkening off.
-        let darken_light_pages =
-            document.theme_override().is_none() && self.webview_theme().darkens_light_pages();
-        if !self.layout_mut().set_theme(new_theme, darken_light_pages) {
+        let darkening = self
+            .webview_theme()
+            .darkened_background()
+            .filter(|_| document.theme_override().is_none());
+        if !self.layout_mut().set_theme(new_theme, darkening) {
             return;
         }
         document.add_restyle_reason(RestyleReason::ThemeChanged);

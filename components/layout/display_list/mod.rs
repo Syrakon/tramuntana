@@ -260,7 +260,9 @@ impl DisplayListBuilder<'_> {
             .filter(|color| color.alpha > 0.0)
             .unwrap_or(default_canvas);
         let _darkening = DarkeningScope::enter(
-            page_canvas.darken_light_pages && darkening::is_light_canvas(page_color),
+            page_canvas
+                .darkening
+                .filter(|_| darkening::is_light_canvas(page_color)),
         );
 
         let _span = profile_traits::trace_span!("DisplayListBuilder::build").entered();
@@ -2663,8 +2665,9 @@ pub(crate) struct PageCanvas<'a> {
     pub device: &'a style::device::Device,
     /// Whether the page is in an iframe, whose canvas stays transparent.
     pub is_iframe: bool,
-    /// Whether a page that stays light is darkened (see [`darkening`]).
-    pub darken_light_pages: bool,
+    /// The grey a white background turns into when a page that stays light
+    /// is darkened, or `None` when it is not (see [`darkening`]).
+    pub darkening: Option<u8>,
 }
 
 /// The style whose background paints the canvas, if the page has a root.

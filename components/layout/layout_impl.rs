@@ -145,8 +145,9 @@ pub struct LayoutThread {
     is_iframe: bool,
 
     /// Whether a page that stays light is darkened when it is painted, as
-    /// asked by the embedder through `Theme::ForcedDark`.
-    darken_light_pages: bool,
+    /// asked by the embedder through `Theme::ForcedDark`: the grey a white
+    /// background turns into.
+    darkening: Option<u8>,
 
     /// The channel on which messages can be sent to the time profiler.
     time_profiler_chan: profile_time::ProfilerChan,
@@ -292,15 +293,15 @@ impl Layout for LayoutThread {
         self.stylist.device()
     }
 
-    fn set_theme(&mut self, theme: Theme, darken_light_pages: bool) -> bool {
+    fn set_theme(&mut self, theme: Theme, darkening: Option<u8>) -> bool {
         let theme: PrefersColorScheme = theme.into();
         let device = self.stylist.device_mut();
-        if theme == device.color_scheme() && darken_light_pages == self.darken_light_pages {
+        if theme == device.color_scheme() && darkening == self.darkening {
             return false;
         }
 
         device.set_color_scheme(theme);
-        self.darken_light_pages = darken_light_pages;
+        self.darkening = darkening;
         self.device_has_changed = true;
         true
     }
@@ -904,7 +905,7 @@ impl LayoutThread {
             webview_id: config.webview_id,
             url: config.url,
             is_iframe: config.is_iframe,
-            darken_light_pages: false,
+            darkening: None,
             time_profiler_chan: config.time_profiler_chan,
             embedder_chan: config.embedder_chan.clone(),
             registered_painters: RegisteredPaintersImpl(Default::default()),
@@ -1150,7 +1151,7 @@ impl LayoutThread {
             pending_svg_elements_for_serialization: Mutex::default(),
             animating_images: reflow_request.animating_images.clone(),
             animation_timeline_value: reflow_request.animation_timeline_value,
-            darken_light_pages: self.darken_light_pages,
+            darken_light_pages: self.darkening.is_some(),
             dark_icons: self.dark_icons.clone(),
         });
         let mut reflow_statistics = Default::default();
@@ -1726,7 +1727,7 @@ impl LayoutThread {
             PageCanvas {
                 device: self.device(),
                 is_iframe: self.is_iframe,
-                darken_light_pages: self.darken_light_pages,
+                darkening: self.darkening,
             },
         );
 

@@ -1660,7 +1660,8 @@ async fn http_network_or_cache_fetch(
 
                 // Per https://httpwg.org/specs/rfc9111.html#response.cacheability we must not cache responses
                 // if the No-Store directive is present
-                if http_request.cache_mode != CacheMode::NoStore {
+                // A download keeps no body, so there is nothing to store.
+                if http_request.cache_mode != CacheMode::NoStore && !forward_response.download {
                     // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
                     //             "Storing Responses in Caches" chapter of HTTP Caching.
                     cache_guard.insert(http_request, forward_response);
@@ -2341,6 +2342,11 @@ async fn http_network_fetch(
     response.headers = response_stream.headers().clone();
     response.referrer = request.referrer.to_url().cloned();
     response.referrer_policy = request.referrer_policy;
+    response.download =
+        crate::download::is_download(request, &response.status, &response.headers);
+    // A download goes to the embedder chunk by chunk; keeping it here too would hold
+    // the whole file in memory.
+    let keep_body = !response.download;
 
     let response_body = response.body.clone();
 
@@ -2394,6 +2400,7 @@ async fn http_network_fetch(
     }
     .min(pref!(network_max_content_length) as usize);
     let _ = done_sender.send(Data::ContentLength(prealloc_size));
+    let prealloc_size = if keep_body { prealloc_size } else { 0 };
     *response_body.lock() = ResponseBody::Receiving(Vec::with_capacity(prealloc_size));
     let response_body2 = response_body.clone();
 
@@ -2410,7 +2417,9 @@ async fn http_network_fetch(
                     )));
                 }
                 if let ResponseBody::Receiving(ref mut body) = *response_body_accumulator.lock() {
-                    body.extend_from_slice(&chunk);
+                    if keep_body {
+                        body.extend_from_slice(&chunk);
+                    }
                     let _ = done_sender.send(Data::Payload(chunk));
                 }
                 future::ready(Ok(response_body_accumulator))

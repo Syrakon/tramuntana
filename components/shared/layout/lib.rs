@@ -297,11 +297,12 @@ pub trait Layout {
     fn device(&self) -> &Device;
 
     /// Set the theme on this [`Layout`]'s [`Device`], and whether a page that
-    /// stays light is darkened when it is painted (see [`Theme::ForcedDark`]).
+    /// stays light is darkened when it is painted: `darkening` is the grey a
+    /// white background turns into, or `None` (see [`Theme::ForcedDark`]).
     /// The caller should also trigger a new layout when this happens, though it
     /// can happen later. Returns `true` if either actually changed or `false`
     /// otherwise.
-    fn set_theme(&mut self, theme: Theme, darken_light_pages: bool) -> bool;
+    fn set_theme(&mut self, theme: Theme, darkening: Option<u8>) -> bool;
 
     /// Set the [`ViewportDetails`] on this [`Layout`]'s [`Device`]. The caller should also
     /// trigger a new layout when this happens, though it can happen later. Returns `true`

@@ -464,6 +464,12 @@ impl ServoInner {
                         .request_authentication(webview, authentication_request);
                 }
             },
+            NetToEmbedderMsg::Download(webview_id, download) => {
+                // With no webview to hand it to, the download is dropped, which cancels it.
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    webview.delegate().notify_download(webview, download);
+                }
+            },
             NetToEmbedderMsg::EmbedderCookieOperationResponseWithCookies(operation_id, cookies) => {
                 self.site_data_manager.handle_cookie_response(
                     operation_id,

@@ -12,15 +12,16 @@
 //!
 //! The rule follows Chromium's dark mode: each colour is judged by its role,
 //! and the ones that are changed have their lightness inverted in CIE Lab, so
-//! that the hue survives. The inversion maps white onto [`DARKEST`], `#090909`,
-//! rather than pure black, and black onto white.
+//! that the hue survives. The inversion maps white onto the grey the embedder
+//! chose (`#090909` by default, anything from pure black to a soft grey) and
+//! black onto white; every colour in between is placed on the same scale, so
+//! the whole page follows that grey.
 //!
 //! Images keep their colours, except the ones that read as a dark icon or
 //! logo (see [`is_dark_icon`]): drawn for a light page, they would vanish on
 //! the darkened one, so they are painted inverted.
 
 use std::cell::Cell;
-use std::sync::LazyLock;
 
 use pixels::{PixelFormat, RasterImage};
 use style::color::{AbsoluteColor, ColorSpace};
@@ -46,23 +47,22 @@ const BACKGROUND_THRESHOLD: f32 = 205. / 255.;
 /// counts as dark. Chromium's foreground value: 150 of 255.
 const FOREGROUND_THRESHOLD: f32 = 150. / 255.;
 
-/// The colour a white background turns into.
-const DARKEST: (u8, u8, u8) = (0x09, 0x09, 0x09);
-
-/// The Lab lightness of [`DARKEST`], where the inversion sends `L = 100`.
-static DARKEST_LIGHTNESS: LazyLock<f32> = LazyLock::new(|| {
-    AbsoluteColor::srgb_legacy(DARKEST.0, DARKEST.1, DARKEST.2, 1.0)
+/// The Lab lightness of the grey `grey`, where the inversion sends `L = 100`.
+fn lightness_of_grey(grey: u8) -> f32 {
+    AbsoluteColor::srgb_legacy(grey, grey, grey, 1.0)
         .to_color_space(ColorSpace::Lab)
         .components
         .0
-});
+        .clamp(0.0, 100.0)
+}
 
 thread_local! {
-    /// Whether the display list being built on this thread is darkened. A
-    /// display list is built in one go on the layout thread, and the colours
-    /// are converted from free functions all over the builder, so the switch
-    /// lives here rather than being threaded through each of them.
-    static DARKENING: Cell<bool> = const { Cell::new(false) };
+    /// Whether the display list being built on this thread is darkened, as the
+    /// Lab lightness a white background turns into. A display list is built in
+    /// one go on the layout thread, and the colours are converted from free
+    /// functions all over the builder, so the switch lives here rather than
+    /// being threaded through each of them.
+    static DARKENING: Cell<Option<f32>> = const { Cell::new(None) };
 }
 
 /// Turns darkening on for the display list being built, and off again when
@@ -70,29 +70,31 @@ thread_local! {
 pub(crate) struct DarkeningScope;
 
 impl DarkeningScope {
-    pub(crate) fn enter(darken: bool) -> Self {
-        DARKENING.with(|cell| cell.set(darken));
+    /// `background` is the grey a white background turns into, or `None` for
+    /// a display list that is not darkened.
+    pub(crate) fn enter(background: Option<u8>) -> Self {
+        DARKENING.with(|cell| cell.set(background.map(lightness_of_grey)));
         DarkeningScope
     }
 }
 
 impl Drop for DarkeningScope {
     fn drop(&mut self) {
-        DARKENING.with(|cell| cell.set(false));
+        DARKENING.with(|cell| cell.set(None));
     }
 }
 
 /// Whether the display list being built on this thread is darkened.
 pub(crate) fn is_active() -> bool {
-    DARKENING.with(Cell::get)
+    DARKENING.with(Cell::get).is_some()
 }
 
 /// The colour to paint in place of `color` in the display list being built.
 pub(crate) fn darkened(color: AbsoluteColor, role: ColorRole) -> AbsoluteColor {
-    if !DARKENING.with(Cell::get) {
-        return color;
+    match DARKENING.with(Cell::get) {
+        Some(darkest) => darken(color, role, darkest),
+        None => color,
     }
-    darken(color, role)
 }
 
 /// Perceived brightness of a colour, from 0 to 1, with the weights Chromium
@@ -112,7 +114,8 @@ pub(crate) fn is_light_canvas(color: AbsoluteColor) -> bool {
     brightness(color) > BACKGROUND_THRESHOLD
 }
 
-fn darken(color: AbsoluteColor, role: ColorRole) -> AbsoluteColor {
+/// `darkest` is the Lab lightness white is sent to.
+fn darken(color: AbsoluteColor, role: ColorRole, darkest: f32) -> AbsoluteColor {
     let brightness = brightness(color);
     let change = match role {
         ColorRole::Background => brightness > BACKGROUND_THRESHOLD,
@@ -124,7 +127,6 @@ fn darken(color: AbsoluteColor, role: ColorRole) -> AbsoluteColor {
     }
     let lab = color.to_color_space(ColorSpace::Lab);
     let lightness = lab.components.0.clamp(0.0, 100.0);
-    let darkest = *DARKEST_LIGHTNESS;
     AbsoluteColor::new(
         ColorSpace::Lab,
         darkest + (100.0 - lightness) * (100.0 - darkest) / 100.0,
@@ -222,6 +224,19 @@ mod tests {
         AbsoluteColor::srgb_legacy(r, g, b, 1.0)
     }
 
+    /// The grey a white background turns into unless the embedder picks another.
+    const DEFAULT_GREY: u8 = 0x09;
+
+    fn darken(color: AbsoluteColor, role: ColorRole) -> AbsoluteColor {
+        super::darken(color, role, lightness_of_grey(DEFAULT_GREY))
+    }
+
+    fn grey_of(color: AbsoluteColor) -> [u8; 3] {
+        let srgb = color.to_color_space(ColorSpace::Srgb);
+        [srgb.components.0, srgb.components.1, srgb.components.2]
+            .map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u8)
+    }
+
     /// A white background turns into #090909, not pure black.
     #[test]
     fn white_background_turns_090909() {
@@ -317,9 +332,42 @@ mod tests {
         let white = srgb(255, 255, 255);
         assert_eq!(darkened(white, ColorRole::Background), white);
         {
-            let _scope = DarkeningScope::enter(true);
+            let _scope = DarkeningScope::enter(Some(DEFAULT_GREY));
             assert_ne!(darkened(white, ColorRole::Background), white);
         }
         assert_eq!(darkened(white, ColorRole::Background), white);
+    }
+
+    /// White turns into exactly the grey the embedder asks for, from pure black
+    /// to a soft grey.
+    #[test]
+    fn white_turns_into_the_chosen_grey() {
+        for grey in [0x00, 0x20, 0x33] {
+            let dark = super::darken(
+                srgb(255, 255, 255),
+                ColorRole::Background,
+                lightness_of_grey(grey),
+            );
+            assert_eq!(grey_of(dark), [grey; 3]);
+        }
+    }
+
+    /// The rest of the page follows the chosen grey: a pale background and a
+    /// hairline turn lighter with a lighter grey, black text still turns white,
+    /// and the order page < hairline < text survives at both ends.
+    #[test]
+    fn the_page_follows_the_chosen_grey() {
+        let at = |grey: u8, color, role| {
+            brightness(super::darken(color, role, lightness_of_grey(grey)))
+        };
+        let pale = srgb(240, 240, 240);
+        assert!(at(0x00, pale, ColorRole::Background) < at(0x33, pale, ColorRole::Background));
+        for grey in [0x00, 0x33] {
+            let page = at(grey, srgb(255, 255, 255), ColorRole::Background);
+            let hairline = at(grey, srgb(221, 221, 221), ColorRole::Border);
+            let text = at(grey, srgb(34, 34, 34), ColorRole::Foreground);
+            assert!(page < hairline && hairline < text, "{grey}: {page} {hairline} {text}");
+            assert!(at(grey, srgb(0, 0, 0), ColorRole::Foreground) > 0.95);
+        }
     }
 }

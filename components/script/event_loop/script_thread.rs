@@ -3255,8 +3255,11 @@ impl ScriptThread {
             Some(metadata) => metadata.status.in_range(204..=205),
             _ => false,
         };
+        // A response the network handed to the embedder as a download ends the navigation
+        // the same way: the page stays as it was and the file is saved instead.
+        let is_download = metadata.is_some_and(|metadata| metadata.download);
 
-        if is_204_205 {
+        if is_204_205 || is_download {
             // If we have an existing window that is being navigated:
             if let Some(window) = self.documents.borrow().find_window(pipeline_id) {
                 let window_proxy = window.window_proxy();
