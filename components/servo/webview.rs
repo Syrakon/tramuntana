@@ -1233,8 +1233,9 @@ impl WebViewBuilder {
     }
 
     /// Put the `WebView` being created in a [`TemporarySession`] instead of the
-    /// ordinary one: its cookies, cache and site storage are kept in memory and
-    /// shared only with the other `WebView`s of the same session. The session
+    /// ordinary one: its cookies, cache and site storage are kept in memory, or
+    /// in the session's directory if it has one, and shared only with the other
+    /// `WebView`s of the same session. The session
     /// starts with the first `WebView` that names its id and lasts until
     /// [`Servo::close_temporary_session`] is called.
     ///

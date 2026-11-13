@@ -97,6 +97,12 @@ impl CookieStorage {
         }
     }
 
+    /// Whether this storage keeps the cookies it is given. Reading a stored jar into one
+    /// replaces it whole, refusal included, so a storage that refuses them is not read into.
+    pub fn accepts_cookies(&self) -> bool {
+        !self.rejects_all
+    }
+
     // http://tools.ietf.org/html/rfc6265#section-5.3
     pub fn remove(
         &mut self,

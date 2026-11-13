@@ -221,40 +221,28 @@ fn create_http_states(
     ignore_certificate_errors: bool,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
 ) -> (Arc<HttpState>, Arc<HttpState>) {
-    let mut hsts_list = HstsList::default();
-    let mut auth_cache = AuthCache::default();
-    let mut cookie_jar = CookieStorage::new(150);
-    if let Some(config_dir) = config_dir {
-        servo_base::read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
-        servo_base::read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
-        servo_base::read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
-        // The jar on disk may hold session cookies from the last run (it is
-        // written while Servo runs, not only at a clean exit). A new session
-        // starts without them.
-        cookie_jar.clear_session_cookies();
-    }
-
-    let override_manager = CertificateErrorOverrideManager::new();
-    let http_state = HttpState {
-        hsts_list: RwLock::new(hsts_list),
-        cookie_jar: RwLock::new(cookie_jar),
-        auth_cache: RwLock::new(auth_cache),
-        history_states: RwLock::new(FxHashMap::default()),
-        orb_media_urls: RwLock::new(MediaUrls::default()),
-        http_cache: HttpCache::new(cache_dir.map(|cache_dir| {
-            (
-                cache_dir.join("http"),
-                servo_config::pref!(network_http_cache_disk_size),
-            )
-        })),
-        client: create_http_client(create_tls_config(
+    let http_state = match config_dir {
+        Some(config_dir) => stored_http_state(
+            config_dir,
+            cache_dir,
+            CookieStorage::new(150),
             ca_certificates.clone(),
             ignore_certificate_errors,
-            override_manager.clone(),
-        )),
-        override_manager,
-        embedder_proxy: embedder_proxy.clone(),
-        no_cross_site_referrer: false,
+            embedder_proxy.clone(),
+            false,
+        ),
+        // With no config directory the disk cache may still have a place of its own.
+        None => {
+            let mut http_state = memory_only_http_state(
+                CookieStorage::new(150),
+                ca_certificates.clone(),
+                ignore_certificate_errors,
+                embedder_proxy.clone(),
+                false,
+            );
+            http_state.http_cache = disk_http_cache(cache_dir);
+            Arc::new(http_state)
+        },
     };
 
     let private_http_state = memory_only_http_state(
@@ -265,12 +253,60 @@ fn create_http_states(
         false,
     );
 
-    let http_state = Arc::new(http_state);
-    if let Some(config_dir) = config_dir {
-        spawn_http_state_persister(Arc::downgrade(&http_state), config_dir.to_owned());
-    }
-
     (http_state, Arc::new(private_http_state))
+}
+
+/// The HTTP cache of a session that keeps its responses under `cache_dir`, or
+/// in memory with none.
+fn disk_http_cache(cache_dir: Option<&Path>) -> HttpCache {
+    HttpCache::new(cache_dir.map(|cache_dir| {
+        (
+            cache_dir.join("http"),
+            servo_config::pref!(network_http_cache_disk_size),
+        )
+    }))
+}
+
+/// The state of a session that keeps it in `config_dir`: the credentials, the
+/// HSTS list and the cookies written there last are read back, and a thread
+/// writes them there again as they change. The cookies are read into
+/// `cookie_jar` only when it accepts cookies at all. The HTTP cache keeps its
+/// responses under `cache_dir`.
+fn stored_http_state(
+    config_dir: &Path,
+    cache_dir: Option<&Path>,
+    cookie_jar: CookieStorage,
+    ca_certificates: CACertificates<'static>,
+    ignore_certificate_errors: bool,
+    embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    no_cross_site_referrer: bool,
+) -> Arc<HttpState> {
+    let mut http_state = memory_only_http_state(
+        cookie_jar,
+        ca_certificates,
+        ignore_certificate_errors,
+        embedder_proxy,
+        no_cross_site_referrer,
+    );
+    {
+        let auth_cache = http_state.auth_cache.get_mut();
+        servo_base::read_json_from_file(auth_cache, config_dir, "auth_cache.json");
+        let hsts_list = http_state.hsts_list.get_mut();
+        servo_base::read_json_from_file(hsts_list, config_dir, "hsts_list.json");
+        let cookie_jar = http_state.cookie_jar.get_mut();
+        if cookie_jar.accepts_cookies() {
+            servo_base::read_json_from_file(cookie_jar, config_dir, "cookie_jar.json");
+            // The jar on disk may hold session cookies from the last run (it is
+            // written while Servo runs, not only at a clean exit). A new session
+            // starts without them.
+            cookie_jar.clear_session_cookies();
+        }
+    }
+    http_state.http_cache = disk_http_cache(cache_dir);
+
+    let http_state = Arc::new(http_state);
+    spawn_http_state_persister(Arc::downgrade(&http_state), config_dir.to_owned());
+    http_state
 }
 
 /// The state of a session that starts empty and of which nothing is written
@@ -335,12 +371,18 @@ fn spawn_http_state_persister(http_state: Weak<HttpState>, config_dir: PathBuf) 
 
 fn persist_http_state(http_state: &HttpState, config_dir: &Path, written: &mut WrittenState) {
     let _guard = PERSIST_LOCK.lock();
+    let cookie_jar = http_state.cookie_jar.read();
+    // A jar that refuses cookies is always empty, and was not read from the
+    // directory: writing it would wipe the cookies kept there.
+    let cookie_jar = cookie_jar
+        .accepts_cookies()
+        .then(|| ("cookie_jar.json", serde_json::to_vec_pretty(&*cookie_jar)));
     let files = [
-        ("auth_cache.json", serde_json::to_vec_pretty(&*http_state.auth_cache.read())),
-        ("cookie_jar.json", serde_json::to_vec_pretty(&*http_state.cookie_jar.read())),
-        ("hsts_list.json", serde_json::to_vec_pretty(&*http_state.hsts_list.read())),
+        Some(("auth_cache.json", serde_json::to_vec_pretty(&*http_state.auth_cache.read()))),
+        cookie_jar,
+        Some(("hsts_list.json", serde_json::to_vec_pretty(&*http_state.hsts_list.read()))),
     ];
-    for (filename, json) in files {
+    for (filename, json) in files.into_iter().flatten() {
         let json = match json {
             Ok(json) => json,
             Err(error) => {
@@ -397,6 +439,8 @@ impl ResourceChannelManager {
 
         // The state of each temporary session, by the id of its channel.
         let mut temporary_http_states: FxHashMap<u64, Arc<HttpState>> = FxHashMap::default();
+        // The directory of each temporary session that keeps its state in one.
+        let mut temporary_dirs: FxHashMap<u64, PathBuf> = FxHashMap::default();
 
         loop {
             // The set gains a receiver for each temporary session while this loop runs,
@@ -408,7 +452,13 @@ impl ResourceChannelManager {
                     // this handles the case where the profiler thread shuts
                     // down before the resource thread.
                     GenericSelectionResult::ChannelClosed(id) => {
-                        temporary_http_states.remove(&id);
+                        let http_state = temporary_http_states.remove(&id);
+                        // What changed since the persister last ran would be lost.
+                        if let (Some(http_state), Some(dir)) =
+                            (http_state, temporary_dirs.remove(&id))
+                        {
+                            persist_http_state(&http_state, &dir, &mut WrittenState::new());
+                        }
                         continue;
                     },
                     GenericSelectionResult::Error(error) => {
@@ -451,25 +501,51 @@ impl ResourceChannelManager {
                             } else {
                                 log::error!("memory reporter should only send CollectMemoryReport");
                             }
-                        } else if let CoreResourceMsg::NewTemporarySession(accept_cookies, reply) =
-                            msg
+                        } else if let CoreResourceMsg::NewTemporarySession(
+                            accept_cookies,
+                            dir,
+                            reply,
+                        ) = msg
                         {
-                            let session = generic_channel::channel().map(|(sender, receiver)| {
+                            let session = generic_channel::channel().and_then(|(sender, receiver)| {
                                 let cookie_jar = if accept_cookies {
                                     CookieStorage::new(150)
                                 } else {
                                     CookieStorage::rejecting_all()
                                 };
-                                let http_state = memory_only_http_state(
-                                    cookie_jar,
-                                    self.ca_certificates.clone(),
-                                    self.ignore_certificate_errors,
-                                    embedder_proxy.clone(),
-                                    true,
-                                );
-                                temporary_http_states
-                                    .insert(rx_set.add(receiver), Arc::new(http_state));
-                                sender
+                                let http_state = match &dir {
+                                    Some(dir) => {
+                                        if let Err(error) = std::fs::create_dir_all(dir) {
+                                            warn!(
+                                                "Could not create the directory of a session, {}: {error}",
+                                                dir.display()
+                                            );
+                                            return None;
+                                        }
+                                        stored_http_state(
+                                            dir,
+                                            Some(dir),
+                                            cookie_jar,
+                                            self.ca_certificates.clone(),
+                                            self.ignore_certificate_errors,
+                                            embedder_proxy.clone(),
+                                            true,
+                                        )
+                                    },
+                                    None => Arc::new(memory_only_http_state(
+                                        cookie_jar,
+                                        self.ca_certificates.clone(),
+                                        self.ignore_certificate_errors,
+                                        embedder_proxy.clone(),
+                                        true,
+                                    )),
+                                };
+                                let id = rx_set.add(receiver);
+                                temporary_http_states.insert(id, http_state);
+                                if let Some(dir) = dir {
+                                    temporary_dirs.insert(id, dir);
+                                }
+                                Some(sender)
                             });
                             if reply.send(session).is_err() {
                                 warn!("Nobody waited for the new temporary session");
@@ -494,6 +570,15 @@ impl ResourceChannelManager {
                                 log::error!("Message from an unknown resource channel: {id}");
                                 continue;
                             };
+                            // `Exit` ends every session, so the ones that keep their
+                            // state in a directory write it there first.
+                            if matches!(msg, CoreResourceMsg::Exit(_)) {
+                                for (id, dir) in &temporary_dirs {
+                                    if let Some(http_state) = temporary_http_states.get(id) {
+                                        persist_http_state(http_state, dir, &mut WrittenState::new());
+                                    }
+                                }
+                            }
                             if !self.process_msg(msg, group, Arc::clone(&protocols)) {
                                 return;
                             }

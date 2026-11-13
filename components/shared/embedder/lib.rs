@@ -1310,16 +1310,25 @@ impl ScriptToEmbedderChan {
     }
 }
 
-/// A browsing session of its own, kept only in memory: its cookies, HTTP cache
-/// and site storage are shared with no other session, and are gone once the
-/// embedder closes it. The embedder picks the `id`; every `WebView` created
-/// with the same `id` belongs to the same session.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+/// A browsing session of its own: its cookies, HTTP cache and site storage are
+/// shared with no other session. The embedder picks the `id`; every `WebView`
+/// created with the same `id` belongs to the same session.
+///
+/// Without a `dir` the session is kept only in memory and everything it held
+/// is gone once the embedder closes it. With one, it keeps what it stores in
+/// that directory, as the ordinary session keeps its own in the config
+/// directory, and finds it there again the next time a session is started on
+/// it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TemporarySession {
     pub id: u64,
     /// Whether the session stores the cookies that sites set. When `false`
     /// its cookie jar stays empty.
     pub accept_cookies: bool,
+    /// Where the session keeps cookies, credentials, the HSTS list, the HTTP
+    /// cache and site storage, or `None` to keep them in memory. No two live
+    /// sessions may share a directory.
+    pub dir: Option<std::path::PathBuf>,
 }
 
 /// Used for communicating the details of a new `WebView` created by the embedder

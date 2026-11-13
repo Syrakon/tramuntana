@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use servo_base::generic_channel::GenericSender;
@@ -45,15 +45,21 @@ fn new_storage_thread_group(
     )
 }
 
-/// Storage threads for a temporary session: they start empty, share nothing
-/// with the public or private groups, and take no `config_dir`, so nothing of
-/// the session lands in the profile. `label` tells the memory reporters of
-/// one session from those of another and has to be unique among live groups.
+/// Storage threads for a temporary session: they share nothing with the
+/// public or private groups. Without a `dir` they start empty and nothing of
+/// the session lands on disk past its end; with one they keep their data in
+/// that directory, as the public group keeps it in the config directory, and
+/// find it there next time. `label` tells the memory reporters of one session
+/// from those of another and has to be unique among live groups.
 pub fn new_temporary_storage_threads(
     mem_profiler_chan: MemProfilerChan,
     label: &str,
+    dir: Option<&Path>,
 ) -> StorageThreads {
-    new_storage_thread_group(mem_profiler_chan, None, true, label)
+    match dir {
+        Some(dir) => new_storage_thread_group(mem_profiler_chan, Some(dir.to_owned()), false, label),
+        None => new_storage_thread_group(mem_profiler_chan, None, true, label),
+    }
 }
 
 pub fn new_storage_threads(

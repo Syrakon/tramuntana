@@ -76,11 +76,96 @@ fn new_temporary_session(
     resource_thread: &CoreResourceThread,
     accept_cookies: bool,
 ) -> CoreResourceThread {
+    new_session_in(resource_thread, accept_cookies, None)
+}
+
+fn new_session_in(
+    resource_thread: &CoreResourceThread,
+    accept_cookies: bool,
+    dir: Option<&std::path::Path>,
+) -> CoreResourceThread {
     let (sender, receiver) = generic_channel::channel().unwrap();
     resource_thread
-        .send(CoreResourceMsg::NewTemporarySession(accept_cookies, sender))
+        .send(CoreResourceMsg::NewTemporarySession(
+            accept_cookies,
+            dir.map(std::path::Path::to_owned),
+            sender,
+        ))
         .unwrap();
     receiver.recv().unwrap().unwrap()
+}
+
+fn public_resource_thread() -> CoreResourceThread {
+    let (tx, _rx) = generic_channel::channel().unwrap();
+    let (mtx, _mrx) = generic_channel::channel().unwrap();
+    let (public, _private) = new_core_resource_thread(
+        None,
+        ProfilerChan(Some(tx)),
+        MemProfilerChan(mtx),
+        create_generic_embedder_proxy(),
+        None,
+        None,
+        CACertificates::Default,
+        false, /* ignore_certificate_errors */
+        std::sync::Arc::new(ProtocolRegistry::default()),
+        None,
+    );
+    public
+}
+
+fn exit(resource_thread: &CoreResourceThread) {
+    let (sender, receiver) = generic_channel::oneshot().unwrap();
+    resource_thread.send(CoreResourceMsg::Exit(sender)).unwrap();
+    receiver.recv().unwrap();
+}
+
+/// A session with a directory finds there the cookies it kept, whether it ended
+/// on its own or with the resource thread, and shares them with no other session.
+#[test]
+fn test_a_session_with_a_directory_keeps_its_cookies() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = ServoUrl::parse("https://example.org/").unwrap();
+    let lasting = "kept=1; Max-Age=3600";
+
+    let public = public_resource_thread();
+    let session = new_session_in(&public, true, Some(dir.path()));
+    set_cookie(&session, &url, lasting);
+    set_cookie(&session, &url, "for_now=1");
+    assert_eq!(cookie_string(&public, &url), None);
+
+    // The session ends when its last sender goes, and writes its jar on the way.
+    drop(session);
+    let jar = dir.path().join("cookie_jar.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_to_string(&jar).is_ok_and(|text| text.contains("kept")) {
+        assert!(std::time::Instant::now() < deadline, "the jar was never written");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Started again on the same directory, it has what lasts and not the
+    // cookies of the session before.
+    let again = new_session_in(&public, true, Some(dir.path()));
+    assert_eq!(cookie_string(&again, &url), Some("kept=1".to_owned()));
+    set_cookie(&again, &url, "added=1; Max-Age=3600");
+    // `Exit` writes the session's jar too.
+    exit(&public);
+
+    let public = public_resource_thread();
+    let after_exit = new_session_in(&public, true, Some(dir.path()));
+    let cookies = cookie_string(&after_exit, &url).unwrap_or_default();
+    assert!(cookies.contains("kept=1") && cookies.contains("added=1"), "{cookies}");
+    drop(after_exit);
+
+    // A session that refuses cookies neither takes them from the directory nor
+    // leaves its empty jar there.
+    let refusing = new_session_in(&public, false, Some(dir.path()));
+    assert_eq!(cookie_string(&refusing, &url), None);
+    drop(refusing);
+    exit(&public);
+    let public = public_resource_thread();
+    let last = new_session_in(&public, true, Some(dir.path()));
+    assert!(cookie_string(&last, &url).is_some_and(|cookies| cookies.contains("kept=1")));
+    exit(&public);
 }
 
 #[test]

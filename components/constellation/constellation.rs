@@ -623,8 +623,11 @@ pub struct InitialConstellationState {
 }
 
 /// Makes the storage threads of a new temporary session, given the id of the
-/// session. They must start empty and write nothing to the profile.
-pub type TemporaryStorageFactory = Box<dyn Fn(u64) -> StorageThreads + Send>;
+/// session and the directory it keeps its state in, if any. Without one they
+/// must start empty and write nothing to disk; with one they keep their data
+/// there and nowhere else.
+pub type TemporaryStorageFactory =
+    Box<dyn Fn(u64, Option<&std::path::Path>) -> StorageThreads + Send>;
 
 /// When we are exiting a pipeline, we can either force exiting or not. A normal exit
 /// waits for `Paint` to update its state before exiting, and delegates layout exit to
@@ -3745,6 +3748,7 @@ where
             session,
         }: NewWebViewDetails,
     ) {
+        let is_private = session.is_some();
         // A webview that asked for a temporary session and cannot have it is
         // not loaded at all: the ordinary session would keep what it stores.
         if let Some(session) = session &&
@@ -3756,7 +3760,6 @@ where
         let pipeline_id = PipelineId::new();
         let browsing_context_id = BrowsingContextId::from(webview_id);
         let load_data = LoadData::new_for_new_unrelated_webview(url);
-        let is_private = session.is_some();
 
         // Register this new top-level browsing context id as a webview and set
         // its focused browsing context to be itself.
@@ -3882,7 +3885,11 @@ where
                 return false;
             };
             if let Err(error) = self.public_resource_threads.send(
-                net_traits::CoreResourceMsg::NewTemporarySession(session.accept_cookies, sender),
+                net_traits::CoreResourceMsg::NewTemporarySession(
+                    session.accept_cookies,
+                    session.dir.clone(),
+                    sender,
+                ),
             ) {
                 warn!("Asking for a temporary session failed ({error})");
                 return false;
@@ -3891,7 +3898,8 @@ where
                 warn!("The resource thread did not start a temporary session");
                 return false;
             };
-            let storage_threads = (self.temporary_storage_factory)(session.id);
+            let storage_threads =
+                (self.temporary_storage_factory)(session.id, session.dir.as_deref());
             self.temporary_sessions.insert(
                 session.id,
                 (ResourceThreads::new(core_thread), storage_threads),

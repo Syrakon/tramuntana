@@ -1064,10 +1064,11 @@ impl Servo {
 
         let temporary_storage_factory: TemporaryStorageFactory = {
             let mem_profiler_chan = mem_profiler_chan.clone();
-            Box::new(move |session_id| {
+            Box::new(move |session_id, dir| {
                 new_temporary_storage_threads(
                     mem_profiler_chan.clone(),
                     &format!("temporary-{session_id}"),
+                    dir,
                 )
             })
         };
@@ -1181,10 +1182,11 @@ impl Servo {
     }
 
     /// End the [`TemporarySession`](embedder_traits::TemporarySession) with
-    /// this id: its cookies, cache and site storage are dropped. If some of
-    /// its `WebView`s are still open, the session ends when the last of them
-    /// closes. Once it has ended, a `WebView` created with the same id starts
-    /// a new, empty session.
+    /// this id: its cookies, cache and site storage are dropped, or, for a
+    /// session with a directory, written there. If some of its `WebView`s are
+    /// still open, the session ends when the last of them closes. Once it has
+    /// ended, a `WebView` created with the same id starts a new session: an
+    /// empty one, or one that reads back what its directory holds.
     pub fn close_temporary_session(&self, id: u64) {
         self.0
             .constellation_proxy
