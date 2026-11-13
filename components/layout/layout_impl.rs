@@ -905,7 +905,11 @@ impl LayoutThread {
             webview_id: config.webview_id,
             url: config.url,
             is_iframe: config.is_iframe,
-            darkening: None,
+            // From the theme the page starts with, as `set_theme` would set it: a page that
+            // replaces another under the same theme gets no theme change to darken it later.
+            // A new document has no devtools override yet, which is all `refresh_theme`
+            // adds.
+            darkening: config.theme.darkened_background(),
             time_profiler_chan: config.time_profiler_chan,
             embedder_chan: config.embedder_chan.clone(),
             registered_painters: RegisteredPaintersImpl(Default::default()),
